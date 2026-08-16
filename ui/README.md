@@ -1,107 +1,98 @@
 # Seedpod UI
 
-Web UI for managing K3s clusters, deployments, and infrastructure.
+The web UI for clusters, deployments, snapshots, secrets, and config. Preact + Vite, with
+Server-Sent Events for live updates.
 
-## Tech Stack
-
-- **Preact** - Lightweight React alternative
-- **Vite** - Fast build tool and dev server
-- **Preact Router** - Client-side routing
-- **Server-Sent Events (SSE)** - Real-time updates from backend
+In a release, seedpod serves this bundle itself, same-origin (DR-0041 decision 3). The vite
+dev server below is a development workflow only.
 
 ## Development
 
-### Prerequisites
-
-- Node.js 18+
-- Running `seedpod` API server (default: http://localhost:8000)
-
-### Setup
+You need Node 24 (the version CI builds with) and a running seedpod API, by default at
+`http://localhost:8000`.
 
 ```bash
-# Install dependencies
 npm install
-
-# Copy environment config
-cp .env.example .env
-
-# Start dev server
-npm run dev
+cp .env.example .env    # VITE_API_URL=http://localhost:8000
+npm run dev             # http://localhost:5173
 ```
 
-The UI will be available at http://localhost:5173
+The dev server calls the API cross-origin. `SEEDPOD_CORS_ORIGINS` defaults to `*`, so this
+works with no server-side change.
 
-### Authentication
+### Getting a token
 
-1. Generate an API token from the seedpod CLI:
-   ```bash
-   cd ..
-   uv run seedpod bootstrap myuser --expires-days 365
-   ```
+The UI authenticates with an API key pasted into the login form. Mint the first one with:
 
-2. Copy the token from `admin-api-key.txt` or CLI output
-
-3. Open the UI and paste the token in the login form
-
-### Project Structure
-
-```
-src/
-├── components/       # Reusable UI components
-│   ├── TopNav.jsx
-│   ├── TabNav.jsx
-│   ├── Table.jsx
-│   ├── Card.jsx
-│   ├── StatusBadge.jsx
-│   └── Breadcrumb.jsx
-├── pages/           # Route pages
-│   ├── Login.jsx
-│   ├── ClusterList.jsx
-│   ├── ClusterDetail.jsx
-│   ├── PodDetail.jsx
-│   ├── DeploymentList.jsx
-│   ├── SecretList.jsx
-│   └── ApiKeyList.jsx
-├── lib/            # Utilities
-│   ├── api-client.js
-│   └── sse-client.js
-├── hooks/          # Custom hooks
-│   └── useSSE.js
-└── app.jsx        # Main app with routing
+```bash
+seedpod-bootstrap create-admin <username>
 ```
 
-### Routes
+It prints the key once and never again. There is no key file to read it back from.
 
-- `/clusters` - List all clusters
-- `/clusters/:id` - Cluster details with pod list
-- `/clusters/:id/pods/:name` - Pod details and logs
-- `/deployments` - Deployment history
-- `/secrets` - Secret management
-- `/keys` - API key management
+### Tests
 
-### Real-time Updates
-
-The UI connects to the seedpod SSE endpoint (`/api/events/stream`) to receive real-time updates for:
-
-- Cluster state changes (PENDING → PROVISIONING → ACTIVE, etc.)
-- Deployment progress
-- Pod status updates
-
-Events are automatically handled and update the UI without polling.
+```bash
+npm test          # vitest, single run
+npm run test:watch
+```
 
 ## Build
 
 ```bash
-# Production build
-npm run build
-
-# Preview production build
+npm run build     # -> dist/
 npm run preview
 ```
 
-The build output will be in `dist/`.
+`dist/` ships in the release artifact, so the appliance needs no Node at runtime. `vite build`
+runs in production mode and loads `.env.production`, which sets `VITE_API_URL` to empty —
+`api-client.js` and `sse-client.js` both read `import.meta.env.VITE_API_URL || ''`, and an
+empty base means same-origin. That file exists to override a developer's gitignored `.env`:
+a release once shipped a bundle that sent every request to `localhost:8000`, which worked on
+the server host and failed from every other machine.
 
-## Environment Variables
+## Routes
 
-- `VITE_API_URL` - API endpoint (default: http://localhost:8000)
+Routing is `preact-router` over real paths, so the server needs an SPA fallback for deep
+links. `seedpod/api/spa.py` provides one, mounted from `seedpod/__main__.py` when
+`SEEDPOD_UI_DIR` is set.
 
+| Path | Page |
+|---|---|
+| `/clusters`, `/clusters/:clusterId` | cluster list and detail |
+| `/clusters/:clusterId/pods/:namespace/:podName` | pod detail and logs |
+| `…/containers/:containerName` | container detail |
+| `/deployments`, `/deployments/:deploymentId` | deployment history and detail |
+| `/presets`, `/presets/:presetId` | deploy presets |
+| `/snapshots`, `/snapshots/:snapshotId` | snapshots |
+| `/secrets` | secret management |
+| `/keys`, `/keys/create`, `/keys/:keyId` | API keys |
+| `/workflows` | workflow definitions |
+| `/config`, `/config/rules/:ruleName`, `/config/profiles/:profileName`, `/config/strategies/:strategyName` | the on-disk config, browsable |
+| `/health` | health |
+
+## Layout
+
+```
+src/
+├── app.jsx, main.jsx    routing and mount
+├── components/          TopNav, TabNav, Table, Card, StatusBadge, Breadcrumb,
+│   │                    modals (deploy, destroy, snapshot, restore, confirm),
+│   │                    MiniEventHud, ConnectionStatus, HiddenSecret, …
+│   └── config/          config browser views
+├── pages/               one per route above
+├── hooks/               useSSE, useEventHistory
+├── lib/                 api-client, sse-client, event-store, time-utils
+└── styles/
+```
+
+## Live updates
+
+The UI subscribes to `/api/events/stream` and updates without polling: cluster state changes
+(`PENDING` → `PROVISIONING` → `ACTIVE` …), deployment progress, and pod status. `event-store.js`
+keeps the recent history that `MiniEventHud` shows.
+
+## Environment variables
+
+- `VITE_API_URL` — API base. `http://localhost:8000` for the dev server; empty in production
+  builds, meaning same-origin.

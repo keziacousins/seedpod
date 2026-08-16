@@ -3,7 +3,7 @@ title: DR-0041 — packaging seedpod as a dev appliance: a versioned release roo
 type: decision
 status: active
 created: 2026-08-14
-updated: 2026-08-15
+updated: 2026-08-16
 ---
 
 # DR-0041: packaging the dev appliance
@@ -242,6 +242,40 @@ one line, and exits **75** (`EX_TEMPFAIL`), distinct from the shell launchers' *
 (`EX_CONFIG`) — so a script can tell "something is already running" from "this is
 misconfigured". Found by starting a second `bin/seedpod` against a real installed release,
 which is the only way that path is ever reached.
+
+### Erratum E3 — the artifact does not carry the deployment's `config/` (2026-08-16)
+
+Decision 2's release-root sketch and Amendment A's contents list both put `config/` in the
+artifact. That held while one repo carried both the engine and the deployment it ran. It no
+longer holds. The engine is published under MIT, and the real deployment configuration —
+profiles, manifest templates, provider settings, org identity — moved to a private
+per-project repo (`seedpod-config`, one per client). **An artifact cannot carry a private
+repository.**
+
+`scripts/build_release.py` still copies `config/`, and that stays correct. What changed is
+what `config/` contains: a small generic example that exercises the same features, not any
+deployment's configuration. The artifact therefore ships a default, and an appliance running
+on that default is configured for nothing real.
+
+**How an appliance gets its real config today.** Clone the config repo onto the host and
+point `SEEDPOD_CONFIG_DIR` at the clone. The launcher already exports that variable as an
+absolute path (decision 2), so only the path changes. Update it by hand. That manual step is
+the thing this DR argued against for code — deploy it, do not rsync it — and config now sits
+on the wrong side of that argument.
+
+**What a DR must settle before config becomes deployable.** The current thinking is to push
+config through `seedpodctl` rather than couple the release build to a second checkout: the
+CLI is already the authenticated HTTP surface (DR-0021 §0c), and a config push is the kind of
+operator action it exists for. Three questions come first:
+
+- Does the server validate a pushed config before it accepts it? It already fails loudly on
+  an unresolvable profile, so a dry-run render is within reach.
+- Is config versioned alongside releases, or independently?
+- What happens to a running server when config changes underneath it? Today `config_dir` is
+  read at boot, and nothing re-reads it.
+
+Not started. Recorded so the gap between "config is separate now" and "the appliance can
+still get config" stays visible rather than being discovered on a host.
 
 ### D. A succinct ops section in `README.md`
 
