@@ -11,7 +11,7 @@ requires-python = ">=3.11"
 # transport deps in Pillar 3 if needed.
 dependencies = [
     "fastapi>=0.141.1",
-    "uvicorn[standard]>=0.30.0",
+    "uvicorn[standard]>=0.52.3",
     "sqlalchemy>=2.0.52,<2.1.0",
     "pydantic>=2.5.0,<3.0.0",
     "cryptography>=41.0.0",
