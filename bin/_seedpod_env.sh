@@ -19,12 +19,20 @@
 # happened to be standing in.
 #
 # **Why the launcher wins over var/.env for the path variables only.** .env is
-# sourced FIRST, then the five path variables below are overwritten (plus
+# sourced FIRST, then the path variables below are overwritten (plus
 # SEEDPOD_UI_DIR, when a bundle is actually present). .env is the
 # right home for secrets and tokens; it is the wrong home for "where does this
 # release keep its state", because that answer is a property of the layout, not
 # of the operator's preferences -- and a stale relative path in .env is exactly
 # the class of bug the absolutes exist to prevent. Everything else in .env wins.
+#
+# **SEEDPOD_CONFIG_DIR is the one exception, and it is a recent one**
+# (DR-0041 erratum E3). Config is no longer a property of the release: the real
+# deployment configuration lives in its own private repo, and the `config/` an
+# artifact carries is only a generic default. So an ABSOLUTE SEEDPOD_CONFIG_DIR
+# wins here. A RELATIVE one still does not -- `SEEDPOD_CONFIG_DIR=config` is the
+# stale-checkout leftover the absolutes exist to prevent, and is discarded
+# exactly as before.
 
 set -eu
 
@@ -71,6 +79,12 @@ if [ ! -x "$PY" ]; then
     exit 78
 fi
 
+# Captured BEFORE .env is sourced, because `set -a; . .env` overwrites the
+# inherited environment. Without this, a stale `SEEDPOD_CONFIG_DIR=config` left
+# in .env would silently beat a value the operator exported deliberately in the
+# shell they are standing in. Explicit beats file; file beats release default.
+SEEDPOD_CONFIG_DIR_FROM_SHELL="${SEEDPOD_CONFIG_DIR:-}"
+
 # Secrets and tokens first; the path variables below then override.
 if [ -f "$SEEDPOD_VAR/.env" ]; then
     set -a
@@ -80,7 +94,27 @@ fi
 
 mkdir -p "$SEEDPOD_VAR/db" "$SEEDPOD_VAR/log" "$SEEDPOD_VAR/data/snapshots"
 
-SEEDPOD_CONFIG_DIR="$RELEASE_ROOT/config"
+if [ -n "$SEEDPOD_CONFIG_DIR_FROM_SHELL" ]; then
+    SEEDPOD_CONFIG_DIR="$SEEDPOD_CONFIG_DIR_FROM_SHELL"
+fi
+
+# Absolute: the operator owns it, keep it. Anything else (unset, or relative):
+# this release's own config. See the header note.
+case "${SEEDPOD_CONFIG_DIR:-}" in
+    /*) : ;;
+    *) SEEDPOD_CONFIG_DIR="$RELEASE_ROOT/config" ;;
+esac
+
+# A refusal rather than a silent fallback to the release default: an operator who
+# set this and mistyped it wants to hear so, not to watch seedpod come up serving
+# somebody else's profiles.
+if [ ! -d "$SEEDPOD_CONFIG_DIR" ]; then
+    echo "seedpod: config directory not found: $SEEDPOD_CONFIG_DIR" >&2
+    echo "  Set SEEDPOD_CONFIG_DIR in $SEEDPOD_VAR/.env to an absolute path," >&2
+    echo "  or unset it to use this release's own config ($RELEASE_ROOT/config)." >&2
+    exit 78
+fi
+
 SEEDPOD_LOG_DIR="$SEEDPOD_VAR/log"
 SEEDPOD_PID_FILE="$SEEDPOD_VAR/seedpod.pid"
 SEEDPOD_SNAPSHOT_STORAGE_PATH="$SEEDPOD_VAR/data/snapshots"

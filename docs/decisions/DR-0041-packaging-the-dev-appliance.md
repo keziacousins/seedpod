@@ -257,11 +257,30 @@ what `config/` contains: a small generic example that exercises the same feature
 deployment's configuration. The artifact therefore ships a default, and an appliance running
 on that default is configured for nothing real.
 
-**How an appliance gets its real config today.** Clone the config repo onto the host and
-point `SEEDPOD_CONFIG_DIR` at the clone. The launcher already exports that variable as an
-absolute path (decision 2), so only the path changes. Update it by hand. That manual step is
-the thing this DR argued against for code — deploy it, do not rsync it — and config now sits
-on the wrong side of that argument.
+**How an appliance gets its real config today.** Clone the config repo onto the host, and
+record its absolute path as `SEEDPOD_CONFIG_DIR` in `var/.env`. Update the clone by hand.
+That manual step is the thing this DR argued against for code — deploy it, do not rsync it —
+and config now sits on the wrong side of that argument.
+
+**This required a launcher change, which the first draft of this erratum missed.** It claimed
+"the launcher already exports that variable, so only the path changes". It did export it —
+unconditionally, at `_seedpod_env.sh:83`, *after* sourcing `var/.env`, which is precisely the
+override this erratum needs not to happen. As written, the instruction above described
+something the code forbade. The rule now:
+
+- An **absolute** `SEEDPOD_CONFIG_DIR` wins, from the shell or from `var/.env`. Config is no
+  longer a property of the release, so it leaves the set of layout variables the launcher
+  owns. The other four (`SEEDPOD_LOG_DIR`, `SEEDPOD_PID_FILE`,
+  `SEEDPOD_SNAPSHOT_STORAGE_PATH`, `SEEDPOD_DATABASE_URL`) are unchanged and still override.
+- A **relative** one is still discarded. `SEEDPOD_CONFIG_DIR=config` is the stale-checkout
+  leftover the absolutes exist to prevent; operators owning the variable does not make that
+  value less of a bug.
+- A path that **does not exist is a refusal** (exit 78), not a fallback to the release's own
+  `config/`. Falling back would start seedpod serving the generic example profiles under the
+  name of a real deployment, which is worse than not starting.
+- The shell's value is captured **before** `.env` is sourced. `set -a; . .env` overwrites the
+  inherited environment, so without that a stale line in `.env` would beat a value the
+  operator exported deliberately. Explicit beats file; file beats the release default.
 
 **What a DR must settle before config becomes deployable.** The current thinking is to push
 config through `seedpodctl` rather than couple the release build to a second checkout: the

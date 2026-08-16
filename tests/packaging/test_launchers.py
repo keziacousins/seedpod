@@ -215,6 +215,65 @@ def test_dot_env_supplies_secrets_but_the_launcher_owns_the_paths(release):
     assert env["SEEDPOD_LOG_DIR"] != "logs"
 
 
+def test_an_absolute_config_dir_from_the_operator_wins(release, tmp_path):
+    """DR-0041 erratum E3. Config stopped being a property of the release when the
+    real deployment configuration moved to its own private repo -- the `config/`
+    an artifact carries is a generic default. So an absolute SEEDPOD_CONFIG_DIR
+    survives, where every other path variable is overridden."""
+    theirs = tmp_path / "seedpod-config"
+    theirs.mkdir()
+    log = release.parent / "calls.log"
+    run(release / "bin" / "seedpod", log=log, SEEDPOD_CONFIG_DIR=str(theirs))
+    env = calls(log)[-1]
+
+    assert env["SEEDPOD_CONFIG_DIR"] == str(theirs)
+    # The rest of the layout is unmoved by it.
+    assert env["SEEDPOD_LOG_DIR"] == str(release.parent / "var" / "log")
+
+
+def test_an_absolute_config_dir_in_var_dot_env_wins(release, tmp_path):
+    """The mechanism erratum E3 actually documents, and the one an appliance uses:
+    the operator records the path once in `var/.env` rather than exporting it in
+    every shell. It has to beat the release default while the relative paths in
+    the same file still lose."""
+    theirs = tmp_path / "seedpod-config"
+    theirs.mkdir()
+    env_file = release.parent / "var" / ".env"
+    env_file.write_text(f"{DOT_ENV}SEEDPOD_CONFIG_DIR={theirs}\n", encoding="utf-8")
+
+    log = release.parent / "calls.log"
+    run(release / "bin" / "seedpod", log=log)
+    env = calls(log)[-1]
+
+    assert env["SEEDPOD_CONFIG_DIR"] == str(theirs)
+    assert env["SEEDPOD_LOG_DIR"] == str(release.parent / "var" / "log")
+
+
+def test_a_relative_config_dir_is_still_discarded(release):
+    """The exception is for absolute paths only. `SEEDPOD_CONFIG_DIR=config` is
+    the stale-checkout leftover the absolutes exist to prevent -- it is the value
+    `var/.env` carries in this fixture, and it must not survive just because
+    operators may now own this variable."""
+    log = release.parent / "calls.log"
+    run(release / "bin" / "seedpod", log=log, SEEDPOD_CONFIG_DIR="config")
+    env = calls(log)[-1]
+
+    assert env["SEEDPOD_CONFIG_DIR"] == str(release / "config")
+
+
+def test_a_config_dir_that_does_not_exist_refuses_instead_of_falling_back(release, tmp_path):
+    """An operator who set this and mistyped it wants to hear so. Falling back to
+    the release's own config would start seedpod serving the generic example
+    profiles under the name of a real deployment -- the silent-wrong-config
+    failure, which is worse than not starting."""
+    missing = tmp_path / "not-there"
+    result = run(release / "bin" / "seedpod", SEEDPOD_CONFIG_DIR=str(missing))
+
+    assert result.returncode == 78, result.stderr
+    assert str(missing) in result.stderr
+    assert "SEEDPOD_CONFIG_DIR" in result.stderr
+
+
 def test_the_spa_is_pointed_at_only_when_a_bundle_is_really_there(release):
     """Decision 3: unset mounts nothing, which keeps the vite workflow working.
     Pointing at an empty directory instead would make `mount_spa` refuse at

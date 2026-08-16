@@ -149,8 +149,14 @@ to `seedpod.log.startup-<timestamp>` and keeps the last 10, so what the previous
 still readable.
 
 `var/.env` holds secrets and tokens. `seedpodctl` reads `SEEDPOD_API_URL` and
-`SEEDPOD_API_KEY` from it. The launcher owns the five path variables and overrides `.env` for
-those alone.
+`SEEDPOD_API_KEY` from it. The launcher owns four path variables — the log directory, pid
+file, snapshot path and database URL — and overrides `.env` for those alone.
+
+**`SEEDPOD_CONFIG_DIR` is yours.** Set it in `var/.env` to an absolute path and it wins;
+leave it unset and the release's own `config/` is used. That is how an appliance runs a real
+deployment's configuration, which lives in its own repo rather than in the artifact (DR-0041,
+erratum E3). A relative value is ignored, and a path that does not exist is refused rather
+than quietly replaced with the example config.
 
 ```bash
 ~/seedpod/current/bin/seedpodctl clusters list
