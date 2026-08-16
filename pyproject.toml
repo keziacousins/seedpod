@@ -10,9 +10,9 @@ requires-python = ">=3.11"
 # (the workflow engine owns background work), and psycopg2 (SQLite). Providers add their own
 # transport deps in Pillar 3 if needed.
 dependencies = [
-    "fastapi>=0.115.0",
+    "fastapi>=0.141.1",
     "uvicorn[standard]>=0.30.0",
-    "sqlalchemy>=2.0.20,<2.1.0",
+    "sqlalchemy>=2.0.52,<2.1.0",
     "pydantic>=2.5.0,<3.0.0",
     "cryptography>=41.0.0",
     "httpx>=0.27.0",
@@ -26,8 +26,8 @@ dependencies = [
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.8",
-    "hypothesis>=6.100.0",
-    "ruff>=0.13.0",
+    "hypothesis>=6.165.5",
+    "ruff>=0.16.3",
 ]
 
 [project.scripts]
