@@ -1,0 +1,45 @@
+# v1 archaeology — read-only, contains secrets and dirty history. NEVER commit.
+reference-code/
+
+# secrets & local state
+.env
+*.db
+# smoke-run state. `*.db` alone misses the `.db.bak-*` backups, which hold
+# encrypted kubeconfigs from real DigitalOcean runs — ignore the directory.
+db/
+# Snapshot storage (SEEDPOD_SNAPSHOT_STORAGE_PATH, default data/snapshots) — real
+# pg_dump archives of real clusters, including ones imported from v1. Same class of
+# hazard as db/, which `099fdcd` had to add for the same reason.
+# ANCHORED with a leading slash, deliberately (found 2026-08-10, DR-0034): an
+# unanchored `data/` matches a directory of that name at ANY depth, so it silently
+# ignored `seedpod/data/` too. Existing tracked files there were unaffected, but every
+# NEW one was invisible to `git add` — `0002_cluster_dns_record_id.sql` would have been
+# left out of its own commit, and a fresh clone would have had no dns_record_id column.
+/data/
+logs/
+admin-api-key.txt
+seedpod.pid
+
+# release artifacts (DR-0041). `dist/` is build output — the tarball is the
+# deliverable, not a tracked file. `var/` is a release root's STATE directory: if
+# one ever appears beside a checkout (a launcher run with SEEDPOD_VAR pointed
+# here), it holds the same class of secret `db/` and `/data/` do.
+/dist/
+/var/
+
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.coverage
+
+# os / editors
+.DS_Store
+.zed/
+# Agent tooling (the round-N workflow scripts). Untracked since it appeared;
+# ignored explicitly because `scripts/build_release.py` refuses to build from a
+# dirty tree and counts UNTRACKED files as dirty -- so an unignored scratch
+# directory blocks releases while never being able to reach the artifact.
+.claude/

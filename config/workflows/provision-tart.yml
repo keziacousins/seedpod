@@ -1,0 +1,137 @@
+# provision-tart — the tart verb family, re-normalized per DR-0022:
+# infra.create_instance (CreateInstance), infra.await_instance (ProbeInstance, gate
+# -- address acquisition), then k3s.await_ssh / k3s.trust_host_keys / k3s.install /
+# k3s.await_api / k3s.fetch_kubeconfig (tart is a real-VM provider using the shared
+# ssh-k3s plane, exactly like provision-digitalocean.yml from k3s.await_ssh onward --
+# same step ids, same verbs, same known_hosts threading).
+#
+# DR-0022 ruling 6: `k3s.await_ssh` is ADDED here (it was previously absent --
+# DR-0004 folded port-22 readiness into k3s.trust_host_keys' own ssh_default retry
+# budget instead of a dedicated gate, which meant DO and tart -- the same ssh-k3s
+# plane -- had different readiness semantics for no reason but historical
+# enumeration). It now mirrors provision-digitalocean.yml's `ssh` gate exactly,
+# using tart.yml's own `health_checks.ssh_ready_timeout` (180s) in place of DO's
+# 420s.
+#
+# No Traefik shim: real k3s (installed by k3s.install) ships its own bundled
+# Traefik -- only kind/orbstack (no k3s, no bundled ingress) get the parity shim.
+#
+# Head/tail/outcome shape mirrors provision-digitalocean.yml (Conflicts 8/9/10):
+# inputs shrink to cluster_id; cluster.load_spec builds the ClusterSpecification;
+# create emits InfraAllocated; kubeconfig never rides an event -- k3s.fetch_kubeconfig's
+# SecretStr output is persisted by cluster.store_kubeconfig, which mints kubeconfig_ref;
+# cancelled fires ProvisionFailed(reason="cancelled") like failed.
+#
+# Timeouts/intervals imported from config/providers/tart.yml (cited per literal
+# below); the intervals with no dedicated tart.yml key (tart IP poll, k3s poll, ssh
+# poll) are docs/design/coherence-review.md's named "physics constants" (§ "Physics
+# constants" paragraph), same source provision-digitalocean.yml's own 10s intervals
+# already draw on.
+workflow: provision-tart
+version: 1
+inputs:
+  cluster_id: {type: str}
+on_failure: compensate                         # failure OR cancel destroys what was made (C1)
+outcome:
+  succeeded: {event: ProvisionSucceeded,
+              payload: {public_ip: {from: vm.address}, kubeconfig_ref: {from: store.kubeconfig_ref}}}
+  failed:    {event: ProvisionFailed}          # emitted AFTER compensation settles
+  cancelled: {event: ProvisionFailed}          # reason="cancelled" engine-attached (Conflict 8)
+steps:
+  - id: spec                          # domain step: cluster row + provider_config ->
+    uses: cluster.load_spec           # ClusterSpecification, incl. salvaged
+    with: {cluster_id: {from: run.cluster_id}}    # allocate_cluster_cidrs() (Conflict 10)
+    timeout_seconds: 30
+    # Output: spec: ClusterSpecification, provider: str
+
+  - id: create                        # `tart clone` (local, fast) + `tart run
+    uses: infra.create_instance       # --no-graphics --rosetta=rosetta` (detached,
+    with: {provider: {from: spec.provider}, spec: {from: spec.spec},
+           cluster_id: {from: run.cluster_id}, slug: {from: spec.slug}}   # start_new_session=True
+    timeout_seconds: 60               # -- salvaged intact, seam-c-provider.md §5.7 item 5.
+                                       # `provider` is DR-0022 ruling 1's late-binding key.
+    emit:
+      event: InfraAllocated           # persists resource_ids onto the cluster record
+      payload: {resource_ids: {from: create.resource_ids}}
+    # Output: resource_ids: Mapping[str, str]
+
+  - id: vm                            # gate-only verb: execute no-op; poll: `tart ip`
+    uses: infra.await_instance        # until an address is assigned.
+    with: {provider: {from: spec.provider}, resource_ids: {from: create.resource_ids}}
+    gate: {timeout_seconds: 120, interval_seconds: 2}
+    # timeout_seconds: health_checks.vm_ip_timeout -- tart.yml
+    # interval_seconds: 2s tart IP interval -- coherence-review.md "Physics constants"
+    emit: {event: EndpointReady, payload: {public_ip: {from: vm.address}}}
+    # Output: address: str
+
+  - id: dns                           # DR-0034, identical to provision-digitalocean.yml's
+    uses: dns.create_record           # (see there for why it sits here and why it has no
+    with: {intent: {from: spec.dns_intent}, slug: {from: spec.slug},   # on_failure).
+           address: {from: vm.address}}
+    retry: api_default
+    timeout_seconds: 30
+    # v1 gated DNS on `dns_config.enabled` ALONE, never on provider, so this is in
+    # every provision file rather than the cloud ones only -- and it is a no-op
+    # without an intent. No shipped tart profile enables DNS (`exampleco-*-nodns.yml`
+    # set `enabled: false`), so this costs a local run nothing.
+    # Output: record: Optional[DnsRecordRef], created: bool
+
+  - id: dns_store
+    uses: cluster.store_dns_record
+    with: {cluster_id: {from: run.cluster_id}, record: {from: dns.record}}
+    timeout_seconds: 30
+
+  - id: ssh                           # gate-only (DR-0022 ruling 6): mirrors
+    uses: k3s.await_ssh               # provision-digitalocean.yml's `ssh` gate --
+    with: {host: {from: vm.address}}  # DO and tart share the ssh-k3s plane and now
+    gate: {timeout_seconds: 180, interval_seconds: 10, settle_seconds: 5}   # share readiness
+    # timeout_seconds: health_checks.ssh_ready_timeout -- tart.yml     # semantics, incl.
+    # settle_seconds=5: v1's "brief settle so sshd has finished its handshake
+    # setup" (_ssh_k3s_installer.py's wait_for_ssh_ready) -- the same homeless
+    # physics constant provision-digitalocean.yml's `ssh` gate now carries
+    # (Round-8a review finding).
+
+  - id: trust_host                    # TOFU keyscan -- canonical _ssh_k3s_installer copy
+    uses: k3s.trust_host_keys         # ONLY (never the dead StrictHostKeyChecking=no forks,
+    with: {host: {from: vm.address}, ssh_user: {from: spec.ssh_user},   # gotcha 13)
+           ssh_private_key_path: {from: spec.ssh_private_key_path}}   # DR-0023
+    retry: ssh_default
+    timeout_seconds: 310              # ssh_config.cloud_init_wait_timeout (300) +
+    # Output: known_hosts: str        # ssh_config.ssh_keyscan_timeout (10) -- tart.yml
+
+  - id: k3s                           # salvaged SSHBasedK3sInstaller body: CIDR flags,
+    uses: k3s.install                 # extra TLS SANs = address. undoable=False (no inverse --
+    with: {host: {from: vm.address}, spec: {from: spec.spec}, extra_tls_san: {from: vm.address},
+           acme: {from: spec.acme},          # DR-0036: Optional -- present only when the profile
+                                              # enabled BOTH ssl and dns, which is exactly when the
+                                              # Ingress templates render the certresolver annotation
+                                              # naming it. Written into the traefik HelmChartConfig
+                                              # BEFORE k3s starts, so no reconfigure/restart.
+           known_hosts: {from: trust_host.known_hosts}, ssh_user: {from: spec.ssh_user},   # subsumed
+           ssh_private_key_path: {from: spec.ssh_private_key_path}}   # by infra.create_instance's undo)
+    retry: ssh_default                # retry_attempts=3/retry_delay=5 (tart.yml
+    timeout_seconds: 600              # ssh_config) match NAMED_POLICIES.ssh_default
+                                       # k3s_config.install_timeout -- tart.yml
+
+  - id: k3s_ready
+    uses: k3s.await_api               # gate-only
+    with: {host: {from: vm.address}, known_hosts: {from: trust_host.known_hosts},
+           ssh_user: {from: spec.ssh_user}, ssh_private_key_path: {from: spec.ssh_private_key_path}}
+    gate: {timeout_seconds: 300, interval_seconds: 10}
+    # timeout_seconds: health_checks.k3s_ready_timeout -- tart.yml
+    # interval_seconds: 10s k3s interval -- coherence-review.md "Physics constants"
+
+  - id: kubeconfig
+    uses: k3s.fetch_kubeconfig        # rewrites server: to the VM's NAT IP
+    with: {host: {from: vm.address}, rewrite_server_to: {from: vm.address},
+           known_hosts: {from: trust_host.known_hosts}, ssh_user: {from: spec.ssh_user},
+           ssh_private_key_path: {from: spec.ssh_private_key_path}}
+    retry: ssh_default
+    timeout_seconds: 60               # mirrors provision-digitalocean.yml's fetch step;
+    # Output: kubeconfig: SecretStr   # tart.yml has no dedicated fetch-timeout key
+
+  - id: store                          # domain step: Fernet-encrypt via CryptoService, write
+    uses: cluster.store_kubeconfig     # clusters.encrypted_kubeconfig + kubeconfig_key_class
+    with: {cluster_id: {from: run.cluster_id}, kubeconfig: {from: kubeconfig.kubeconfig}}
+    timeout_seconds: 30
+    # Output: kubeconfig_ref: str      # "cluster-kubeconfig:{cluster_id}" -- opaque handle

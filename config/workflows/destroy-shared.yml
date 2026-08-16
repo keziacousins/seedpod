@@ -1,0 +1,70 @@
+# destroy-shared — docs/design/seam-b-engine.md §2.2 (Proof 3's trailing paragraph):
+# "destroy-shared (orbstack/kind) is this file plus one kube.wipe_namespace step
+# (on_failure: continue) before destroy, chosen at dispatch by provider kind, never
+# by an `if`." Otherwise byte-identical to destroy-cloud.yml, including the Conflict
+# 8 outcome correction (DestroyCompleted/DestroyStalled dead; DestroyFailed covers
+# both the failed and cancelled branches) and DR-0022's re-normalized verb names /
+# `cluster.load_infra` head (ruling 2) / gated daemonset delete (ruling 4).
+#
+# `kube.wipe_namespace`'s Params are this task's own minimal, honest inference
+# (Seam B names the verb and its position but not its shape) -- flagged for Pillar 3
+# reconciliation, same as the rest of tests/engine/declared_verbs.py's fixture types.
+workflow: destroy-shared
+version: 1
+inputs:
+  cluster_id: {type: str}
+  trigger: {type: str}                         # DR-0040 (amends ruling 2): "ttl_expiry" |
+  #                                              "operator" -- provenance nothing downstream
+  #                                              can re-derive, since both destroy routes
+  #                                              converge on DestroyDue.
+  snapshot: {type: bool}                       # DR-0043 -- see destroy-cloud.yml's comment.
+on_failure: report
+outcome:
+  succeeded: {event: DestroySucceeded}
+  failed:    {event: DestroyFailed}
+  cancelled: {event: DestroyFailed}
+steps:
+  - id: infra                                  # domain step: cluster row + provider_config ->
+    uses: cluster.load_infra                   # {provider, slug, resource_ids, dns_record}
+    with: {cluster_id: {from: run.cluster_id}} # read FRESH at run time (DR-0022 ruling 2) --
+    timeout_seconds: 30                        # never a stale dispatch-time snapshot
+    # Output: provider: str, slug: str, resource_ids: Mapping[str, str],
+    #         dns_record: Optional[DnsRecordRef]
+  - id: kubecfg
+    uses: cluster.load_kubeconfig_optional     # Output: kubeconfig: Optional[SecretStr]
+    on_failure: continue
+  - id: autosnap                              # DR-0040: the profile's own auto_snapshot on an
+    uses: cluster.auto_snapshot               # unattended destroy. DR-0043: AND the operator's
+    with: {cluster_id: {from: run.cluster_id}, trigger: {from: run.trigger},
+           snapshot: {from: run.snapshot}}
+    on_failure: continue                      # a TTL destroy is a DEADLINE -- a snapshot
+    timeout_seconds: 600                      # that cannot be taken must never strand a
+    #                                           cluster the TTL says must die.
+    # Placed AFTER kubecfg (it needs the kubeconfig) and BEFORE tailscale, i.e. while the
+    # cluster is still whole -- see destroy-cloud.yml's comment for the DR-0043 rationale
+    # and the step's one-snapshot precedence rule.
+  - id: tailscale                              # clean disconnect BEFORE infra teardown
+    uses: kube.delete_daemonset                # (gotcha 10: else 48h Tailscale lingering)
+    with: {kubeconfig: {from: kubecfg.kubeconfig}, name: tailscale, namespace: default,
+           grace_period_seconds: 30}
+    # namespace CORRECTED kube-system -> default (DR-0022 Erratum E3) -- see destroy-cloud.yml's
+    # comment for the full rationale (v1's DaemonSet manifest + cleanup both use `default`).
+    gate: {timeout_seconds: 45, interval_seconds: 5, settle_seconds: 3}
+    # DR-0022 ruling 4 + Erratum E2 -- see destroy-cloud.yml's comment: timeout/settle preserve
+    # v1's `--grace-period=30 --wait=true --timeout=45s` then a 3s post-success grace as gate
+    # data; interval_seconds is this gate's own poll cadence, distinct from the settle.
+    on_failure: continue                       # Optional kubeconfig=None => no-op
+  - id: dns
+    uses: dns.delete_record
+    with: {record: {from: infra.dns_record}}   # None => no-op
+    retry: api_default
+    on_failure: continue
+  - id: wipe                                   # local/shared providers: proactively wipe
+    uses: kube.wipe_namespace                  # app namespaces before tearing down the
+    with: {kubeconfig: {from: kubecfg.kubeconfig}, namespace: default}   # shared cluster/VM
+    on_failure: continue
+  - id: destroy                                # verb resolves provider with
+    uses: infra.destroy_instance               # check_enabled=False ALWAYS (gotcha 1)
+    with: {provider: {from: infra.provider}, slug: {from: infra.slug},
+           resource_ids: {from: infra.resource_ids}}
+    gate: {timeout_seconds: 900, interval_seconds: 15, max_consecutive_poll_failures: 5}

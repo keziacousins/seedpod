@@ -1,0 +1,50 @@
+# Seedpod Infrastructure Manager - Organization Configuration
+# This file defines infrastructure-level branding, naming, and conventions.
+# Deployment-specific settings belong in deployment profiles.
+#
+# This is an EXAMPLE config tree for the open-source release. "exampleco" is a
+# placeholder organization name -- replace every value in this file with your
+# own before deploying anything real.
+
+organization:
+  name: "seedpod"
+  display_name: "Seedpod Infrastructure Manager"
+  version: "1.0"
+  github_organization: "exampleco" # GitHub organization for GHCR image lookups
+
+# Infrastructure resource tagging (DigitalOcean, cloud providers)
+infrastructure:
+  # Primary tag for all managed resources
+  managed_tag: "seedpod-managed"
+
+  # Cluster identification tag pattern
+  # Will be used as: "cluster-uuid:{cluster_id}"
+  cluster_tag_prefix: "cluster-uuid"
+
+# Resource naming conventions
+naming:
+  # VPC naming: {vpc_prefix}-{region}
+  vpc_prefix: "seedpod-vpc"
+
+  # Management node prefix
+  mgmt_prefix: "seedpod-mgmt"
+
+  # Application node prefix
+  apps_prefix: "seedpod-apps"
+
+# API configuration
+api:
+  # API key format: {key_prefix}_{env}_{random_hex}
+  key_prefix: "seedpod"
+
+  # User-Agent for HTTP requests
+  user_agent: "seedpod/1.0"
+
+  # API documentation
+  title: "Seedpod Infrastructure Manager API"
+  description: "Central control plane for K3s-based deployment architecture"
+
+# Kubernetes secret naming conventions
+kubernetes:
+  # Default secret name for application secrets
+  app_secrets_name: "seedpod-app-secrets"

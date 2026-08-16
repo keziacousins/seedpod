@@ -1,0 +1,24 @@
+# deploy-rollback — docs/design/coherence-review.md Conflict 12, verbatim.
+#
+# Rollback is a machine DECISION, not a grammar feature: DEPLOYING x CancelRequested
+# -> CANCELLED emits CW(deploy), RW(rollback, deployment_id=self.id) (Conflict 12's
+# amended deployment-table row); the drain-lane admitter (Conflict 2) processes those
+# two effects in `seq` order, so this run only starts once the cancelled deploy run
+# it's rolling back is terminal. There is deliberately no rollback on ClusterGone (v1
+# parity -- no point rolling out `kubectl rollout undo` against a dying cluster).
+workflow: deploy-rollback
+version: 1
+inputs: {deployment_id: {type: str}}
+on_failure: report                    # v1 warns-and-continues on undo failure
+outcome:
+  succeeded: {event: RollbackFinished}       # total-Ignore Report (Conflict 8)
+  failed:    {event: RollbackFinished}
+  cancelled: {event: RollbackFinished}
+steps:
+  - id: kubecfg
+    uses: cluster.load_kubeconfig
+  - id: undo
+    uses: kube.rollout_undo           # ProviderStep -> KubeRolloutUndo; >=1-success semantics
+    with: {kubeconfig: {from: kubecfg.kubeconfig}, namespace: default}   # (crown jewel #13)
+    retry: kubectl_default
+    timeout_seconds: 120

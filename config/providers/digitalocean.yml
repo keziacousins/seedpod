@@ -1,0 +1,246 @@
+# DigitalOcean Provider Configuration
+# Maps provider-agnostic specifications to DigitalOcean-specific resources
+
+provider_name: "digitalocean"
+display_name: "DigitalOcean"
+description: "DigitalOcean droplet with K3s"
+
+# Enable/disable this provider
+# When disabled, seedpod will not create clusters or run jobs for this provider
+enabled: true
+
+# DigitalOcean project ID for resource organization
+# All created resources (droplets, VPCs, firewalls) will be assigned to this project
+project_id: "00000000-0000-0000-0000-000000000000" # placeholder -- replace with your own DigitalOcean project ID
+
+# Map generic region hints to DigitalOcean regions
+region_mapping:
+  "europe-west": "ams3" # Amsterdam
+  "europe-central": "fra1" # Frankfurt
+  "europe-north": "lon1" # London
+  "us-east": "nyc1" # New York
+  "us-west": "sfo3" # San Francisco
+  "us-central": "tor1" # Toronto
+  "asia-pacific": "sgp1" # Singapore
+  "asia-southeast": "blr1" # Bangalore
+
+# Map CPU cores + memory GB to DigitalOcean droplet sizes
+# Format: "cpu_cores,memory_gb" -> droplet_size
+node_size_mapping:
+  "1,1": "s-1vcpu-1gb" # Micro
+  "1,2": "s-1vcpu-2gb" # Small
+  "2,2": "s-2vcpu-2gb" # Medium-small
+  "2,4": "s-2vcpu-4gb" # Medium (default for ephemeral)
+  "4,8": "s-4vcpu-8gb" # Large
+  "8,16": "s-8vcpu-16gb" # X-Large
+  "4,16": "c-4" # CPU optimized
+  "8,32": "c-8" # CPU optimized large
+  "16,32": "s-16vcpu-32gb" # XX-Large
+  "32,64": "s-32vcpu-64gb" # Max standard
+
+# Default configuration
+defaults:
+  region: "ams3" # Amsterdam (Europe-West)
+  droplet_size: "s-2vcpu-4gb" # Medium size
+  image: "ubuntu-22-04-x64" # Ubuntu 22.04 LTS
+  ssh_key_name: "exampleco-testing"
+  ssh_user: "root"
+  ssh_private_key_path: "~/.ssh/id_exampleco_testing"
+
+# VPC configuration for secure private networking
+vpc_config:
+  # VPC name pattern: seedpod-vpc-{region}
+  name_prefix: "seedpod-vpc"
+  ip_range: "10.0.0.0/16"
+  description: "Seedpod Infrastructure Manager VPC"
+
+  # VPC will be created per region if it doesn't exist
+  create_if_missing: true
+
+# SSH access configuration (change based on your deployment environment)
+ssh_access:
+  # Sources that can SSH to droplets during provisioning and management
+  # Options: "0.0.0.0/0" (open), specific IPs, or CIDR blocks
+  allowed_sources:
+    - "0.0.0.0/0" # WARNING: Open to internet - change for production
+    # Examples for more restrictive access:
+    # - "203.0.113.0/24"      # Your office network
+    # - "198.51.100.42/32"    # Specific deployment server
+    # - "10.0.0.0/8"          # Private networks only
+
+# Kubernetes API access configuration
+k8s_api_access:
+  # Sources that can access K3s API server (kubectl)
+  allowed_sources:
+    - "0.0.0.0/0" # WARNING: Open to internet - change for production
+    # Examples:
+    # - "203.0.113.0/24"      # Your office network
+    # - "198.51.100.42/32"    # CI/CD server
+
+# Firewall configuration
+firewall_config:
+  # Management firewall (SSH and K3s API access)
+  management:
+    name_prefix: "seedpod-mgmt"
+    description: "Management traffic (SSH, K3s API)"
+    rules:
+      # SSH access from configured sources
+      - type: "inbound"
+        protocol: "tcp"
+        ports: "22"
+        sources:
+          type: "cidr_list" # Special type to use ssh_access.allowed_sources
+      # SSH access from within infrastructure (droplet-to-droplet)
+      - type: "inbound"
+        protocol: "tcp"
+        ports: "22"
+        sources:
+          type: "droplet_tag"
+          value: "seedpod-managed"
+      # K3s API server from configured sources
+      - type: "inbound"
+        protocol: "tcp"
+        ports: "6443"
+        sources:
+          type: "cidr_list" # Special type to use k8s_api_access.allowed_sources
+      # K3s API server from within VPC
+      - type: "inbound"
+        protocol: "tcp"
+        ports: "6443"
+        sources:
+          type: "droplet_tag"
+          value: "seedpod-managed"
+      # Internal cluster communication
+      - type: "inbound"
+        protocol: "tcp"
+        ports: "10250"
+        sources:
+          type: "droplet_tag"
+          value: "k3s-cluster"
+      # Flannel VXLAN
+      - type: "inbound"
+        protocol: "udp"
+        ports: "8472"
+        sources:
+          type: "droplet_tag"
+          value: "k3s-cluster"
+
+  # Application firewall (public access)
+  application:
+    name_prefix: "seedpod-apps"
+    description: "Application traffic (HTTP/HTTPS)"
+    rules:
+      # HTTP
+      - type: "inbound"
+        protocol: "tcp"
+        ports: "80"
+        sources:
+          type: "cidr"
+          value: "0.0.0.0/0"
+      # HTTPS
+      - type: "inbound"
+        protocol: "tcp"
+        ports: "443"
+        sources:
+          type: "cidr"
+          value: "0.0.0.0/0"
+
+# Droplet configuration
+droplet_config:
+  # Networking
+  enable_ipv6: true
+  enable_private_networking: true
+  enable_monitoring: true
+  enable_backups: false # Ephemeral clusters don't need backups
+
+  # Default tags applied to all droplets
+  default_tags:
+    - "seedpod-managed"
+    - "k3s-cluster"
+
+# K3s installation configuration
+k3s_config:
+  version: "v1.28.5+k3s1" # Specific K3s version
+  channel: "stable" # Or use channel instead of version
+  install_url: "https://get.k3s.io"
+
+  # K3s server arguments
+  server_args:
+    - "--disable=traefik" # We'll install our own ingress
+    - "--disable=servicelb" # Use cloud load balancer
+    - "--write-kubeconfig-mode=644"
+
+  # Installation timeout
+  install_timeout_seconds: 300 # 5 minutes
+
+# SSH configuration
+ssh_config:
+  connection_timeout: 30 # seconds
+  command_timeout: 300 # seconds
+  retry_attempts: 3
+  retry_delay: 5 # seconds between retries
+
+# DigitalOcean API HTTP request timeouts (seconds)
+# Prevents indefinite hangs when DO API is slow/unresponsive
+# These are timeouts for individual HTTP API calls (not operation completion)
+api_timeouts:
+  default: 30 # Default timeout for most API calls
+  list_droplets: 45 # Listing droplets (can be slower with many resources)
+  create_droplet: 60 # Creating droplet API call (not droplet ready time)
+  delete_droplet: 45 # Deleting droplet API call
+  load_droplet: 30 # Loading single droplet details
+
+# Health check configuration
+health_checks:
+  # Time to wait for droplet to be ready
+  droplet_ready_timeout: 600 # 10 minutes
+
+  # Time to wait for SSH to be available
+  ssh_ready_timeout: 420 # 7 minutes
+
+  # Time to wait for K3s to be ready
+  k3s_ready_timeout: 600 # 10 minutes
+
+  # Health check intervals
+  status_check_interval: 20 # seconds
+
+# Cost optimization settings
+cost_optimization:
+  # Automatically destroy clusters after TTL + grace period
+  ttl_grace_period_hours: 1
+
+  # Enable automatic shutdown for long-running clusters
+  auto_shutdown_enabled: false
+  auto_shutdown_after_hours: 168 # 1 week
+
+# Environment-specific overrides
+environment_overrides:
+  ephemeral:
+    # Smaller instances for feature branches
+    default_node_spec:
+      cpu_cores: 1
+      memory_gb: 2
+      disk_gb: 30
+    droplet_config:
+      enable_backups: false
+      enable_monitoring: false # Reduce costs
+
+  staging:
+    # Standard instances for staging
+    default_node_spec:
+      cpu_cores: 2
+      memory_gb: 4
+      disk_gb: 50
+    droplet_config:
+      enable_backups: false
+      enable_monitoring: true
+
+  production:
+    # Larger instances for production
+    default_node_spec:
+      cpu_cores: 4
+      memory_gb: 8
+      disk_gb: 100
+    droplet_config:
+      enable_backups: true
+      enable_monitoring: true

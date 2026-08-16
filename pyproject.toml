@@ -1,0 +1,57 @@
+[project]
+name = "seedpod"
+version = "2.0.0a0"
+description = "Control plane for K3s-based ephemeral deployment environments"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+
+# v2 deliberately drops v1's alembic (numbered-SQL migrations only), celery/redis/apscheduler
+# (the workflow engine owns background work), and psycopg2 (SQLite). Providers add their own
+# transport deps in Pillar 3 if needed.
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "sqlalchemy>=2.0.20,<2.1.0",
+    "pydantic>=2.5.0,<3.0.0",
+    "cryptography>=41.0.0",
+    "httpx>=0.27.0",
+    "PyYAML>=6.0.0,<7.0.0",
+    "jinja2>=3.1.0,<4.0.0",
+    "python-dotenv>=1.0.0,<2.0.0",
+]
+
+[dependency-groups]
+# no pytest-mock, no unittest.mock: banned by the testing posture (CLAUDE.md)
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.8",
+    "hypothesis>=6.100.0",
+    "ruff>=0.13.0",
+]
+
+[project.scripts]
+# DR-0021: three entry points, one console script per trust model.
+seedpod = "seedpod.__main__:main"
+seedpod-bootstrap = "seedpod.bootstrap:main"
+seedpodctl = "seedpod.ctl.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["seedpod"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "C4", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "--tb=short"

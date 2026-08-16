@@ -1,0 +1,124 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: exampleco-api
+  labels:
+    app: exampleco-api
+    environment: "{{ config.environment }}"
+    cluster-id: "{{ config.cluster_id }}"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: exampleco-api
+  template:
+    metadata:
+      labels:
+        app: exampleco-api
+        environment: "{{ config.environment }}"
+        cluster-id: "{{ config.cluster_id }}"
+    spec:
+      serviceAccountName: exampleco-api-sa
+
+      imagePullSecrets:
+        - name: ghcr-secret
+
+      containers:
+        - name: exampleco-api
+          image: "{{ images.exampleco_api }}"
+          ports:
+            - containerPort: 8000
+          env:
+            # Environment variables from deployment profile (shared + this
+            # service's own, already merged by EnvironmentVariables.resolve_
+            # all_services)
+            {% for key, value in environment_variables.get('exampleco-api', {}).items() %}
+            - name: {{ key }}
+              value: "{{ value }}"
+            {% endfor %}
+            # Secrets
+
+            - name: DATABASE_PASSWORD
+              value: "{{ secrets.database_password }}"
+
+            - name: CACHE_PASSWORD
+              value: "{{ secrets.cache_password }}"
+
+            - name: S3_ACCESS_KEY
+              value: "{{ secrets.s3_access_key }}"
+
+            - name: S3_SECRET_KEY
+              value: "{{ secrets.s3_secret_key }}"
+
+            - name: JWT_SECRET
+              value: "{{ secrets.jwt_secret }}"
+
+            - name: MAIL_PASSWORD
+              value: "{{ secrets.mail_password }}"
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 10
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: exampleco-api
+  labels:
+    app: exampleco-api
+    environment: "{{ config.environment }}"
+spec:
+  selector:
+    app: exampleco-api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+  type: ClusterIP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: exampleco-api
+  labels:
+    app: exampleco-api
+    environment: "{{ config.environment }}"
+  {% if use_acme_certs %}
+  annotations:
+    traefik.ingress.kubernetes.io/router.tls.certresolver: letsencrypt
+  {% endif %}
+spec:
+  {% if cluster_hostname is dns_name and ssl_enabled %}
+  tls:
+    - hosts:
+        - {{ cluster_hostname }}
+  {% endif %}
+  rules:
+    - {% if cluster_hostname is dns_name %}host: {{ cluster_hostname }}{% endif %}
+
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: exampleco-api
+                port:
+                  number: 8000

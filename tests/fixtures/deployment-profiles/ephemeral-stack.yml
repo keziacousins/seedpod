@@ -1,0 +1,27 @@
+# Test-only fixture filling a genuine gap in tests/fixtures/deployment-rules.yml:
+# its `feature_branches` rule carries no explicit `deployment_profile` key, so
+# `DeploymentService.version_update` falls back to its hardcoded default name
+# (`seedpod/app/services/deployment_service.py`'s `_DEFAULT_DEPLOYMENT_PROFILE =
+# "ephemeral-stack"`, itself matching v1's own hardcoded fallback --
+# reference-code/seedpod/seedpod/api/deployments.py:185,
+# orchestrator/cluster_manager.py:1503 etc, "deployment_decision.config.get(
+# 'deployment_profile', 'ephemeral-stack')"). v1's fallback was never actually
+# exercised in production: every real rule in BOTH reference-code's and this
+# repo's config/deployment-rules.yml sets an explicit `deployment_profile`
+# (exampleco-stack, exampleco-web-2-kind) -- "ephemeral-stack.yml" never existed as a
+# real file in either tree. Without it, the parity gate's own hard assertion
+# (`test_feature_branch_deployment_flow`: `cluster_id is not None`) cannot pass,
+# since DeploymentService aborts before birthing a cluster when the profile
+# fails to load and no existing cluster is found
+# (`seedpod/app/services/deployment_service.py::version_update`).
+#
+# `services: {}` deliberately -- lets ANY triggering repo used across the parity
+# gate (exampleco-core, exampleco-api, exampleco-web, exampleco-financial-backend, ...) resolve
+# cleanly with zero required services, so zero GHCR/registry calls are ever
+# needed regardless of which repo fired the webhook.
+version: "1.0"
+description: "Minimal ephemeral-stack test fixture (DeploymentService default_profile fallback)"
+manifests_dir: "config/manifest-templates/ephemeral-stack"
+resolution_strategy: "branch_discovery_with_fallback"
+provider: "fake"
+services: {}

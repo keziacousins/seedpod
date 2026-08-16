@@ -1,0 +1,146 @@
+version: "1.0"
+description: "Example stack deployment with a real DNS record and a Let's Encrypt (staging) certificate"
+manifests_dir: "config/manifest-templates/exampleco-stack"
+environment_type: "ephemeral"
+resolution_strategy: "branch_discovery_with_fallback"
+fallback_branches: ["staging", "dev"]
+default_secrets_class: "DEV"
+rollout_timeout_seconds: 900
+
+# Provider-agnostic cluster specification
+cluster_spec:
+  node_specification:
+    cpu_cores: 2
+    memory_gb: 4
+    disk_gb: 30
+    region_hint: "europe-west"
+
+  cluster_config:
+    node_count: 1
+    ttl_hours: 4
+    tags: ["ephemeral", "example", "dns"]
+    kubernetes_version: "stable"
+
+  # Ingress configuration -- a SIBLING of cluster_config, not nested inside
+  # it (three of the four shipped profiles use this shape).
+  ingress_strategy:
+    type: "traefik"
+
+    traefik:
+      enabled: true
+      expose_method: "hostport"
+      http_port: 80
+      https_port: 443
+
+# DNS configuration -- a real record gets created, so a real hostname
+# resolves. No `hostname:` block: absence + `dns.enabled: true` infers the
+# "dns" strategy (v1's own backward-compat rule).
+dns:
+  enabled: true
+  zone: "cluster.example.com"
+
+# SSL/TLS configuration -- Let's Encrypt via the DNS-01/HTTP-01 certresolver.
+# Deliberately pointed at Let's Encrypt STAGING: production allows only 50
+# certs/week per registered domain, and every ephemeral cluster this profile
+# creates would burn one. Point this at production only as a deliberate,
+# reviewed act.
+ssl:
+  enabled: true
+  acme_email: "devops@example.com"
+  acme_server: "https://acme-staging-v02.api.letsencrypt.org/directory"
+
+# Auto-snapshot configuration
+auto_snapshot:
+  enabled: true
+  name_pattern: "auto-{cluster_slug}-{date}"
+
+services:
+  exampleco-api:
+    repository: "exampleco-api"
+    port: 8000
+    replicas: 1
+    required: true
+
+  postgres:
+    repository: "postgres"
+    port: 5432
+    replicas: 1
+    external: true
+    required: true
+    image_override: "postgres:16-alpine"
+    deploy_wave: 1
+    persistence:
+      type: "postgres"
+      database: "exampleco"
+      username: "exampleco"
+      migration_service: "exampleco-migrations"
+
+  cache:
+    repository: "redis"
+    port: 6379
+    replicas: 1
+    external: true
+    required: true
+    image_override: "redis:7-alpine"
+    deploy_wave: 1
+
+  minio:
+    repository: "minio"
+    port: 9000
+    replicas: 1
+    external: true
+    required: true
+    image_override: "minio/minio:latest"
+    deploy_wave: 1
+
+  exampleco-migrations:
+    repository: "exampleco-migrations"
+    port: 0
+    replicas: 0
+    external: false
+    required: true
+    migration_type: job
+    deploy_wave: 2
+
+  rbac:
+    repository: "rbac"
+    port: 0
+    replicas: 0
+    external: true
+    required: true
+    image_override: "none"
+
+environment_variables:
+  shared:
+    CLUSTER_ID: "{{ cluster_id }}"
+    LOG_JSON: "false"
+    APP_PUBLIC_URL: "https://{{ cluster_hostname }}"
+    WEBHOOK_CALLBACK_URL: "https://{{ cluster_hostname }}/webhooks"
+
+  services:
+    exampleco-api:
+      SERVICE_NAME: "exampleco-api"
+      DATABASE_HOST: "postgres.default.svc.cluster.local"
+      DATABASE_PORT: "5432"
+      DATABASE_NAME: "exampleco"
+      DATABASE_USERNAME: "exampleco"
+      CACHE_HOST: "cache.default.svc.cluster.local:6379"
+      S3_HOST: "minio.default.svc.cluster.local:9000"
+      API_BASE_URL: "https://{{ cluster_hostname }}/api"
+      ADMIN_DASHBOARD_URL: "https://{{ cluster_hostname }}/admin"
+      REDIRECT_URI: "https://{{ cluster_hostname }}/*"
+
+    postgres:
+      POSTGRES_DB: "exampleco"
+      POSTGRES_USER: "exampleco"
+
+    cache:
+
+    minio:
+      MINIO_ROOT_USER: "dev-minio-access-key"
+
+    exampleco-migrations:
+      database_host: "postgres.default.svc.cluster.local"
+      database_port: "5432"
+      database_name: "exampleco"
+      database_username: "exampleco"

@@ -1,0 +1,22 @@
+#!/bin/sh
+#
+# The offline bootstrap CLI (DR-0021 §0a/point 2), wrapped so it resolves the
+# same release root and the same var/ the server does. It touches the database
+# and the secret store DIRECTLY -- no HTTP, no running server -- so pointing it
+# at a different config_dir or database_url than bin/seedpod is not a
+# misconfiguration you would notice until the data disagreed.
+#
+#   bin/seedpod-bootstrap migrate
+#   bin/seedpod-bootstrap create-admin <username>
+#   bin/seedpod-bootstrap seed-secrets <environment> --profile <name> --dry-run
+#
+# Runs against a stopped server by design: `migrate` on a live database is how a
+# schema change and an open connection meet.
+
+set -eu
+
+SEEDPOD_BIN_DIR=$(cd "$(dirname "$0")" && pwd)
+export SEEDPOD_BIN_DIR
+. "$SEEDPOD_BIN_DIR/_seedpod_env.sh"
+
+exec "$PY" -m seedpod.bootstrap "$@"

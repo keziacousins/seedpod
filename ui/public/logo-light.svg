@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="48" height="48" viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg">
+<style>.d{fill:#3d3828}.l{fill:#7a6f52}</style>
+<g transform="translate(24 24) scale(0.6)">
+<g transform="matrix(0.20268 -0.17007 0.17007 0.20268 0 20)">
+<ellipse class="d" rx="75" ry="20"/>
+<ellipse class="l" cx="3" cy="-2" rx="60" ry="13"/>
+</g>
+<g transform="matrix(0.21673 0.15176 -0.15176 0.21673 -2.5 -18)">
+<ellipse class="d" rx="80" ry="22"/>
+<ellipse class="l" cx="4" cy="-2" rx="63" ry="14"/>
+</g>
+<g transform="matrix(0.26358 0.02306 -0.02306 0.26358 -10 0)">
+<ellipse class="d" rx="95" ry="25"/>
+<ellipse class="l" cx="5" cy="-3" rx="75" ry="16"/>
+</g>
+</g>
+</svg>

@@ -1,0 +1,156 @@
+# kind Provider Configuration
+# Maps provider-agnostic specifications to kind (Kubernetes in Docker) clusters
+# For local development and testing on macOS/Linux
+
+provider_name: "kind"
+display_name: "kind (local)"
+description: "Local Kubernetes cluster using kind (Kubernetes in Docker)"
+
+# Enable/disable this provider
+# When disabled, seedpod will not create clusters or run jobs for this provider
+enabled: true
+
+# Network accessibility configuration
+# IMPORTANT: Configure how the seedpod daemon will reach kind clusters
+api_server:
+  # The hostname/IP that seedpod can use to reach the Docker host running kind
+  # Examples:
+  #   - "localhost" (seedpod and kind on same machine)
+  #   - "192.168.1.100" (kind host's LAN IP)
+  #   - "macbook.local" (mDNS name)
+  #   - "docker-host.tailscale" (Tailscale hostname)
+  host: "minimax.local"
+
+  # Port range for kind API servers (each cluster gets a unique port)
+  # kind will bind the API server to 0.0.0.0:<port> on the Docker host
+  port_range_start: 6443
+  port_range_end: 6543
+
+# Default kind configuration
+defaults:
+  # Kubernetes node image - determines K8s version
+  # See https://github.com/kubernetes-sigs/kind/releases for available versions
+  node_image: "kindest/node:v1.29.2"
+
+  # Maximum time to wait for cluster to be ready
+  wait_timeout: "5m"
+
+  # Keep failed clusters for debugging (otherwise deleted on failure)
+  retain_on_failure: false
+
+# Cluster networking defaults
+cluster_defaults:
+  networking:
+    # Pod network CIDR (uses kind's kindnet CNI)
+    # Note: seedpod will override these with unique CIDRs per cluster
+    pod_subnet: "10.244.0.0/16"
+    service_subnet: "10.96.0.0/12"
+
+    # Disable default CNI if using custom (not recommended for kind)
+    disable_default_cni: false
+
+  # Extra port mappings from Docker host to kind control-plane container
+  # Traefik uses hostPort to bind directly to these ports on the container
+  # These mappings expose those ports from the Docker host
+  extra_port_mappings:
+    - container_port: 80
+      host_port: 80
+      protocol: TCP
+    - container_port: 443
+      host_port: 443
+      protocol: TCP
+
+  # Container runtime settings
+  containerd_config_patches: []
+
+# Node size mapping
+# kind doesn't have true "instance types" - this maps to number of worker nodes
+# For local dev, single-node (control-plane only) is usually sufficient
+node_size_mapping:
+  # Format: "cpu_cores,memory_gb" -> kind config
+  # CPU/memory values are ignored for kind; we just use worker count
+  "1,1":
+    workers: 0
+    description: "Control plane only (fastest startup)"
+  "1,2":
+    workers: 0
+    description: "Control plane only"
+  "2,2":
+    workers: 0
+    description: "Control plane only"
+  "2,4":
+    workers: 1
+    description: "1 worker node"
+  "4,8":
+    workers: 1
+    description: "1 worker node"
+  "8,16":
+    workers: 2
+    description: "2 worker nodes"
+
+  # Fallback for any unmatched size
+  default:
+    workers: 0
+    description: "Control plane only (default)"
+
+# Region mapping (ignored for kind - all clusters are local)
+# Included for interface compatibility with CloudProvider
+region_mapping:
+  "europe-west": "local"
+  "europe-central": "local"
+  "us-east": "local"
+  "us-west": "local"
+  "asia-pacific": "local"
+  default: "local"
+
+# Docker configuration
+docker:
+  # Docker network for kind clusters
+  # Each kind cluster creates its own network by default
+  # Set to a specific network name to share networks
+  network: null # null = let kind manage networks
+
+  # Container labels applied to kind nodes
+  labels:
+    managed-by: "seedpod"
+
+# Health check configuration
+health_checks:
+  # Time to wait for cluster to be ready after creation
+  cluster_ready_timeout: 300 # 5 minutes
+
+  # Interval between readiness checks
+  status_check_interval: 5 # seconds
+
+  # kubectl connectivity check timeout
+  kubectl_timeout: 30 # seconds
+
+# Cleanup configuration
+cleanup:
+  # Delete Docker volumes when destroying cluster
+  delete_volumes: true
+
+  # Delete Docker network when destroying cluster (if dedicated)
+  delete_network: true
+
+# Environment-specific overrides
+environment_overrides:
+  ephemeral:
+    defaults:
+      wait_timeout: "3m" # Faster timeout for ephemeral
+    # Note: ephemeral uses cluster_defaults.extra_port_mappings (HTTP access needed)
+
+  local:
+    defaults:
+      retain_on_failure: true # Keep failed clusters for debugging
+    cluster_defaults:
+      extra_port_mappings:
+        - container_port: 80
+          host_port: 8080
+          protocol: TCP
+        - container_port: 443
+          host_port: 8443
+          protocol: TCP
+        - container_port: 30000
+          host_port: 30000
+          protocol: TCP

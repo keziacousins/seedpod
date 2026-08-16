@@ -1,0 +1,27 @@
+# Test-only fixture: the "infrastructure-only" profile
+# tests/acceptance/test_deployment_flow.py::test_deployment_preview_to_actual_deployment
+# (ported verbatim from v1's e2e suite) previews, but that never existed as an
+# on-disk profile in EITHER tree (v1's config/deployment-profiles/ has no such
+# file either -- only a same-named in-memory dict generator,
+# reference-code/seedpod/tests/fixtures/test_manifests.py:39-62
+# `infrastructure_only_manifest()`, used by a different, non-e2e test suite).
+# Salvaged from that generator's shape (both services external + image_override,
+# so resolution needs zero GHCR/registry calls -- works with github_token unset).
+# Overlaid onto test_config_dir by tests/conftest.py, never shipped in production
+# config/.
+version: "1.0"
+description: "Infrastructure services only (postgres, keycloak) for testing"
+manifests_dir: "config/manifest-templates/infrastructure-only"
+resolution_strategy: "branch_discovery_with_fallback"
+provider: "fake"
+services:
+  postgres:
+    repository: postgres
+    external: true
+    required: true
+    image_override: "postgres:15.4-alpine"
+  keycloak:
+    repository: keycloak
+    external: true
+    required: true
+    image_override: "quay.io/keycloak/keycloak:22.0"

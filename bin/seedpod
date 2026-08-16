@@ -1,0 +1,46 @@
+#!/bin/sh
+#
+# The server launcher (DR-0041 decision 4). Runs in the FOREGROUND: no nohup, no
+# `&`, no supervisor. A session-bound process inherits its shell's Local Network
+# grant -- the workaround docs/guides/tart-local-dev.md documents as *borrowing* a
+# grant rather than holding one, and the reason launchd (and with it the whole
+# code-signing question) is out of scope here.
+#
+# `exec` is load-bearing: the server replaces this shell, so Ctrl-C and any
+# SIGTERM reach uvicorn directly instead of killing a wrapper and orphaning the
+# thing it wrapped. Orphaning is the exact 2026-08-13 failure -- a server that
+# outlived its session and served 18-hour-old code while answering /health.
+#
+# The version banner prints BEFORE the exec, so "which code is this?" is
+# answered in the terminal that started it even if the boot then fails.
+# The port and singleton guards live in seedpod/__main__.py (Amendment B), not
+# here: a guard in a shell wrapper is only as good as the next script that
+# forgets to use the wrapper.
+#
+# Usage:  bin/seedpod            run the server
+#         bin/seedpod --version  print what this release is, and exit
+
+set -eu
+
+SEEDPOD_BIN_DIR=$(cd "$(dirname "$0")" && pwd)
+export SEEDPOD_BIN_DIR
+. "$SEEDPOD_BIN_DIR/_seedpod_env.sh"
+
+case "${1:-}" in
+    --version|-V)
+        seedpod_banner
+        exit 0
+        ;;
+    -h|--help)
+        echo "usage: seedpod [--version]"
+        echo "  Runs the seedpod server in the foreground. Ctrl-C stops it."
+        echo "  Release root: $RELEASE_ROOT"
+        echo "  State:        $SEEDPOD_VAR"
+        exit 0
+        ;;
+esac
+
+seedpod_banner
+echo "  state: $SEEDPOD_VAR   logs: $SEEDPOD_LOG_DIR"
+
+exec "$PY" -m seedpod

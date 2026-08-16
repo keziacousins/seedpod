@@ -1,0 +1,51 @@
+# Resolution Strategies Configuration
+# This file defines the available image resolution strategies for manifest resolution
+
+strategies:
+  # Default strategy - try same branch across repos, fallback to dev/main
+  branch_discovery_with_fallback:
+    description: "Query registry for same branch name across all repos, fallback to dev/main branches"
+    explanation: "This strategy attempts to find container images matching the triggering branch across all service repositories. If no image is found for the triggering branch, it falls back to the configured fallback branches (dev, then main). This is ideal for feature branch deployments where you want to use matching feature branch images when available, but gracefully fall back to stable branches when a service hasn't been updated for that feature."
+    fallback_branches: ["dev", "main"]
+    require_triggering_repo: true
+    allow_external_fallback: true
+
+  # Latest images only - always use main/dev branches
+  latest_only:
+    description: "Always use latest images from main/dev branches, ignore triggering branch"
+    explanation: "This strategy ignores the triggering branch and always uses the latest stable images from main or dev branches. It does not require the triggering repository to have an image, allowing deployments to be triggered by any repository while always deploying the latest stable versions of all services. This is useful for staging environments or when you want consistent stable deployments regardless of which repository triggered the update."
+    fallback_branches: ["main", "dev"]
+    require_triggering_repo: false
+    allow_external_fallback: true
+
+  # Strict branch matching - no fallbacks allowed
+  strict_branch:
+    description: "Require exact branch match for all services, fail if not found"
+    explanation: "This strategy requires an exact branch match for all services and provides no fallbacks. Only the triggering repository is searched, and deployment will fail if any service doesn't have an image for the exact triggering branch. This ensures complete consistency across all services for a given branch, useful in scenarios where you need guaranteed version alignment or want to prevent partial deployments with mixed branch images."
+    fallback_branches: []
+    require_triggering_repo: true
+    allow_external_fallback: false
+
+  # Development focused - prefer dev branch
+  dev_priority:
+    description: "Try dev branch first, then triggering branch, then main"
+    explanation: "This strategy prioritizes the dev branch for all services, making it useful for development and testing environments where you want the latest development versions. It searches across all repositories (not just the triggering one) and falls back to main if dev is not available. This ensures you're always running recent development builds even when triggered by feature branches."
+    fallback_branches: ["dev", "main"]
+    require_triggering_repo: false
+    allow_external_fallback: true
+
+  # Production focused - tagged releases only
+  production_tags:
+    description: "Only use tagged releases, no branch-based images"
+    explanation: "This strategy is designed for production environments where only explicitly tagged releases should be deployed. It does not use branch-based images and has no fallback branches, ensuring that only versioned, tagged releases are deployed. Deployments will fail if tagged images are not available, preventing accidental deployment of development code to production."
+    fallback_branches: []
+    require_triggering_repo: true
+    allow_external_fallback: false
+
+  # Hybrid strategy - some services follow branch, others use stable
+  hybrid_stable:
+    description: "Mix of branch discovery and stable branches for different services"
+    explanation: "This flexible strategy allows for mixed deployment scenarios where some services track feature branches while others remain on stable versions. It attempts to find images for the triggering branch first, then falls back through main, stable, and dev branches. This is useful when you have core services that should remain stable while allowing peripheral services to track feature development."
+    fallback_branches: ["main", "stable", "dev"]
+    require_triggering_repo: true
+    allow_external_fallback: true

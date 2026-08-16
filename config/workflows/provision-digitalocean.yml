@@ -1,0 +1,170 @@
+# provision-digitalocean — docs/design/seam-b-engine.md §2.2 Proof 2, REWRITTEN per
+# docs/design/coherence-review.md, verb names re-normalized per DR-0022:
+#   - Conflict 10 (head): inputs shrink to `cluster_id` -- the pure machine emitting
+#     RunWorkflow(provision) cannot build a ClusterSpecification, so a new domain
+#     step `cluster.load_spec` builds it; `infra.create_instance`'s Output carries
+#     `resource_ids: Mapping[str, str]` (droplet_id naming is dead), mirroring Seam
+#     C's InstanceCreated.resource_ids.
+#   - Conflict 14 (known_hosts): `k3s.trust_host_keys` declares Output known_hosts:
+#     str and every subsequent SSH step (k3s.install, k3s.await_api,
+#     k3s.fetch_kubeconfig) binds it -- TOFU (crown jewel #2) threaded structurally,
+#     provable by validator V4 at load time instead of only at runtime.
+#   - Conflict 9 (tail): kubeconfig never rides an event -- k3s.fetch_kubeconfig's
+#     SecretStr output is persisted by the domain step `cluster.store_kubeconfig`
+#     (Fernet-encrypt + mint `kubeconfig_ref`); ProvisionSucceeded carries the ref,
+#     never the secret.
+#   - Conflict 8 (outcome): ProvisionCancelled does not exist -- cancelled fires
+#     ProvisionFailed(reason="cancelled") like failed (reason engine-attached; the
+#     YAML outcome blocks below are Conflict 9's verbatim block).
+#   - DR-0022 P6 (glossary nouns): `do.await_droplet`'s output field `ip` is dead --
+#     `infra.await_instance` (the 3->1 merge of do.await_droplet/kind.await_ready/
+#     tart.await_vm) outputs `address: str`, one name across all four providers.
+#
+# Timeouts are v1's tuned values (config/providers/digitalocean.yml health_checks /
+# ssh_config / k3s_config), imported not re-guessed:
+#   droplet_ready_timeout=600, ssh_ready_timeout=420, k3s_ready_timeout=600,
+#   install_timeout_seconds=300; trust_host's 330s = cloud-init wait (300) +
+#   keyscan (10) per Conflict 14's own comment.
+workflow: provision-digitalocean
+version: 1
+inputs:
+  cluster_id: {type: str}
+on_failure: compensate                         # failure OR cancel destroys what was made (C1)
+outcome:
+  succeeded: {event: ProvisionSucceeded,
+              payload: {public_ip: {from: droplet.address}, kubeconfig_ref: {from: store.kubeconfig_ref}}}
+  failed:    {event: ProvisionFailed}          # emitted AFTER compensation settles
+  cancelled: {event: ProvisionFailed}          # reason="cancelled" engine-attached (Conflict 8)
+steps:
+  - id: spec                          # domain step: cluster row + provider_config ->
+    uses: cluster.load_spec           # ClusterSpecification, incl. salvaged
+    with: {cluster_id: {from: run.cluster_id}}    # allocate_cluster_cidrs() (Conflict 10)
+    timeout_seconds: 30
+    # Output: spec: ClusterSpecification, provider: str
+
+  - id: create                        # API call only; undoable, idempotent=False.
+    uses: infra.create_instance       # execute: ctx.note(resource_ids=...) the instant the
+    with: {provider: {from: spec.provider}, spec: {from: spec.spec},
+           cluster_id: {from: run.cluster_id}, slug: {from: spec.slug}}   # API responds --
+    timeout_seconds: 60               # `provider` is DR-0022 ruling 1's late-binding key
+                                       # (dict lookup, never a branch); undo: destroy by
+                                       # resource_ids from output/notes, else by cluster-uuid
+                                       # TAG lookup -- tolerant of "never created". Closes C1.
+    emit:                             #
+      event: InfraAllocated           # persists resource_ids onto the cluster record via
+      payload: {resource_ids: {from: create.resource_ids}}   # Pillar 1, same tx as step success
+    # Output: resource_ids: Mapping[str, str]      # was droplet_id: str -- aligned with
+    #                                              # Seam C InstanceCreated.resource_ids
+
+  - id: droplet                       # gate-only verb: execute no-op; poll: droplet active?
+    uses: infra.await_instance        # final Ready enriches outputs with the address
+    with: {provider: {from: spec.provider}, resource_ids: {from: create.resource_ids}}
+    gate: {timeout_seconds: 600, interval_seconds: 20}   # droplet_ready_timeout;
+    # interval_seconds=20 is v1's status_check_interval (config/providers/
+    # digitalocean.yml health_checks), which _wait_for_droplet_ready read
+    # directly for this exact loop. This is the only gate here that polls a
+    # RATE-LIMITED API, so halving the interval doubles DO API calls per
+    # provision for no gain (Round-8a gate finding m-3).
+    #
+    # NO settle_seconds: v1's 30s post-active warmup ("wait a bit more for SSH
+    # to be ready", _wait_for_droplet_ready) is SUBSUMED by the `ssh` gate
+    # below, which polls for exactly that condition directly instead of paying
+    # a fixed delay. The constant itself is preserved as data, with that
+    # subsumption recorded, at seedpod/providers/digitalocean.py's
+    # `DigitalOceanConfig.settle_seconds` -- its Erratum-E2 home. An earlier
+    # revision ALSO set it here as a real gate sleep, which made every DO
+    # provision pay the 30s and the poll (gate finding m-4).
+    emit: {event: EndpointReady, payload: {public_ip: {from: droplet.address}}}
+    # Output: address: str
+
+  - id: dns                           # DR-0034: the create half #22 found missing. No-op
+    uses: dns.create_record           # unless the profile enabled DNS (spec.dns_intent
+    with: {intent: {from: spec.dns_intent}, slug: {from: spec.slug},   # is then None).
+           address: {from: droplet.address}}
+    retry: api_default
+    timeout_seconds: 30
+    # Placed HERE, not at the tail: this is the earliest point the address exists
+    # (v1's own precondition -- state_manager.py:962 returned False with no
+    # public_ip), so the remaining ~3min of k3s install becomes free DNS
+    # propagation before the first deploy renders this hostname into an Ingress.
+    # NO `on_failure: continue`, deliberately diverging from v1's "not critical"
+    # (state_manager.py:1009) -- DR-0034 decision 7: a DNS-profile cluster renders
+    # its hostname into every Ingress host and every app URL, so reaching ACTIVE
+    # with a name that does not resolve is silently broken. Transient Cloudflare
+    # failures are absorbed by `retry: api_default`; a permanent one fails the run
+    # and `dns.create_record`'s undo deletes the record iff it created it.
+    # Output: record: Optional[DnsRecordRef], created: bool
+
+  - id: dns_store                     # domain step: clusters.dns_hostname/dns_zone/
+    uses: cluster.store_dns_record    # dns_record_id -- the columns the API already
+    with: {cluster_id: {from: run.cluster_id}, record: {from: dns.record}}   # serves
+    timeout_seconds: 30               # (clusters.py's cluster_url) and `cluster.load_infra`
+                                       # reads back so destroy deletes a REAL record (#6).
+
+  - id: ssh                           # gate-only; v1's inner SSH retry loop is STRIPPED
+    uses: k3s.await_ssh               # from the installer -- the gate loop replaces it
+    with: {host: {from: droplet.address}}
+    gate: {timeout_seconds: 420, interval_seconds: 10, settle_seconds: 5}   # ssh_ready_timeout;
+    # settle_seconds=5 is v1's "brief settle so sshd has finished its handshake
+    # setup" (_ssh_k3s_installer.py's wait_for_ssh_ready, right after the TCP
+    # connect succeeds) -- seam-c-provider.md §5.4's other homeless physics
+    # constant, preserved as gate data alongside the droplet gate's 30s above
+    # (Round-8a review finding).
+
+  - id: trust_host                    # TOFU keyscan -- canonical _ssh_k3s_installer copy
+    uses: k3s.trust_host_keys         # ONLY (never the dead StrictHostKeyChecking=no forks,
+    with: {host: {from: droplet.address}, ssh_user: {from: spec.ssh_user},   # gotcha 13)
+           ssh_private_key_path: {from: spec.ssh_private_key_path}}   # DR-0023
+    retry: ssh_default
+    timeout_seconds: 330              # covers cloud-init wait (300) + keyscan (10)
+    # Output: known_hosts: str
+
+  - id: k3s                           # salvaged SSHBasedK3sInstaller body: CIDR flags,
+    uses: k3s.install                 # extra TLS SANs = address. undoable=False (no inverse --
+    with: {host: {from: droplet.address}, spec: {from: spec.spec}, extra_tls_san: {from: droplet.address},
+           acme: {from: spec.acme},          # DR-0036: Optional -- present only when the profile
+                                              # enabled BOTH ssl and dns, which is exactly when the
+                                              # Ingress templates render the certresolver annotation
+                                              # naming it. Written into the traefik HelmChartConfig
+                                              # BEFORE k3s starts, so no reconfigure/restart.
+           known_hosts: {from: trust_host.known_hosts}, ssh_user: {from: spec.ssh_user},   # subsumed
+           ssh_private_key_path: {from: spec.ssh_private_key_path}}   # by infra.create_instance's undo)
+    retry: ssh_default                # replaces the installer's internal 3x backoff
+    timeout_seconds: 300              # install_timeout_seconds
+
+  - id: k3s_ready
+    uses: k3s.await_api               # gate-only
+    with: {host: {from: droplet.address}, known_hosts: {from: trust_host.known_hosts},
+           ssh_user: {from: spec.ssh_user}, ssh_private_key_path: {from: spec.ssh_private_key_path}}
+    gate: {timeout_seconds: 600, interval_seconds: 10}    # k3s_ready_timeout
+
+  - id: kubeconfig
+    uses: k3s.fetch_kubeconfig        # rewrites server: to the public IP
+    with: {host: {from: droplet.address}, rewrite_server_to: {from: droplet.address},
+           known_hosts: {from: trust_host.known_hosts}, ssh_user: {from: spec.ssh_user},
+           ssh_private_key_path: {from: spec.ssh_private_key_path}}
+    retry: ssh_default
+    timeout_seconds: 60
+    # Output: kubeconfig: SecretStr   # Fernet-encrypted in the step row; never on disk
+
+  - id: store                          # domain step: Fernet-encrypt via CryptoService, write
+    uses: cluster.store_kubeconfig     # clusters.encrypted_kubeconfig + kubeconfig_key_class
+    with: {cluster_id: {from: run.cluster_id}, kubeconfig: {from: kubeconfig.kubeconfig}}
+    timeout_seconds: 30
+    # Output: kubeconfig_ref: str      # "cluster-kubeconfig:{cluster_id}" -- opaque handle
+
+  - id: firewalls                     # v1 warns-and-continues (digitalocean.py:477)
+    uses: do.apply_firewalls
+    with: {resource_ids: {from: create.resource_ids}, spec: {from: spec.spec}}
+    retry: api_default
+    timeout_seconds: 60
+    on_failure: continue
+
+  - id: assign_project                 # LATE, reliable-timing project assignment (fix-round-1:
+    uses: do.assign_project            # v1 fired this again here too, digitalocean.py:451/454,
+    with: {resource_ids: {from: create.resource_ids}}   # "AFTER successful K3s install" -- by
+    retry: api_default                 # now the droplet has existed for minutes, structurally
+    timeout_seconds: 30                # past the "not yet fully created" window the early,
+    on_failure: continue                # inline create-time attempt (infra.create_instance)
+                                         # guards against without this provider ever sleeping
+                                         # (H4-H6).

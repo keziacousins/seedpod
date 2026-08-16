@@ -1,0 +1,35 @@
+# Background Job Configuration
+# Controls timing and behavior of all scheduled background jobs
+
+version: "1.0"
+
+# Per-cluster polling intervals (seconds)
+# Adaptive polling: more frequent during transitions, less when stable
+polling:
+  transitioning_clusters: 30  # CREATING, PROVISIONING, DEPLOYING, DESTROYING states
+  stable_clusters: 60         # ACTIVE state
+
+# Health check configuration
+health_checks:
+  enabled: true
+  kubectl_timeout: 15  # kubectl command timeout (seconds)
+
+# Cleanup and maintenance intervals (seconds)
+cleanup:
+  expired_clusters_dev: 60      # Check for expired clusters in dev/testing
+  expired_clusters_prod: 300    # Check for expired clusters in production
+
+# Cost tracking
+cost_tracking:
+  update_interval: 900  # Update cluster costs every 15 minutes
+
+# Infrastructure reconciliation
+reconciliation:
+  enabled: true
+  full_interval: 600     # Full reconciliation every 10 minutes (orphan cleanup, untracked discovery, conflicts, costs)
+  state_interval: 300    # DB vs in-memory consistency check every 5 minutes (defensive bug detector)
+
+# Discovered cluster behavior
+discovered_clusters:
+  ttl_hours: null        # TTL for discovered clusters (null = no auto-cleanup)
+  cost_alerts: true      # Enable cost alerts for discovered clusters

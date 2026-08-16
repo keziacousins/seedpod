@@ -1,0 +1,124 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tailscale
+  namespace: default
+  labels:
+    app: tailscale
+    environment: "{{ config.environment }}"
+    cluster-id: "{{ config.cluster_id }}"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: tailscale
+  namespace: default
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: tailscale
+  namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: tailscale
+subjects:
+  - kind: ServiceAccount
+    name: tailscale
+    namespace: default
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tailscale-auth
+  namespace: default
+  labels:
+    app: tailscale
+    environment: "{{ config.environment }}"
+    cluster-id: "{{ config.cluster_id }}"
+type: Opaque
+# `data` (base64), NOT `stringData`. stringData is write-only: the API server
+# converts it to `data` and never echoes it back, so kubectl re-sends it on
+# every apply and reports this Secret `configured` forever. That false
+# `configured` poisons ApplyChangeSummary.all_unchanged, which is the only
+# signal deploy.ensure_rollouts uses to decide on a rollout restart -- one
+# stringData Secret disables that rule for the whole wave.
+data:
+  TS_AUTHKEY: "{{ secrets.tailscale_auth_key | b64encode }}"
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: tailscale
+  namespace: default
+  labels:
+    app: tailscale
+    environment: "{{ config.environment }}"
+    cluster-id: "{{ config.cluster_id }}"
+spec:
+  selector:
+    matchLabels:
+      app: tailscale
+  template:
+    metadata:
+      labels:
+        app: tailscale
+        environment: "{{ config.environment }}"
+        cluster-id: "{{ config.cluster_id }}"
+    spec:
+      serviceAccountName: tailscale
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: tailscale
+          image: tailscale/tailscale:latest
+          env:
+            # Authenticate with Tailscale
+            - name: TS_AUTHKEY
+              valueFrom:
+                secretKeyRef:
+                  name: tailscale-auth
+                  key: TS_AUTHKEY
+            # Accept routes from other nodes
+            - name: TS_ACCEPT_ROUTES
+              value: "true"
+            # Advertise cluster-specific routes
+            - name: TS_ROUTES
+              value: "{{ config.pod_cidr }},{{ config.service_cidr }}"
+            # Use userspace networking (no kernel module required)
+            - name: TS_USERSPACE
+              value: "true"
+            # Set hostname based on repo and cluster ID
+            # Format: repo-clusterid8 (e.g., "web2-9ef90d67")
+            # Max 63 chars for DNS label compliance
+            - name: TS_HOSTNAME
+              value: "{{ config.cluster_slug.split('-')[0][:20] }}-{{ config.cluster_id[:8] }}"
+            # Ephemeral node - store state in memory, auto-logout on exit
+            # This causes immediate removal from Tailscale console when pod terminates
+            - name: TS_STATE_DIR
+              value: "mem:"
+            # Don't use Kubernetes secret for state (we're using mem:)
+            # NO `value: ""` -- an env var's `value` defaults to "" when
+            # omitted, and the API server DROPS an explicit empty string (it
+            # is the zero value), so the live object stores
+            # `{name: TS_KUBE_SECRET}` with no `value` key. Spelling
+            # `value: ""` therefore never round-trips: kubectl re-patches it
+            # on every apply and reports the DaemonSet `configured` forever.
+            # Omitting it is semantically identical.
+            - name: TS_KUBE_SECRET
+          securityContext:
+            capabilities:
+              add:
+                - NET_ADMIN
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "200m"

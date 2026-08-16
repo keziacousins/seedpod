@@ -1,0 +1,59 @@
+# Backlog #20 — the first CI this repo has ever had (Kezia, 2026-08-11).
+#
+# Deliberately the FLOOR, not the ceiling: it runs what already exists and is
+# already trustworthy. It would not have caught a single defect found in the last
+# three sessions -- those came from real smokes against real infrastructure, and
+# no cheap CI substitutes for that. What it does catch is the class nobody should
+# be spending a smoke on: an import error, a lint regression, a broken UI build,
+# or a test someone forgot to run before pushing.
+#
+# What it deliberately does NOT do:
+#   - no deploy, no provider credentials, no network to DigitalOcean/Cloudflare/GHCR.
+#     Every secret this repo uses is real and lives in `.env`; a CI runner has no
+#     business holding them, and the suite is designed to need none (fault injection
+#     lives at the transport seam -- CLAUDE.md's testing posture).
+#   - no smoke. The smoke is a human decision that spends real money.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Sync dependencies (locked)
+        run: uv sync --locked
+      - name: Lint
+        run: uv run ruff check .
+      - name: Tests
+        # `seedpod.pid` is a PID-file singleton: a stray one fails
+        # test_importing_start_module_has_zero_side_effects. A fresh runner never
+        # has one, but say so rather than leave the next person guessing.
+        run: uv run pytest -q
+
+  ui:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - run: npm ci
+      - name: Tests
+        run: npm test
+      - name: Build
+        # The build is a real check: it is what caught nothing so far only because
+        # someone ran it by hand every time.
+        run: npm run build

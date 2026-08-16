@@ -1,0 +1,46 @@
+version: "1.0"
+global_ephemeral_enabled: true
+default_ttl_hours: 2
+defaults:
+  ephemeral:
+    ttl_hours: 2
+  persistent: {}
+rules:
+  - name: feature_branches
+    description: Create ephemeral clusters for feature branches
+    enabled: true
+    repo_patterns: ["*"]
+    branch_pattern: feature/*
+    action: create_ephemeral
+    config:
+      ttl_hours: 2
+  - name: main_staging
+    description: Update staging environment
+    enabled: true
+    repo_patterns: ["*"]
+    branch_pattern: main
+    action: update_environment
+    config:
+      environment: staging
+  - name: needs_registry_branch
+    description: >-
+      Round-6 api-deployments fixture: routes to a profile with a required,
+      unresolvable service (tests/fixtures/deployment-profiles/needs-registry.yml)
+      so the HTTP-level birth-then-reject test can hit manifest_resolution_failed
+      without any GHCR/registry token configured. branch_pattern deliberately does
+      NOT overlap feature_branches' `feature/*` (first-match-wins).
+    enabled: true
+    repo_patterns: ["*"]
+    branch_pattern: registry-test/*
+    action: create_ephemeral
+    config:
+      ttl_hours: 2
+      deployment_profile: needs-registry
+valid_actions:
+  - create_ephemeral
+  - update_environment
+  - no_action
+valid_environments:
+  - dev
+  - staging
+  - production

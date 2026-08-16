@@ -1,0 +1,27 @@
+# Test-only fixture for the Round-6 api-deployments component's HTTP-level
+# birth-then-reject coverage (tests/api/test_version_update.py,
+# test_manifest_resolution_failed_is_200_with_deployment_id -- the obligation the
+# v1-carried skip test_manifest_resolution_error_flow leaves unguarded, per that
+# test's own docstring). Mirrors tests/app/test_services_deployment.py's
+# test_image_resolution_failure_with_valid_profile_still_creates_deployment_record
+# (an inline profile there; this is the SAME shape as an on-disk fixture, since the
+# HTTP-layer test drives a real build_app()/RuleEngine.load() instead of hand-
+# constructing a DeploymentService).
+#
+# `downstream-service` is a required, non-external service with no
+# `image_override` and is never the triggering repo used by the test -- so
+# resolution reaches `ManifestResolver._resolve_single_service`'s GHCR branch,
+# which (with the default fixture AppConfig's `github_token` unset --
+# `ghcr_service` stays None, `seedpod/app/factory.py` step 5.5) fails with
+# "GHCR service not available", a required-service failure that surfaces as
+# `manifest_resolution_failed` -- AFTER the cluster has already been born
+# (the profile itself loads fine; only the per-service image lookup fails).
+version: "1.0"
+description: "Valid profile with one required, unresolvable service (api-layer manifest_resolution_failed fixture)"
+manifests_dir: "config/manifest-templates/needs-registry"
+resolution_strategy: "branch_discovery_with_fallback"
+provider: "fake"
+services:
+  downstream-service:
+    repository: "downstream-service"
+    required: true

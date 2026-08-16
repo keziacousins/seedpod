@@ -1,0 +1,54 @@
+version: "1.0"
+global_ephemeral_enabled: true
+default_ttl_hours: 8
+defaults:
+  ephemeral:
+    ttl_hours: 8
+  persistent: {}
+rules:
+  - name: main_stack_feature_branches
+    description: Core stack repo triggers a full-stack ephemeral cluster
+    enabled: true
+    repo_patterns:
+      - "exampleco-core"
+    branch_pattern:
+      - "feature/*"
+      - "dev"
+    action: create_ephemeral
+    config:
+      ttl_hours: 1
+      deployment_profile: exampleco-dev-stack-nodns
+
+  - name: main_stack_production_tags
+    description: Production tags for the core stack repo - stage then manual approval
+    enabled: true
+    repo_patterns:
+      - "exampleco-core"
+    branch_pattern: "main"
+    tag_pattern: "v*.*.*"
+    action: staging_then_manual
+    config:
+      require_approval: true
+
+  # Standalone services - single container deployments
+  - name: exampleco_web_2
+    description: Example standalone web service (ephemeral cluster; provider from the profile)
+    enabled: true
+    repo_patterns: ["exampleco-web-2"]
+    branch_pattern:
+      - "feature/*"
+      - "dev"
+    action: create_ephemeral
+    config:
+      ttl_hours: 4
+      deployment_profile: exampleco-web-2
+
+valid_actions:
+  - create_ephemeral
+  - update_environment
+  - staging_then_manual
+  - no_action
+valid_environments:
+  - dev
+  - staging
+  - production

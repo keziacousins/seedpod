@@ -1,0 +1,35 @@
+# OrbStack Provider Configuration
+# Thin wrapper around OrbStack's built-in Kubernetes cluster
+# Single persistent cluster — no creation/destruction
+
+provider_name: "orbstack"
+display_name: "OrbStack (local)"
+description: "Local Kubernetes via OrbStack's built-in cluster"
+
+enabled: true
+
+# How seedpod reaches the OrbStack Kubernetes API
+# If seedpod runs on the same machine as OrbStack, use "localhost"
+# If remote (e.g., seedpod on laptop, OrbStack on minimax.local), use the hostname
+api_server:
+  host: "localhost"
+
+# Hostname for reaching cluster services from the network (used for ingress/display)
+# Separate from api_server.host since the K8s API cert only covers localhost/k8s.orb.local
+public_hostname: "minimax.local"
+
+# kubectl context name used by OrbStack
+kubectl_context: "orbstack"
+
+# Node size mapping (informational only — OrbStack manages its own resources)
+node_size_mapping:
+  default:
+    description: "OrbStack managed resources"
+
+# Region mapping (all local)
+region_mapping:
+  default: "local"
+
+# Health check configuration
+health_checks:
+  kubectl_timeout: 30

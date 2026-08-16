@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  labels:
+    app: minio
+    environment: "ephemeral"
+    cluster-id: "{{ config.cluster_id }}"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+        environment: "ephemeral"
+        cluster-id: "{{ config.cluster_id }}"
+    spec:
+      containers:
+        - name: minio
+          image: "minio/minio:latest"
+          command: ["minio", "server", "/data", "--console-address", ":9001"]
+          ports:
+            - containerPort: 9000
+              name: api
+            - containerPort: 9001
+              name: console
+          env:
+            # Environment variables from deployment profile
+            {% for key, value in environment_variables.get('minio', {}).items() %}
+            - name: {{ key }}
+              value: "{{ value }}"
+            {% endfor %}
+            # Secrets
+
+            - name: MINIO_ROOT_PASSWORD
+              value: "{{ secrets.minio_root_password }}"
+
+          livenessProbe:
+            tcpSocket:
+              port: 9000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
+          readinessProbe:
+            tcpSocket:
+              port: 9000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  labels:
+    app: minio
+    environment: "ephemeral"
+spec:
+  selector:
+    app: minio
+  ports:
+    - name: api
+      port: 9000
+      targetPort: 9000
+    - name: console
+      port: 9001
+      targetPort: 9001
+  type: ClusterIP

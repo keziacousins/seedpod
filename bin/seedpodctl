@@ -1,0 +1,25 @@
+#!/bin/sh
+#
+# The HTTP user CLI (DR-0021 §0a/point 3). Unlike the other two launchers this
+# one is a pure API client: it reads SEEDPOD_API_URL and SEEDPOD_API_KEY from
+# var/.env and talks to a *running* server over HTTP. It holds no database
+# handle and no Fernet key -- that separation is the whole point of DR-0021's
+# three entry points, and wrapping it here must not blur it.
+#
+# The shared env resolution is still worth having: it finds the same var/.env,
+# and it fails with the same message when the runtime is missing.
+#
+#   bin/seedpodctl clusters list
+#   bin/seedpodctl health detailed     # DR-0042: this route moved under /api
+#
+# Note DR-0042 -- an OLD seedpodctl against a NEW server 404s on `health`, and
+# only on `health`. If that is what you are seeing, the CLI is stale, not the
+# server.
+
+set -eu
+
+SEEDPOD_BIN_DIR=$(cd "$(dirname "$0")" && pwd)
+export SEEDPOD_BIN_DIR
+. "$SEEDPOD_BIN_DIR/_seedpod_env.sh"
+
+exec "$PY" -m seedpod.ctl.cli "$@"

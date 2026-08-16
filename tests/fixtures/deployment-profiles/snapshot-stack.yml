@@ -1,0 +1,26 @@
+# Test-only fixture (Round 6, api-features's SnapshotService exercise): a
+# profile with ONE persistable, external, image_override'd service named "web"
+# -- matching tests/conformance/fake_kubectl.py's FakeKubectlBackend default
+# seed (SEEDED_POD = "web-abc123", SEEDED_DEPLOYMENT = "web"), so
+# SnapshotService's pod-prefix-match discovery (`{service_name}-`) finds the
+# seeded pod with zero extra backend wiring. `external: true` +
+# `image_override` means zero GHCR/registry calls are needed regardless of
+# github_token, same discipline as infrastructure-only.yml/needs-registry.yml.
+# Overlaid onto test_config_dir by tests/conftest.py, never shipped in
+# production config/.
+version: "1.0"
+description: "Minimal persistable-service fixture for SnapshotService tests"
+manifests_dir: "config/manifest-templates/snapshot-stack"
+resolution_strategy: "branch_discovery_with_fallback"
+provider: "fake"
+environment_type: "ephemeral"
+services:
+  web:
+    repository: web
+    external: true
+    required: true
+    image_override: "web:latest"
+    persistence:
+      type: postgres
+      database: appdb
+      username: postgres

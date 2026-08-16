@@ -1,0 +1,148 @@
+version: "1.0"
+description: "Example small stack deployment (no DNS) -- web app + database + cache + object storage + migration job"
+manifests_dir: "config/manifest-templates/exampleco-stack"
+environment_type: "ephemeral"
+resolution_strategy: "branch_discovery_with_fallback"
+fallback_branches: ["dev", "staging"]
+default_secrets_class: "DEV"
+rollout_timeout_seconds: 900
+
+# Hostname configuration - use the provider's host directly (e.g. droplet IP
+# or a local hypervisor's hostname). No `provider_host` value is known until
+# the cluster actually provisions, so `cluster_hostname` is deliberately
+# OMITTED from the resolved config until deploy time (DR-0025).
+hostname:
+  strategy: "provider_host"
+
+# Provider-agnostic cluster specification
+cluster_spec:
+  node_specification:
+    cpu_cores: 2
+    memory_gb: 4
+    disk_gb: 30
+    region_hint: "europe-west"
+
+  cluster_config:
+    node_count: 1
+    ttl_hours: 2
+    tags: ["ephemeral", "example"]
+    kubernetes_version: "stable"
+
+  # Ingress configuration
+  ingress_strategy:
+    type: "traefik"
+
+    traefik:
+      enabled: true
+      expose_method: "hostport"
+      http_port: 80
+      https_port: 443
+
+# DNS configuration - disabled for this profile
+dns:
+  enabled: false
+
+# SSL/TLS configuration - enabled with Traefik's default self-signed
+# certificate (no certresolver annotation = Traefik uses an auto-generated
+# self-signed cert)
+ssl:
+  enabled: true
+
+# Auto-snapshot configuration
+auto_snapshot:
+  enabled: true
+  name_pattern: "auto-{cluster_slug}-{date}"
+
+services:
+  exampleco-api:
+    repository: "exampleco-api"
+    port: 8000
+    replicas: 1
+    required: true
+    # No explicit deploy_wave -- defaults to 3, the application tier.
+
+  postgres:
+    repository: "postgres"
+    port: 5432
+    replicas: 1
+    external: true
+    required: true
+    image_override: "postgres:16-alpine"
+    deploy_wave: 1 # datastore, applied and ready before migrations/apps
+    persistence:
+      type: "postgres"
+      database: "exampleco"
+      username: "exampleco"
+      migration_service: "exampleco-migrations"
+
+  cache:
+    repository: "redis"
+    port: 6379
+    replicas: 1
+    external: true
+    required: true
+    image_override: "redis:7-alpine"
+    deploy_wave: 1 # datastore
+
+  minio:
+    repository: "minio"
+    port: 9000
+    replicas: 1
+    external: true
+    required: true
+    image_override: "minio/minio:latest"
+    deploy_wave: 1 # datastore
+
+  exampleco-migrations:
+    repository: "exampleco-migrations"
+    port: 0
+    replicas: 0 # Job, not Deployment
+    external: false # built alongside the main app image
+    required: true
+    migration_type: job
+    deploy_wave: 2 # migration Job, after datastores, before app services
+
+  rbac:
+    repository: "rbac"
+    port: 0
+    replicas: 0 # Infrastructure resource, not a deployment
+    external: true
+    required: true
+    image_override: "none" # No image needed for RBAC resources
+
+environment_variables:
+  shared:
+    CLUSTER_ID: "{{ cluster_id }}"
+    LOG_JSON: "false"
+    APP_PUBLIC_URL: "https://{{ cluster_hostname }}"
+    WEBHOOK_CALLBACK_URL: "https://{{ cluster_hostname }}/webhooks"
+
+  services:
+    exampleco-api:
+      SERVICE_NAME: "exampleco-api"
+      DATABASE_HOST: "postgres.default.svc.cluster.local"
+      DATABASE_PORT: "5432"
+      DATABASE_NAME: "exampleco"
+      DATABASE_USERNAME: "exampleco"
+      CACHE_HOST: "cache.default.svc.cluster.local:6379"
+      S3_HOST: "minio.default.svc.cluster.local:9000"
+      S3_REGION: "us-east-1"
+      SHOULD_SECURE_S3: "False"
+      API_BASE_URL: "https://{{ cluster_hostname }}/api"
+      ADMIN_DASHBOARD_URL: "https://{{ cluster_hostname }}/admin"
+      REDIRECT_URI: "https://{{ cluster_hostname }}/*"
+
+    postgres:
+      POSTGRES_DB: "exampleco"
+      POSTGRES_USER: "exampleco"
+
+    cache:
+
+    minio:
+      MINIO_ROOT_USER: "dev-minio-access-key"
+
+    exampleco-migrations:
+      database_host: "postgres.default.svc.cluster.local"
+      database_port: "5432"
+      database_name: "exampleco"
+      database_username: "exampleco"

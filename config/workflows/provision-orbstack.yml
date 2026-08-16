@@ -1,0 +1,125 @@
+# provision-orbstack — DR-0022's re-normalized verb vocabulary (formerly DR-0004's
+# orbstack verb family, now superseded): infra.create_instance (CreateInstance --
+# OrbStack has one persistent built-in cluster; "create" is adoption, and the merged
+# Output's `adopted_existing: bool` field says so honestly for orbstack -- and now
+# for every provider, per DR-0022's ruling 1), infra.await_instance,
+# infra.fetch_kubeconfig, then cluster.store_kubeconfig. No k3s.* steps (Seam C §5.4
+# plane matrix: kind/orbstack provision workflows simply omit the ssh-k3s plane).
+#
+# DR-0022's `infra.create_instance` merge (4 per-provider verbs -> 1) means its
+# Output is now ONE shared shape across all four providers, matching Seam C's real
+# `InstanceCreated.address: str | None` (`seedpod/providers/contract.py`) exactly --
+# `None` until a separate readiness gate enriches it for DO/kind/tart. The
+# pre-DR-0022 fixture had orbstack's own dedicated Output typing `address` as
+# non-Optional (honest in isolation: OrbStack's cluster is already running, so its
+# own create call always has it) -- but ONE shared Output for the merged verb must
+# be Optional (V4 would otherwise be lying about DO/kind/tart's create-time value).
+# So provision-orbstack.yml now includes the SAME `infra.await_instance` gate
+# DO/kind/tart use: for OrbStack this poll simply succeeds on its first iteration
+# (there is nothing to actually wait for), but it is what turns the merged verb's
+# `address: str | None` into the guaranteed-present `address: str` the outcome
+# payload and infra.fetch_kubeconfig's `rewrite_server_to` require -- the same
+# mechanism, not a special case, per DR-0022's own "the shape doesn't change just
+# because the provider name does."
+#
+# on_failure: compensate is declared here exactly like the other two provision
+# files (provision cancel/failure destroys what was made -- C1), but note
+# infra.create_instance's undo (DestroyInstance) is a PRESERVE-NO-OP for orbstack by
+# provider semantics (seam-c-provider.md §5.3 DestroyOutcome comment: "orbstack =>
+# DESTROYED no-op + note" -- "OrbStack cluster preserved..."). That no-op-ness is a
+# fact about the orbstack provider adapter, not a reason to weaken this workflow's
+# on_failure key: the compensation call still happens (and is what makes the
+# no-op law testable at the conformance seam), it is simply a no-op every time.
+#
+# Traefik shim (Seam C §5.4 plane matrix, seam-c-provider.md fault table row 26):
+# OrbStack ships no ingress controller of its own (unlike k3s), so the copied
+# config/manifest-templates/infrastructure/traefik-orbstack.yaml is applied via
+# kube.apply_file with a non-fatal kube.await_rollout gate
+# (on_failure: continue -- crown jewel #10).
+#
+# Timeouts imported from config/providers/orbstack.yml -- health_checks.kubectl_timeout
+# is the ONLY timeout key orbstack.yml declares (no readiness/interval keys: OrbStack
+# has no polling loop of its own), so it is reused everywhere below; each reuse is
+# cited and the reasoning noted, not silently repeated.
+workflow: provision-orbstack
+version: 1
+inputs:
+  cluster_id: {type: str}
+on_failure: compensate                         # failure OR cancel destroys what was made (C1)
+outcome:
+  succeeded: {event: ProvisionSucceeded,
+              payload: {public_ip: {from: ready.address}, kubeconfig_ref: {from: store.kubeconfig_ref}}}
+  failed:    {event: ProvisionFailed}          # emitted AFTER compensation settles
+  cancelled: {event: ProvisionFailed}          # reason="cancelled" engine-attached (Conflict 8)
+steps:
+  - id: spec                          # domain step: cluster row + provider_config ->
+    uses: cluster.load_spec           # ClusterSpecification, incl. salvaged
+    with: {cluster_id: {from: run.cluster_id}}    # allocate_cluster_cidrs() (Conflict 10)
+    timeout_seconds: 30
+    # Output: spec: ClusterSpecification, provider: str
+
+  - id: adopt                         # OrbStack's cluster already exists and is
+    uses: infra.create_instance       # already running -- "create" verifies/adopts
+    with: {provider: {from: spec.provider}, spec: {from: spec.spec},
+           cluster_id: {from: run.cluster_id}, slug: {from: spec.slug}}   # it (kubectl
+    timeout_seconds: 30               # connectivity check), never spins up new
+                                       # infrastructure. `provider` is DR-0022 ruling
+                                       # 1's late-binding key.
+    emit:
+      event: InfraAllocated           # persists resource_ids onto the cluster record
+      payload: {resource_ids: {from: adopt.resource_ids}}
+    # timeout_seconds: health_checks.kubectl_timeout -- orbstack.yml (the "create"
+    #   call here is itself a kubectl connectivity check)
+    # Output: resource_ids: Mapping[str, str], address: Optional[str], adopted_existing: bool
+
+  - id: ready                         # gate-only verb: OrbStack's cluster is already
+    uses: infra.await_instance        # running, so this poll succeeds on its first
+    with: {provider: {from: spec.provider}, resource_ids: {from: adopt.resource_ids}}
+    gate: {timeout_seconds: 30, interval_seconds: 5}    # health_checks.kubectl_timeout
+    emit: {event: EndpointReady, payload: {public_ip: {from: ready.address}}}
+    # Output: address: str   # guaranteed-present once Ready -- unlike create's Optional
+
+  - id: dns                           # DR-0034, identical to provision-digitalocean.yml's
+    uses: dns.create_record           # (see there for the full rationale). v1 gated DNS on
+    with: {intent: {from: spec.dns_intent}, slug: {from: spec.slug},   # `dns_config.
+           address: {from: ready.address}}     # enabled` ALONE, never on provider, so it is
+    retry: api_default                          # in every provision file rather than the
+    timeout_seconds: 30                         # cloud ones only -- and it no-ops without an
+    # intent. No shipped local profile enables DNS, so orbstack pays nothing for it.
+    # Output: record: Optional[DnsRecordRef], created: bool
+
+  - id: dns_store
+    uses: cluster.store_dns_record
+    with: {cluster_id: {from: run.cluster_id}, record: {from: dns.record}}
+    timeout_seconds: 30
+
+  - id: fetch                         # `kubectl config view --raw --minify --context
+    uses: infra.fetch_kubeconfig      # orbstack` + in-memory rewrite (\2 port-preserving
+    with: {provider: {from: spec.provider}, resource_ids: {from: adopt.resource_ids},
+           rewrite_server_to: {from: ready.address}}   # backreference -- crown jewel #6)
+    timeout_seconds: 30               # health_checks.kubectl_timeout -- orbstack.yml
+    # Output: kubeconfig: SecretStr   # Fernet-encrypted in the step row; never on disk
+
+  - id: store                          # domain step: Fernet-encrypt via CryptoService, write
+    uses: cluster.store_kubeconfig     # clusters.encrypted_kubeconfig + kubeconfig_key_class
+    with: {cluster_id: {from: run.cluster_id}, kubeconfig: {from: fetch.kubeconfig}}
+    timeout_seconds: 30
+    # Output: kubeconfig_ref: str      # "cluster-kubeconfig:{cluster_id}" -- opaque handle
+
+  - id: traefik_apply                  # OrbStack ships no ingress controller of its own --
+    uses: kube.apply_file              # parity shim, salvaged verbatim as static YAML
+    with: {kubeconfig: {from: fetch.kubeconfig},
+           manifest_path: "config/manifest-templates/infrastructure/traefik-orbstack.yaml"}
+    timeout_seconds: 30               # health_checks.kubectl_timeout -- orbstack.yml
+    on_failure: continue              # best-effort (v1 gotcha 17); never blocks provisioning
+
+  - id: traefik_ready                 # gate-only; non-fatal (seam-c-provider.md fault
+    uses: kube.await_rollout          # table row 26: "rollout slow after apply --
+    with: {kubeconfig: {from: fetch.kubeconfig}, deployment: "traefik", namespace: "traefik"}
+    gate: {timeout_seconds: 60, interval_seconds: 5}
+    # timeout_seconds: 2x health_checks.kubectl_timeout -- orbstack.yml (no dedicated
+    #   rollout-wait key; doubled as a conservative non-fatal bound)
+    # interval_seconds: no dedicated orbstack.yml key -- reuses kind.yml's
+    #   health_checks.status_check_interval by analogy (both are local kubectl-plane
+    #   providers with the same "might just be slow" shim)
+    on_failure: continue              # crown jewel #10: non-fatal rollout gate

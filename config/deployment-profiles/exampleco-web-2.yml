@@ -1,0 +1,66 @@
+version: "1.0"
+description: "Example standalone web service (single app service + a secret-bearing sidecar)"
+manifests_dir: "config/manifest-templates/exampleco-misc"
+environment_type: "ephemeral"
+resolution_strategy: "branch_discovery_with_fallback"
+fallback_branches: ["dev", "main"]
+default_secrets_class: "DEV"
+
+# Provider-agnostic cluster specification
+cluster_spec:
+  node_specification:
+    cpu_cores: 1
+    memory_gb: 2
+    disk_gb: 20
+    region_hint: "europe-west"
+
+  cluster_config:
+    node_count: 1
+    ttl_hours: 4
+    tags: ["ephemeral", "example", "exampleco-web-2"]
+    kubernetes_version: "stable"
+
+    # Ingress configuration
+    ingress_strategy:
+      type: "traefik" # Options: traefik, nodeport, none
+      traefik:
+        enabled: true # Install Traefik with K3s
+        expose_method: "hostport" # Options: hostport, nodeport, loadbalancer
+        http_port: 80
+        https_port: 443
+
+services:
+  # A single application-tier service (deploy_wave defaults to 3, the
+  # application tier -- this profile has no datastore or migration/init Job,
+  # so "everything is wave 3" is correct here, not an omission).
+  exampleco-web-2:
+    repository: "exampleco-web-2"
+    port: 8000
+    replicas: 1
+    required: true
+    deploy_wave: 3
+
+  # A second declared service with no image to build -- image_override
+  # means it needs no GHCR lookup -- that ALSO needs a secret
+  # (secrets.tailscale_auth_key, read by manifest-templates/exampleco-misc/
+  # tailscale.yaml). Demonstrates a service whose manifest template requires
+  # a secret to render at all.
+  tailscale:
+    repository: "tailscale"
+    port: 0
+    replicas: 0 # DaemonSet, not Deployment
+    external: true
+    required: false
+    image_override: "tailscale/tailscale:latest"
+    deploy_wave: 3
+
+environment_variables:
+  shared:
+    # Environment metadata
+    ENVIRONMENT_NAME: "ephemeral"
+    CLUSTER_ID: "{{ cluster_id }}"
+
+  services:
+    exampleco-web-2:
+      APP_NAME: "exampleco-web-2"
+      SERVICE_PORT: "8000"

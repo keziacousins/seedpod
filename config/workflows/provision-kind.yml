@@ -1,0 +1,113 @@
+# provision-kind — DR-0022's re-normalized verb vocabulary (formerly DR-0004's kind
+# verb family, now superseded): infra.create_instance (CreateInstance, late-bound --
+# 4->1 merge of do.create_droplet/kind.create_cluster/tart.create_vm/
+# orbstack.adopt_cluster), infra.await_instance (ProbeInstance, gate -- 3->1 merge of
+# do.await_droplet/kind.await_ready/tart.await_vm), infra.fetch_kubeconfig
+# (FetchKubeconfig, resource_ids variant -- 2->1 merge of kind.fetch_kubeconfig/
+# orbstack.fetch_kubeconfig; kind is in the FetchKubeconfig plane per Seam C
+# §5.3/§5.4). No k3s.* steps: kind/orbstack provision workflows simply omit the
+# ssh-k3s plane (Seam C §5.4 plane matrix).
+#
+# Head/tail/outcome shape is provision-digitalocean.yml's, unchanged by provider:
+#   - Conflict 10 (head): inputs shrink to cluster_id; cluster.load_spec builds the
+#     ClusterSpecification the pure machine emitting RunWorkflow(provision) cannot.
+#   - Conflict 10 (create emits InfraAllocated): "Head of every provision workflow"
+#     pins the create step's emit shape, not just DO's.
+#   - Conflict 9 (tail): kubeconfig never rides an event -- infra.fetch_kubeconfig's
+#     SecretStr output is persisted by cluster.store_kubeconfig, which mints
+#     kubeconfig_ref; ProvisionSucceeded carries the ref, never the secret.
+#   - Conflict 8 (outcome): ProvisionCancelled does not exist -- cancelled fires
+#     ProvisionFailed(reason="cancelled") like failed (reason engine-attached).
+#
+# Traefik shim (Seam C §5.4 plane matrix, seam-c-provider.md fault table row 26):
+# kind ships no built-in ingress controller (unlike k3s's bundled Traefik, which the
+# ssh-k3s install disables via --disable=traefik on real k3s only -- kind never runs
+# that installer), so the copied
+# config/manifest-templates/infrastructure/traefik-kind.yaml is applied via
+# kube.apply_file with a non-fatal kube.await_rollout gate
+# (on_failure: continue -- crown jewel #10: "might just be slow" is not a
+# provisioning failure).
+#
+# Timeouts/intervals imported from config/providers/kind.yml (cited per literal
+# below), not re-guessed. Physics constants absent from kind.yml (none needed --
+# kind has no ssh/k3s plane).
+workflow: provision-kind
+version: 1
+inputs:
+  cluster_id: {type: str}
+on_failure: compensate                         # failure OR cancel destroys what was made (C1)
+outcome:
+  succeeded: {event: ProvisionSucceeded,
+              payload: {public_ip: {from: ready.address}, kubeconfig_ref: {from: store.kubeconfig_ref}}}
+  failed:    {event: ProvisionFailed}          # emitted AFTER compensation settles
+  cancelled: {event: ProvisionFailed}          # reason="cancelled" engine-attached (Conflict 8)
+steps:
+  - id: spec                          # domain step: cluster row + provider_config ->
+    uses: cluster.load_spec           # ClusterSpecification, incl. salvaged
+    with: {cluster_id: {from: run.cluster_id}}    # allocate_cluster_cidrs() (Conflict 10)
+    timeout_seconds: 30
+    # Output: spec: ClusterSpecification, provider: str
+
+  - id: create                        # `kind create cluster` (docker container +
+    uses: infra.create_instance       # control-plane bring-up); RESOURCE_ALLOCATED
+    with: {provider: {from: spec.provider}, spec: {from: spec.spec},
+           cluster_id: {from: run.cluster_id}, slug: {from: spec.slug}}   # fires the moment
+    timeout_seconds: 300              # the container/name exists, defaults.wait_timeout
+                                       # ("5m") -- kind.yml. `provider` is DR-0022 ruling
+                                       # 1's late-binding key.
+    emit:
+      event: InfraAllocated           # persists resource_ids onto the cluster record
+      payload: {resource_ids: {from: create.resource_ids}}
+    # Output: resource_ids: Mapping[str, str]
+
+  - id: ready                         # gate-only verb: execute no-op; poll: cluster
+    uses: infra.await_instance        # control-plane ready? final Ready enriches
+    with: {provider: {from: spec.provider}, resource_ids: {from: create.resource_ids}}
+    gate: {timeout_seconds: 300, interval_seconds: 5}   # outputs with the address.
+    # timeout_seconds: health_checks.cluster_ready_timeout -- kind.yml
+    # interval_seconds: health_checks.status_check_interval -- kind.yml
+    emit: {event: EndpointReady, payload: {public_ip: {from: ready.address}}}
+    # Output: address: str
+
+  - id: dns                           # DR-0034, identical to provision-digitalocean.yml's
+    uses: dns.create_record           # (see there for the full rationale). v1 gated DNS on
+    with: {intent: {from: spec.dns_intent}, slug: {from: spec.slug},   # `dns_config.
+           address: {from: ready.address}}     # enabled` ALONE, never on provider, so it is
+    retry: api_default                          # in every provision file rather than the
+    timeout_seconds: 30                         # cloud ones only -- and it no-ops without an
+    # intent. No shipped local profile enables DNS, so kind pays nothing for it.
+    # Output: record: Optional[DnsRecordRef], created: bool
+
+  - id: dns_store
+    uses: cluster.store_dns_record
+    with: {cluster_id: {from: run.cluster_id}, record: {from: dns.record}}
+    timeout_seconds: 30
+
+  - id: fetch                         # `kind get kubeconfig` + in-memory rewrite
+    uses: infra.fetch_kubeconfig      # (0.0.0.0 + allocated-port substitution --
+    with: {provider: {from: spec.provider}, resource_ids: {from: create.resource_ids},
+           rewrite_server_to: {from: ready.address}}   # crown jewel #6 variant)
+    timeout_seconds: 30               # health_checks.kubectl_timeout -- kind.yml
+    # Output: kubeconfig: SecretStr   # Fernet-encrypted in the step row; never on disk
+
+  - id: store                          # domain step: Fernet-encrypt via CryptoService, write
+    uses: cluster.store_kubeconfig     # clusters.encrypted_kubeconfig + kubeconfig_key_class
+    with: {cluster_id: {from: run.cluster_id}, kubeconfig: {from: fetch.kubeconfig}}
+    timeout_seconds: 30
+    # Output: kubeconfig_ref: str      # "cluster-kubeconfig:{cluster_id}" -- opaque handle
+
+  - id: traefik_apply                  # kind ships no ingress controller of its own --
+    uses: kube.apply_file              # parity shim, salvaged verbatim as static YAML
+    with: {kubeconfig: {from: fetch.kubeconfig},
+           manifest_path: "config/manifest-templates/infrastructure/traefik-kind.yaml"}
+    timeout_seconds: 30               # health_checks.kubectl_timeout -- kind.yml
+    on_failure: continue              # best-effort (v1 gotcha 17); never blocks provisioning
+
+  - id: traefik_ready                 # gate-only; non-fatal (seam-c-provider.md fault
+    uses: kube.await_rollout          # table row 26: "rollout slow after apply --
+    with: {kubeconfig: {from: fetch.kubeconfig}, deployment: "traefik", namespace: "traefik"}
+    gate: {timeout_seconds: 300, interval_seconds: 5}
+    # timeout_seconds: health_checks.cluster_ready_timeout -- kind.yml (reused: no
+    #   dedicated rollout-wait key; "might just be slow", not a hard budget)
+    # interval_seconds: health_checks.status_check_interval -- kind.yml
+    on_failure: continue              # crown jewel #10: non-fatal rollout gate

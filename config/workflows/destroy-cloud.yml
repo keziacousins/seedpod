@@ -1,0 +1,96 @@
+# destroy-cloud — docs/design/seam-b-engine.md §2.2 Proof 3 ("destroy semantics need
+# a home"), outcome corrected per docs/design/coherence-review.md Conflict 8, verb
+# names re-normalized and the head/dns-plumbing mechanism replaced per DR-0022:
+#   - DestroyCompleted / DestroyStalled do not exist (Pillar 1 never registered
+#     them); Seam B's "cluster stays DESTROYING" reading is overridden by Conflict 5
+#     (the LAW replacing Seam B's InfrastructureUnreachableError-as-Transient
+#     wording): a destroy run that exhausts the blocked/unreachable budget fires
+#     DestroyFailed(reason="unreachable") -> DESTROY_FAILED, not a stall. Retry via
+#     DestroyRequested and the InfraMissingObserved completion backstop are
+#     unaffected -- both already exist on DESTROY_FAILED in the machine.
+#   - cancelled also fires DestroyFailed (reason="cancelled" engine-attached), per
+#     the outcome-event mapping table -- there is no DestroyStalled/ProvisionCancelled-
+#     shaped event for this branch either.
+#   - DR-0022 ruling 2: inputs shrink to `cluster_id` (mirroring every provision
+#     workflow's Conflict-10 head) -- the dispatch table's `dns_record_ref(cluster)`
+#     snapshot-at-dispatch-time hook is deleted; a `cluster.load_infra` domain step
+#     reads `{provider, slug, resource_ids, dns_record}` FRESH at run time instead
+#     (stale-on-retry-proof, and it is what makes `infra.destroy_instance`'s typed
+#     Params -- P8, no more EmptyParams provider verb -- possible at all).
+#   - DR-0022 ruling 4: `kube.delete_daemonset`'s `wait`/`wait_timeout_seconds`/
+#     `settle_seconds` leave Params for a `gate:` block (D2's fix: no command
+#     waits, all waiting is an engine gate) -- the v1 edge behaviour they protect
+#     (gotcha 10 -- the 48-hour lingering Tailscale node) is preserved as gate
+#     data, not deleted.
+workflow: destroy-cloud
+version: 1
+inputs:
+  cluster_id: {type: str}
+  trigger: {type: str}                         # DR-0040 (amends ruling 2): "ttl_expiry" |
+  #                                              "operator" -- provenance nothing downstream
+  #                                              can re-derive, since both destroy routes
+  #                                              converge on DestroyDue.
+  snapshot: {type: bool}                       # DR-0043: the operator's snapshot_before_destroy,
+  #                                              carried here instead of performed inline in
+  #                                              ClusterService.destroy. Separate from `trigger`
+  #                                              on purpose -- provenance and "was a snapshot
+  #                                              asked for" are different questions.
+on_failure: report                             # teardown steps are best-effort themselves
+outcome:
+  succeeded: {event: DestroySucceeded}
+  failed:    {event: DestroyFailed}            # reason engine-attached ("unreachable" on
+  cancelled: {event: DestroyFailed}            #   budget exhaustion per Conflict 5, else the
+                                                #   real error; "cancelled" on the cancel path)
+steps:
+  - id: infra                                  # domain step: cluster row + provider_config ->
+    uses: cluster.load_infra                   # {provider, slug, resource_ids, dns_record}
+    with: {cluster_id: {from: run.cluster_id}} # read FRESH at run time (DR-0022 ruling 2) --
+    timeout_seconds: 30                        # never a stale dispatch-time snapshot
+    # Output: provider: str, slug: str, resource_ids: Mapping[str, str],
+    #         dns_record: Optional[DnsRecordRef]
+  - id: kubecfg
+    uses: cluster.load_kubeconfig_optional     # Output: kubeconfig: Optional[SecretStr]
+    on_failure: continue
+  - id: autosnap                              # DR-0040: the profile's own auto_snapshot on an
+    uses: cluster.auto_snapshot               # unattended destroy. DR-0043: AND the operator's
+    with: {cluster_id: {from: run.cluster_id}, trigger: {from: run.trigger},
+           snapshot: {from: run.snapshot}}
+    on_failure: continue                      # a TTL destroy is a DEADLINE -- a snapshot
+    timeout_seconds: 600                      # that cannot be taken must never strand a
+    #                                           cluster the TTL says must die.
+    # Placed AFTER kubecfg (it needs the kubeconfig) and BEFORE tailscale, i.e. while the
+    # cluster is still whole -- which is why DR-0043 moved the operator's snapshot HERE
+    # rather than leaving it inline in ClusterService.destroy, where it blocked the DELETE
+    # request for up to 300s per service. The step takes exactly one snapshot: `snapshot`
+    # (explicit, unconditional) wins over `trigger="ttl_expiry"` (profile-gated).
+  - id: tailscale                              # clean disconnect BEFORE infra teardown
+    uses: kube.delete_daemonset                # (gotcha 10: else 48h Tailscale lingering)
+    with: {kubeconfig: {from: kubecfg.kubeconfig}, name: tailscale, namespace: default,
+           grace_period_seconds: 30}
+    # namespace CORRECTED kube-system -> default (DR-0022 Erratum E3, 2026-07-20): v1's DaemonSet
+    # manifest is `namespace: default` throughout and v1 deleted it with `-n default`; deleting from
+    # kube-system finds nothing, "succeeds" as NotFound, and silently reintroduces gotcha 10's
+    # 48h lingering Tailscale node.
+    gate: {timeout_seconds: 45, interval_seconds: 5, settle_seconds: 3}
+    # DR-0022 ruling 4 + Erratum E2: v1's destruction_job.py:164-181 ran
+    # `kubectl delete daemonset tailscale -n default --grace-period=30 --wait=true --timeout=45s`,
+    # then -- ONLY on a successful delete -- `asyncio.sleep(3)` so Tailscale can send its
+    # disconnect to the control plane. `timeout_seconds`/`settle_seconds` preserve that budget/grace
+    # as gate data; `interval_seconds` is this gate's own poll cadence (NOT the settle -- folding
+    # the 3s grace into interval_seconds would make the gate poll every 3s, not grace once after
+    # Ready, which does not reproduce v1's semantic).
+    on_failure: continue                       # Optional kubeconfig=None => no-op
+  - id: dns
+    uses: dns.delete_record
+    with: {record: {from: infra.dns_record}}   # None => no-op
+    retry: api_default
+    on_failure: continue
+  - id: destroy                                # verb resolves provider with
+    uses: infra.destroy_instance               # check_enabled=False ALWAYS (gotcha 1)
+    with: {provider: {from: infra.provider}, slug: {from: infra.slug},
+           resource_ids: {from: infra.resource_ids}}
+    gate: {timeout_seconds: 900, interval_seconds: 15, max_consecutive_poll_failures: 5}
+    # execute: initiate destroy (v1 "destroying"). poll_ready: provider absence check;
+    # InfrastructureUnreachableError parks the run (Conflict 5's LAW -- it does NOT
+    # feed max_consecutive_poll_failures, that counter is TransientError-only, and it
+    # NEVER flips to "gone"; the gate's overall timeout clock is suspended while parked)

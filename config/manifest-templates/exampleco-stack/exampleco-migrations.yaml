@@ -1,0 +1,39 @@
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: exampleco-migrations
+  labels:
+    app: exampleco-migrations
+    jobType: migration
+spec:
+  # Don't automatically clean up completed jobs - useful for debugging
+  ttlSecondsAfterFinished: 600
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: exampleco-migrations
+    spec:
+      restartPolicy: OnFailure
+      imagePullSecrets:
+        - name: ghcr-secret
+      containers:
+        - name: migrate
+          image: "{{ images.exampleco_migrations }}"
+          # Use args instead of command to preserve the image's ENTRYPOINT
+          args:
+            - "migrate"
+            - "--database-password"
+            - "{{ secrets.database_password }}"
+            {% for key, value in environment_variables.get('exampleco-migrations', {}).items() %}
+            - "--var"
+            - "{{ key }}={{ value }}"
+            {% endfor %}
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"

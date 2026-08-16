@@ -1,0 +1,139 @@
+# deploy-waves — docs/design/seam-b-engine.md §2.2 Proof 1 (PLAN-wave-orchestration),
+# outcome block corrected per docs/design/coherence-review.md Conflict 8, verb names
+# re-normalized per DR-0022 (P4: no conditionals/conjunctions in names --
+# kubectl.delete_jobs_and_stuck_pods -> deploy.prepare_wave,
+# kubectl.rollout_restart_if_unchanged -> deploy.ensure_rollouts; and P1: the gate
+# leaves the provider namespace -- kubectl.wave_ready -> deploy.await_wave):
+#   - DeployCancelled does not exist (Pillar 1 never registered it) -- the cancelled
+#     branch fires DeployFailed(reason="cancelled") like the failed branch, per the
+#     outcome-event mapping table.
+#   - DeploySucceeded/DeployFailed carry no `deployment_id` field (Report base only
+#     adds `at`/`actor`) -- the engine targets the event at
+#     ("deployment", run.deployment_id) directly (Conflict 8's event targeting rule),
+#     so outcome payloads must not (and structurally cannot per V8) reference it.
+#   - `reason` on DeployFailed and `resolved_images` are engine-attached at the
+#     failed/cancelled outcome points from the run's error / literal "cancelled";
+#     only the succeeded payload's `resolved_images` is YAML-driven (from
+#     deploy.load_audit's Output, which Conflict 8 grows a `resolved_images` field).
+workflow: deploy-waves
+version: 1
+inputs:
+  deployment_id: {type: str}
+on_failure: report                    # PLAN-wave: abort-and-report; NO rollback of prior waves
+                                       # (cancel-triggered rollback is a machine decision --
+                                       #  Conflict 12's separate deploy-rollback.yml run, not this
+                                       #  workflow's compensation)
+outcome:
+  succeeded: {event: DeploySucceeded, payload: {resolved_images: {from: audit.resolved_images}}}
+  failed:    {event: DeployFailed}
+  # DeployFailed drives the deployment machine -> failed; cluster stays ACTIVE
+  # (v1 gotcha 8's intent, now clean via the separate deployment machine)
+  cancelled: {event: DeployFailed}    # reason="cancelled" engine-attached (Conflict 8)
+steps:
+  - id: audit                         # domain step: loads DeploymentAudit via repository;
+    uses: deploy.load_audit           # tolerates str/dict resolved_manifests (gotcha 12)
+    with: {deployment_id: {from: run.deployment_id}}
+    # Output: manifests: list[ManifestDoc], profile: DeploymentProfile,
+    #         rollout_timeout_seconds: int, resolved_images: Mapping[str, str],
+    #         data_initialization: SnapshotRestoreSpec|None
+    #         (resolved_images added by coherence-review Conflict 8;
+    #          data_initialization added by DR-0028 decision 2 -- read off
+    #          resolved_config "like every other resolved fact", NOT a profile field)
+
+  - id: kubecfg                       # domain step: decrypts kubeconfig from DB
+    uses: cluster.load_kubeconfig     # (providers never fetch it -- H18)
+    # Output: kubeconfig: SecretStr
+
+  - id: preflight                     # v1 connectivity pre-check, now retried (H6)
+    uses: kube.cluster_info
+    with: {kubeconfig: {from: kubecfg.kubeconfig}}
+    retry: kubectl_default
+    timeout_seconds: 30
+
+  - id: plan                          # DR-0029 (ratified 2026-08-08, supersedes
+    uses: deploy.plan_waves           # DR-0028 decision 5 + Erratum E1's wave-model
+    with:                             # framing): grouping is by SERVICE NAME (the
+      manifests: {from: audit.manifests}              # 3-heuristic matcher against
+      profile: {from: audit.profile}                  # profile.deploy_wave), never by
+      rollout_timeout_seconds: {from: audit.rollout_timeout_seconds}  # document kind --
+      data_initialization: {from: audit.data_initialization}          # unmatched docs go
+    timeout_seconds: 30                                                # to wave 0 (RBAC/
+    # Output: waves: list[Wave]                          # ConfigMaps/Secrets/ghcr-secret,
+    #   Wave{index:int, docs:list[ManifestDoc], jobs:list[str], deployments:list[str],   # see PLAN-wave-orchestration.md).
+    #        gate_timeout_seconds:int, restore: SnapshotRestoreSpec|None}
+    #   DR-0028 decision 2: data_initialization is sourced from the deploy request via
+    #   resolved_config, never from `profile` (`profile` carries persistence_services
+    #   plus the full deploy_wave mapping -- see DeploymentProfile's own docstring,
+    #   seedpod/core/deploy_wave.py).
+    #   `restore` attaches DIRECTLY to the wave carrying persistence_services (DR-0029
+    #   decision 5, preserving DR-0028 Erratum E1 point 2 -- "restore attached to the
+    #   persistence wave... as data, one loop", seam-b:225-226) -- there is NO separate
+    #   empty-docs wave for it; see Wave's own docstring, seedpod/core/deploy_wave.py,
+    #   for why the resulting apply-then-restore-before-the-ready-gate ordering is
+    #   accepted deliberately.
+    #   DR-0028 Erratum E2: a restore requested against a profile declaring no
+    #   persistence_services raises a PermanentError (v1's silent drop, deployment_job.py
+    #   :530, is deliberately NOT ported) -- this step can fail the whole run, by design.
+
+  - id: wave
+    foreach: {items: {from: plan.waves}, as: w}
+    body:
+      - id: prep                      # delete immutable Jobs (--ignore-not-found) +
+        uses: deploy.prepare_wave      # force-delete CrashLoop/Init: pods
+        with: {kubeconfig: {from: kubecfg.kubeconfig}, jobs: {from: w.jobs}}
+        on_failure: continue          # best-effort, as in v1 (gotcha 5)
+
+      - id: apply                     # fan-out-within-the-wave = one apply of all docs
+        uses: kube.apply_docs
+        with: {kubeconfig: {from: kubecfg.kubeconfig}, docs: {from: w.docs}}
+        retry: kubectl_default
+        timeout_seconds: 300
+        # Output: changes: ApplyChangeSummary   # configured/created/unchanged per
+        #                                       # resource; unknown => assume changed
+
+      - id: restore                   # typed no-op when spec is None (conditional-as-data)
+        uses: deploy.restore_snapshot
+        with: {kubeconfig: {from: kubecfg.kubeconfig}, spec: {from: w.restore}}
+        # on the persistence wave, `restore` runs straight after this SAME wave's
+        # own `apply` with no gate between confirming the database pod is up yet
+        # (v1's Phase 1b `_wait_for_database_pods_ready`, deployment_job.py:552-566,
+        # has no v2 equivalent -- see Wave's own docstring, seedpod/core/
+        # deploy_wave.py, "This does re-open, deliberately..."). `kubectl_default`
+        # (Schedule(3, 2.0, 2.0, 15.0) -- ~6s of total backoff, tuned for H6's
+        # kubectl connectivity retries) is NOT sized for "wait for a just-applied
+        # database to accept connections" -- v1 polled up to 180s
+        # (`_wait_for_database_pods_ready(timeout=180)`). This explicit retry
+        # replicates that ~180s budget as engine-owned Schedule attempts
+        # (19 attempts * 10s fixed delay = ~180s of backoff, factor=1.0 so the
+        # delay never grows past base_delay_seconds -- matching v1's own
+        # fixed-interval poll, not an exponential one), never a step-internal
+        # poll loop (CLAUDE.md: "the engine's Schedule owns retry"; Seam C taste
+        # call 2: "no command waits, all waiting is an engine gate").
+        retry: {max_attempts: 19, base_delay_seconds: 10, factor: 1.0, max_delay_seconds: 10}
+        timeout_seconds: 600           # per-attempt ceiling for the restore call itself
+        # (kubectl exec pg_restore/etc); SnapshotService's own dump/restore
+        # KubeRun already bounds each exec to 300s internally, so 600s here is
+        # a per-attempt ceiling that never actually binds -- distinct from the
+        # 19*10s=~180s retry BUDGET *across* attempts above, which is the number
+        # this fix-pass changed. Unchanged from this step's original value.
+
+      - id: restart                   # unchanged-vs-configured heuristic, verbatim salvage
+        uses: deploy.ensure_rollouts    # (deployment_job.py:609-636, gotcha 4)
+        with:
+          kubeconfig: {from: kubecfg.kubeconfig}
+          deployments: {from: w.deployments}
+          changes: {from: apply.changes}
+        retry: kubectl_default
+        timeout_seconds: 60
+
+      - id: ready                     # THE readiness gate; execute is a no-op returning
+        uses: deploy.await_wave       # provisional output; each poll_ready probes ALL of
+        with:                         # the wave's resources once (Deployments: rollout
+          kubeconfig: {from: kubecfg.kubeconfig}      # status --watch=false; Jobs:
+          deployments: {from: w.deployments}          # condition=complete -- Failed =>
+          jobs: {from: w.jobs}                        # PermanentError naming wave+resource)
+        gate:
+          timeout_seconds: {from: w.gate_timeout_seconds}
+          interval_seconds: 5
+        # poll_ready emits ctx.progress per poll with per-resource status
+        # (replaces the bespoke watch_pods SSE task)

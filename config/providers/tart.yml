@@ -1,0 +1,129 @@
+# Tart provider configuration
+#
+# Provisions local Apple-Silicon VMs via Tart (https://tart.run), then
+# installs K3s inside them over SSH using the shared SSHBasedK3sInstaller.
+#
+# Single-machine topology only in v1: seedpod and the Tart daemon must
+# run on the same Mac. VMs are reached via their NAT IP on the
+# hypervisor's virtual switch.
+
+provider_name: "tart"
+display_name: "Tart (local macOS VMs)"
+description: "Local Apple-Silicon VMs via Tart, with K3s installed over SSH"
+
+# Default to false — the provider ships before any deployment profile
+# consumes it. Flip to true once you have a profile ready and the base
+# image is built on the host.
+enabled: true
+
+# How seedpod reaches Tart VMs. v1 only supports "localhost" (seedpod and
+# Tart daemon on the same Mac).
+api_server:
+  host: "localhost"
+
+# Base VM image — must exist in `tart list` on the host.
+# Expected to be an aarch64 Ubuntu image with sshd, sudo, cloud-init, and
+# an authorized key for the SSH user below.
+#
+# `local-dev-base-rosetta` is the Rosetta-enabled variant: has
+# /mnt/rosetta virtio-fs mount + binfmt_misc handler registered so the
+# guest runs amd64 binaries transparently. Needed if any of your images
+# are amd64-only. Pinned to Ubuntu 24.04 GA kernel (6.8.x) because
+# kernels >= 6.10 emit AT_HWCAP3 in auxv which Rosetta on macOS 15.7.x
+# doesn't handle.
+#
+# Build instructions: see ~/vm-infra/README.md (external to seedpod).
+base_image:
+  name: "local-dev-base-rosetta"
+
+# Defaults applied when no explicit size is requested
+defaults:
+  memory_mb: 4096
+  cpu_cores: 4
+  disk_gb: 50
+
+# Map NodeSpecification (cpu_cores, memory_gb) to VM resources.
+# Key format: "<cpu_cores>,<memory_gb>"
+#
+# Keys describe the actual VM size — not a logical ask with hidden
+# overhead. A profile that needs enough headroom for a full multi-service
+# stack plus the ~1.5-2 GB VM/kubelet/containerd overhead should reach for
+# the "4,6" entry (or larger), not "2,4". Profiles built for OrbStack
+# can use tighter sizes because OrbStack shares the host kernel.
+node_size_mapping:
+  "2,4":
+    memory_mb: 4096
+    cpu_cores: 2
+    disk_gb: 40
+  "4,6":
+    memory_mb: 6144
+    cpu_cores: 4
+    disk_gb: 50
+  "4,8":
+    memory_mb: 8192
+    cpu_cores: 4
+    disk_gb: 60
+  "8,16":
+    memory_mb: 16384
+    cpu_cores: 8
+    disk_gb: 80
+
+# Informational — Tart is local-only. All region hints map to "local".
+region_mapping:
+  default: "local"
+
+# SSH credentials for reaching the cloned VM.
+# The base image must have this user set up with passwordless sudo and
+# the corresponding public key in ~/.ssh/authorized_keys.
+ssh_config:
+  ssh_user: "admin"
+  # Use a key that exists for THIS PURPOSE and nothing else. A shared,
+  # general-purpose key (e.g. `~/.ssh/id_ed25519`) is a foot-gun: if it is
+  # ever rotated for an unrelated reason while a base image still trusts
+  # the old one, provisioning fails at `ssh-k3s.capture_host_keys.
+  # cloud_init_wait` with "Permission denied (publickey,password)" -- a VM
+  # that booted and got an IP that nothing could log into. A key nobody has
+  # another reason to rotate cannot fail that way.
+  ssh_private_key_path: "~/.ssh/id_tart_minimax"
+  connection_timeout: 30
+  command_timeout: 600
+  retry_attempts: 3
+  retry_delay: 5
+  ssh_keyscan_timeout: 10
+  cloud_init_wait_timeout: 300
+
+# K3s install tuning (passed to SSHBasedK3sInstaller)
+k3s_config:
+  install_url: "https://get.k3s.io"
+  version: null  # null = latest stable
+  install_timeout: 600
+
+# Health check timeouts
+health_checks:
+  vm_ip_timeout: 120         # how long to poll `tart ip` after boot
+  ssh_ready_timeout: 180     # how long to wait for port 22 to open
+  k3s_ready_timeout: 300     # how long for k3s to become responsive
+
+# Rosetta (Apple's amd64→arm64 binary translator) lets the guest run
+# amd64 containers transparently via binfmt_misc. Required if any of your
+# images are amd64-only.
+#
+# The base image must have /mnt/rosetta mounted (virtio-fs, tag
+# "rosetta") and the binfmt handler pre-registered. Set to false if
+# using a base image without that setup, or on hosts that don't have
+# Rosetta installed. See CLAUDE.md for setup steps.
+rosetta:
+  enabled: true
+
+# VM lifecycle
+cleanup:
+  # When true, `destroy_cluster` runs `tart stop && tart delete`.
+  # When false, VMs are only stopped — operator must `tart delete`
+  # manually. False enables faster re-provisioning but can leave disk
+  # usage growing silently.
+  delete_on_destroy: true
+
+# Concurrent-VM soft cap (enforced in Phase 4; documented here now so
+# operators can tune ahead of time).
+limits:
+  max_concurrent_vms: 3
