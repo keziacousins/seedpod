@@ -1,0 +1,88 @@
+# The scanning half of CI, kept separate from ci.yml on purpose.
+#
+# ci.yml answers "does this change work?" and must stay fast and green. This file
+# answers "does this change introduce a known-bad dependency or a code pattern
+# worth a second look?", which is a different question with different permissions
+# and a different failure meaning. Mixing them makes a security finding look like
+# a broken build.
+#
+# NOTE ON TIMING: both jobs below need the repository to be PUBLIC. CodeQL and the
+# dependency graph are free for public repositories and require GitHub Advanced
+# Security on private ones, so while this repo is still private the CodeQL job
+# fails with an entitlement error. That is expected. This file is committed ahead
+# of publication so scanning starts on the first push after the flip, rather than
+# being remembered later.
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, Monday 06:17 UTC. The odd minute is deliberate -- on-the-hour cron is
+    # the busiest slot on shared runners and gets queued. A scheduled run matters
+    # because a dependency does not have to change for it to become vulnerable:
+    # the advisory arrives on its own schedule, long after the last commit.
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  codeql:
+    name: CodeQL
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      # Writing results into the Security tab is the whole point of the job, and
+      # is the narrowest privilege that allows it.
+      security-events: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both languages this repo actually ships. Neither needs a build step:
+        # CodeQL analyses interpreted languages straight from source.
+        language: ["python", "javascript-typescript"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Initialise CodeQL
+        uses: github/codeql-action/init@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          languages: ${{ matrix.language }}
+          # `security-and-quality` is a wider query set than the default. This
+          # codebase is a control plane that holds encrypted kubeconfigs and runs
+          # subprocesses against real infrastructure, so the extra noise is worth
+          # the extra coverage. Narrow to `security-extended` if it gets loud.
+          queries: security-and-quality
+      - name: Analyse
+        uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  dependency-review:
+    name: Dependency review
+    # Pull requests only: the action compares the base commit against the head to
+    # find what a change ADDS. On a push to main there is no such comparison to
+    # make, and the weekly CodeQL run plus Dependabot cover the standing state.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Review new dependencies
+        uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+        with:
+          # Block the pull request if it pulls in a dependency with a known
+          # high-or-worse advisory. This is the control that would have caught the
+          # seven advisories found by hand on 2026-08-16 (six high, one low, all in
+          # the UI tree) at the moment they were introduced instead of months later.
+          fail-on-severity: high
+          # Copyleft licences are a deliberate decision for an MIT-licensed project,
+          # not something to absorb silently through a transitive dependency.
+          deny-licenses: AGPL-3.0, GPL-2.0, GPL-3.0

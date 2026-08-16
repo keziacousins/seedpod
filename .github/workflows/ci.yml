@@ -13,6 +13,26 @@
 #     business holding them, and the suite is designed to need none (fault injection
 #     lives at the transport seam -- CLAUDE.md's testing posture).
 #   - no smoke. The smoke is a human decision that spends real money.
+#
+# Hardened 2026-08-16 for the public release. The threat model changed when the
+# repo did: anyone can now open a pull request, so a workflow run is attacker-
+# reachable input. Four rules follow from that, and each is load-bearing:
+#
+#   1. `pull_request`, never `pull_request_target`. `pull_request` checks out the
+#      fork's code with a read-only token and NO access to repository secrets.
+#      `pull_request_target` runs with the base repo's secrets against the fork's
+#      code, which hands a stranger everything. Do not "fix" a fork PR that cannot
+#      see a secret by reaching for it.
+#   2. Every action is pinned to a full commit SHA, not a tag. Tags are mutable:
+#      whoever controls the action repo can repoint `v4` at new code, and that is
+#      exactly how the March 2025 `tj-actions/changed-files` compromise leaked
+#      secrets out of thousands of runners. A SHA cannot be repointed. Dependabot
+#      (.github/dependabot.yml) proposes the bumps so pinning does not mean rotting.
+#   3. Least privilege, spelled out. The repo default is already read-only, but a
+#      default is a setting someone can change; `permissions:` here is the contract.
+#   4. No `${{ }}` interpolation inside any `run:` block. A PR title or branch name
+#      is attacker-controlled text, and interpolating it into a shell script is
+#      command injection. Pass untrusted values through `env:` if ever needed.
 name: CI
 
 on:
@@ -20,15 +40,37 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege for every job below. Neither job writes anything: they read the
+# checkout and report status. Any future job needing more should widen its own
+# `permissions:` block rather than this one.
+permissions:
+  contents: read
+
+# A second push to a pull request makes the first run's answer worthless. Cancel
+# it. Pushes to main are never cancelled -- each main commit gets its own verdict.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   python:
     runs-on: ubuntu-latest
+    # The suite runs in well under a minute. A job still going after 15 is hung or
+    # is doing something it should not be; without this it would burn six hours.
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # checkout leaves the job's token in `.git/config` by default, where any
+          # later step can read it -- including arbitrary dependency code executed
+          # by `uv sync` or `pytest`. Nothing here pushes, so drop the credential.
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5.4.2
         with:
           enable-cache: true
       - name: Sync dependencies (locked)
+        # `--locked` fails rather than silently re-resolving, so CI installs the
+        # exact versions in uv.lock and a stale lockfile is an error, not a drift.
         run: uv sync --locked
       - name: Lint
         run: uv run ruff check .
@@ -40,17 +82,31 @@ jobs:
 
   ui:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: ui
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: "24"
           cache: npm
           cache-dependency-path: ui/package-lock.json
-      - run: npm ci
+      - name: Install (locked, no lifecycle scripts)
+        # `--ignore-scripts` is the single cheapest defence against the npm attack
+        # that keeps recurring (the September 2025 "Shai-Hulud" worm and every
+        # typosquat before it): the payload runs from a `postinstall` hook during
+        # install, before any of your code does. Two packages in this tree declare
+        # install scripts -- esbuild and fsevents -- and neither needs one here.
+        # esbuild ships its platform binary as an optional dependency that npm
+        # installs directly, and fsevents is macOS-only. Verified 2026-08-16: build
+        # and tests both pass with scripts off. If a future dependency genuinely
+        # needs its hook, that is a decision to make on purpose, not by deleting
+        # this flag.
+        run: npm ci --ignore-scripts
       - name: Tests
         run: npm test
       - name: Build

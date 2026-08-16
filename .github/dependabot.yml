@@ -1,0 +1,41 @@
+# Dependabot exists here to make SHA-pinning survivable.
+#
+# ci.yml pins every action to a commit SHA, which removes the mutable-tag attack
+# but freezes the action at whatever that commit was. Without something proposing
+# bumps, "pinned" becomes "abandoned" -- and an unpatched action is its own risk.
+# Dependabot rewrites the SHA and the trailing `# vX.Y.Z` comment together, so the
+# pin stays honest and every upgrade arrives as a reviewable pull request rather
+# than as a silent repoint by a third party.
+#
+# The three ecosystems are the three ways code enters this repo without anyone
+# writing it: GitHub Actions, Python wheels, and npm packages.
+version: 2
+updates:
+  # The supply chain that runs with the most privilege, so it goes first.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      # One PR for all routine action bumps. They are reviewed as a batch because
+      # they are read together -- and a single PR is likelier to actually get read.
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      python-minor-patch:
+        update-types: ["minor", "patch"]
+    # Majors stay ungrouped and arrive one at a time: they are the ones that need
+    # a human to read a changelog rather than a green check.
+
+  - package-ecosystem: "npm"
+    directory: "/ui"
+    schedule:
+      interval: "weekly"
+    groups:
+      ui-minor-patch:
+        update-types: ["minor", "patch"]
