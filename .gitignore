@@ -42,4 +42,12 @@ __pycache__/
 # ignored explicitly because `scripts/build_release.py` refuses to build from a
 # dirty tree and counts UNTRACKED files as dirty -- so an unignored scratch
 # directory blocks releases while never being able to reach the artifact.
-.claude/
+#
+# `.claude/*` and not `.claude/`, so the negation below can take effect: git
+# cannot re-include a path whose parent DIRECTORY is excluded, only one whose
+# parent is matched by a wildcard. `skills/` is deliberately tracked -- the
+# run-seedpod skill is committed tooling, not scratch, and a TRACKED file never
+# appears in `git status --porcelain`, so it cannot dirty the tree the way the
+# scratch scripts would. The release guard's reason for this rule is untouched.
+.claude/*
+!.claude/skills/
