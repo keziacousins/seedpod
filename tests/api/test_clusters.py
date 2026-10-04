@@ -28,7 +28,7 @@ from sqlalchemy import text
 
 from seedpod.core.events import CreateRequested, Discovered, DiscoveredInfo, ProvisionSucceeded
 from seedpod.core.records import ClusterRecord, ClusterState, Origin
-from seedpod.data.repositories import ClusterRow
+from seedpod.data.repositories import ClusterRow, DeploymentAuditRepository, DeploymentAuditRow
 from seedpod.providers.kubectl import KubectlConfig, KubectlProvider
 from tests.conformance.fake_kubectl import FakeKubectlBackend, FakeKubectlTransport
 from tests.conformance.kubectl_harness import FAKE_KUBECONFIG
@@ -227,6 +227,69 @@ async def test_get_cluster_detail_shape_and_id_or_slug_lookup(app, client, auth_
     by_slug = await client.get("/api/clusters/c1-slug", headers=auth_headers)
     assert by_slug.status_code == 200
     assert by_slug.json()["id"] == "c1"
+
+
+async def _record_resolved_hostname(app, cluster_id: str, hostname: str | None, *, audit_id: str = "audit-1") -> None:
+    """Insert the deployment audit a deploy would have written, with ``hostname`` as
+    the ``cluster_hostname`` the profile resolved (DR-0047)."""
+    row = DeploymentAuditRow(
+        id=audit_id, deployment_id=None, cluster_id=cluster_id, environment="ephemeral",
+        triggering_repo="preset:web", triggering_branch="main", triggering_image="ghcr.io/org/web:sha",
+        commit_sha=None, deployment_profile_name="web-nodns", resolution_strategy="latest",
+        registry_queries=[], resolved_images={}, resolved_config={"cluster_hostname": hostname} if hostname else {},
+        resolved_manifests="", resolved_secrets={}, key_class="DEV", template_files_used=[],
+        created_at=app.clock.now(),
+    )
+    async with app.uow() as tx:
+        DeploymentAuditRepository(app.crypto).insert(tx, row)
+
+
+async def test_dns_record_cluster_reports_its_hostname_and_source(app, client, auth_headers):
+    await _birth_cluster(app, "c1", slug="c1-slug", dns_hostname="c1.example.com")
+    # A profile-resolved name must not replace the DNS record seedpod owns.
+    await _record_resolved_hostname(app, "c1", "c1-slug.tailnet.ts.net")
+
+    body = (await client.get("/api/clusters/c1", headers=auth_headers)).json()
+    assert body["dns_hostname"] == "c1.example.com"
+    assert body["hostname"] == "c1.example.com"
+    assert body["hostname_source"] == "dns_record"
+    assert body["cluster_url"] == "https://c1.example.com"
+
+
+async def test_cluster_without_dns_record_reports_the_profile_resolved_hostname(app, client, auth_headers):
+    # DR-0047. `dns.enabled: false` plus a `custom` hostname pattern: the name is in
+    # the deployment audit, and before this DR the API and the SPA showed nothing.
+    await _birth_cluster(app, "c1", slug="preset-web-c1")
+    await _record_resolved_hostname(app, "c1", "preset-web-c1.tailnet.ts.net")
+
+    body = (await client.get("/api/clusters/c1", headers=auth_headers)).json()
+    assert body["dns_hostname"] is None  # still "no DNS record owned by seedpod"
+    assert body["hostname"] == "preset-web-c1.tailnet.ts.net"
+    assert body["hostname_source"] == "profile"
+    assert body["cluster_url"] == "https://preset-web-c1.tailnet.ts.net"
+
+    listed = (await client.get("/api/clusters", headers=auth_headers)).json()["clusters"]
+    assert [(c["id"], c["hostname"], c["hostname_source"]) for c in listed] == [
+        ("c1", "preset-web-c1.tailnet.ts.net", "profile")
+    ]
+
+
+async def test_provider_host_ip_is_not_reported_as_a_hostname(app, client, auth_headers):
+    # `hostname.strategy: provider_host` on tart or DigitalOcean resolves to an IP.
+    await _birth_cluster(app, "c1", slug="c1-slug")
+    await _record_resolved_hostname(app, "c1", "192.168.65.49")
+
+    body = (await client.get("/api/clusters/c1", headers=auth_headers)).json()
+    assert body["hostname"] is None
+    assert body["hostname_source"] is None
+    assert body["cluster_url"] is None
+
+
+async def test_cluster_with_no_deployment_reports_no_hostname(app, client, auth_headers):
+    await _birth_cluster(app, "c1", slug="c1-slug")
+
+    body = (await client.get("/api/clusters/c1", headers=auth_headers)).json()
+    assert (body["hostname"], body["hostname_source"], body["cluster_url"]) == (None, None, None)
 
 
 async def test_reconciliation_stale_flips_after_threshold(app, client, auth_headers):

@@ -888,6 +888,43 @@ async def test_deployment_audit_insert_and_get_round_trips_decrypted(uow, crypto
     assert fetched == make_deployment_audit_row("a1", "d1", "c1")
 
 
+async def test_latest_cluster_hostnames_takes_each_clusters_newest_audit(uow, crypto):
+    # DR-0047: the cluster API reads this to show a hostname the profile resolved.
+    repo = DeploymentAuditRepository(crypto)
+    async with uow() as tx:
+        for cluster_id, slug in (("c1", "one"), ("c2", "two"), ("c3", "three"), ("c4", "four")):
+            clusters.insert(tx, make_cluster_row(cluster_id, slug))
+        repo.insert(tx, make_deployment_audit_row(
+            "a1", None, "c1", resolved_config={"cluster_hostname": "old.ts.net"}, created_at=NOW))
+        repo.insert(tx, make_deployment_audit_row(
+            "a2", None, "c1", resolved_config={"cluster_hostname": "new.ts.net"}, created_at=LATER))
+        repo.insert(tx, make_deployment_audit_row(
+            "a3", None, "c2", resolved_config={"cluster_hostname": "192.168.65.49"}))
+        # c3: the newest audit resolved no hostname, so the older one is not used.
+        repo.insert(tx, make_deployment_audit_row(
+            "a4", None, "c3", resolved_config={"cluster_hostname": "stale.ts.net"}, created_at=NOW))
+        repo.insert(tx, make_deployment_audit_row("a5", None, "c3", resolved_config={}, created_at=LATER))
+
+    async with uow() as tx:
+        found = repo.latest_cluster_hostnames(tx, ["c1", "c2", "c3", "c4", "no-such-cluster"])
+    # The repository returns the stored string as it is; rejecting an IP is the pure
+    # `access_hostname` rule, not a storage rule.
+    assert found == {"c1": "new.ts.net", "c2": "192.168.65.49"}
+
+
+async def test_latest_cluster_hostnames_only_returns_the_clusters_asked_for(uow, crypto):
+    repo = DeploymentAuditRepository(crypto)
+    async with uow() as tx:
+        clusters.insert(tx, make_cluster_row("c1", "one"))
+        clusters.insert(tx, make_cluster_row("c2", "two"))
+        repo.insert(tx, make_deployment_audit_row("a1", None, "c1", resolved_config={"cluster_hostname": "one.ts.net"}))
+        repo.insert(tx, make_deployment_audit_row("a2", None, "c2", resolved_config={"cluster_hostname": "two.ts.net"}))
+
+    async with uow() as tx:
+        assert repo.latest_cluster_hostnames(tx, ["c2"]) == {"c2": "two.ts.net"}
+        assert repo.latest_cluster_hostnames(tx, []) == {}
+
+
 async def test_deployment_audit_ciphertext_is_not_plaintext_on_disk(uow, crypto):
     repo = DeploymentAuditRepository(crypto)
     async with uow() as tx:
