@@ -133,7 +133,7 @@ export function ClusterList() {
         ),
     },
     {
-      key: "dns_hostname",
+      key: "hostname", // DR-0047: a DNS record's name, or the name the profile resolved
       label: "URL",
       render: (hostname, row) => {
         if (!hostname) return "-";

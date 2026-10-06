@@ -1841,6 +1841,25 @@ class DeploymentAuditRepository:
         ).mappings().all()
         return [self._decrypt_row(r) for r in rows]
 
+    def latest_cluster_hostnames(self, session: Session, cluster_ids: Sequence[str]) -> dict[str, str]:
+        """DR-0047: the ``cluster_hostname`` that each cluster's newest audit resolved,
+        keyed by cluster id. It reads ``resolved_config`` only, so nothing is
+        decrypted. A cluster has no entry when it has no audit, or when its newest
+        audit resolved no hostname -- an older audit's hostname is not used."""
+        if not cluster_ids:
+            return {}
+        rows = session.execute(
+            text(
+                "SELECT cluster_id, resolved_config FROM deployment_audits "
+                "WHERE cluster_id IN :cluster_ids ORDER BY created_at"
+            ).bindparams(bindparam("cluster_ids", expanding=True)),
+            {"cluster_ids": list(cluster_ids)},
+        ).mappings().all()
+        newest: dict[str, Any] = {}
+        for row in rows:
+            newest[row["cluster_id"]] = (_load(row["resolved_config"]) or {}).get("cluster_hostname")
+        return {cluster_id: name for cluster_id, name in newest.items() if isinstance(name, str) and name}
+
     def update_rendered_manifests(
         self,
         session: Session,

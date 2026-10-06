@@ -36,7 +36,8 @@ adapts to the clean v2 contract -- no compatibility shims"):
   derived here exactly as v1's ``ClusterRecord.cluster_url``/
   ``._is_reconciliation_stale`` did (``reference-code/seedpod/seedpod/data/
   models.py:81-100``): ``cluster_url = f"https://{dns_hostname}"`` when a hostname
-  is set, and "stale" iff a reconciliation HAS happened but was more than 1800s
+  is set (DR-0047 widens "a hostname" to include one the profile resolved, when the
+  cluster has no DNS record -- ``core/cluster_access.py``), and "stale" iff a reconciliation HAS happened but was more than 1800s
   (30 minutes -- v1's own "3x the typical 10-minute reconciliation interval")
   before ``now`` (the injected ``Clock``, never a wall-clock call -- CLAUDE.md).
   Never-reconciled is NOT stale (v1: "no reconciliation data yet - not stale,
@@ -77,6 +78,7 @@ adapts to the clean v2 contract -- no compatibility shims"):
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -85,9 +87,15 @@ from pydantic import BaseModel, Field
 from seedpod.api.auth import require_permission
 from seedpod.api.deps import get_app
 from seedpod.app.services.cluster_service import ClusterNotFound
+from seedpod.core.cluster_access import access_hostname
 from seedpod.core.errors import ErrorCode, ProviderError
 from seedpod.core.machine import InvalidTransition
-from seedpod.data.repositories import ClusterRow, ClusterStateAuditRow, DeploymentRow
+from seedpod.data.repositories import (
+    ClusterRow,
+    ClusterStateAuditRow,
+    DeploymentAuditRepository,
+    DeploymentRow,
+)
 from seedpod.providers.contract import PodDetailsResult
 from seedpod.providers.kube_types import EventInfo, PodDetails, PodInfo
 
@@ -149,8 +157,15 @@ async def _provider_read(coro: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 
-def _cluster_url(row: ClusterRow) -> str | None:
-    return f"https://{row.dns_hostname}" if row.dns_hostname else None
+async def _resolved_hostnames(app: Any, rows: Sequence[ClusterRow]) -> dict[str, str]:
+    """DR-0047: the profile-resolved hostname for each cluster that has no DNS record
+    of its own. One short uow, DB only (DR-0008). No query when every row has a
+    ``dns_hostname``."""
+    cluster_ids = [row.id for row in rows if not row.dns_hostname]
+    if not cluster_ids:
+        return {}
+    async with app.uow() as tx:
+        return DeploymentAuditRepository(app.crypto).latest_cluster_hostnames(tx, cluster_ids)
 
 
 def _reconciliation_stale(row: ClusterRow, *, now) -> bool:
@@ -159,7 +174,11 @@ def _reconciliation_stale(row: ClusterRow, *, now) -> bool:
     return (now - row.last_reconciled_at).total_seconds() > _STALE_THRESHOLD_SECONDS
 
 
-def _serialize_cluster(row: ClusterRow, *, now) -> dict[str, Any]:
+def _serialize_cluster(row: ClusterRow, *, now, resolved_hostname: str | None = None) -> dict[str, Any]:
+    # DR-0047: `hostname` is how to reach the cluster; `dns_hostname` stays "the DNS
+    # record seedpod owns". `cluster_url` follows `hostname`, so it is also set for a
+    # cluster whose name comes from the profile and not from a DNS record.
+    access = access_hostname(dns_hostname=row.dns_hostname, resolved_hostname=resolved_hostname)
     return {
         "id": row.id,
         "slug": row.slug,
@@ -174,7 +193,9 @@ def _serialize_cluster(row: ClusterRow, *, now) -> dict[str, Any]:
         "node_count": row.node_count,
         "public_ip": row.public_ip,
         "dns_hostname": row.dns_hostname,
-        "cluster_url": _cluster_url(row),
+        "hostname": access.hostname if access else None,
+        "hostname_source": access.source if access else None,
+        "cluster_url": f"https://{access.hostname}" if access else None,
         "cost_per_hour": row.cost_per_hour,
         "total_cost": row.total_cost,
         "failure_reason": row.failure_reason,
@@ -277,8 +298,9 @@ async def list_clusters(
 ) -> dict[str, Any]:
     app = get_app(request)
     rows = await app.services.clusters.list(show_destroyed=show_destroyed, status=status)
+    resolved = await _resolved_hostnames(app, rows)
     now = app.clock.now()
-    return {"clusters": [_serialize_cluster(r, now=now) for r in rows]}
+    return {"clusters": [_serialize_cluster(r, now=now, resolved_hostname=resolved.get(r.id)) for r in rows]}
 
 
 @router.get("/clusters/{cluster_id}")
@@ -290,7 +312,8 @@ async def get_cluster(
         row = await app.services.clusters.get(cluster_id)
     except ClusterNotFound as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    return _serialize_cluster(row, now=app.clock.now())
+    resolved = await _resolved_hostnames(app, [row])
+    return _serialize_cluster(row, now=app.clock.now(), resolved_hostname=resolved.get(row.id))
 
 
 @router.delete("/clusters/{cluster_id}")

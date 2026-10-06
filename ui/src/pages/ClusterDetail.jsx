@@ -685,9 +685,18 @@ export function ClusterDetail({ clusterId }) {
                 rel="noopener noreferrer"
                 style={{ color: "var(--blue)", marginRight: "0.5rem" }}
               >
-                {cluster.dns_hostname}
+                {cluster.hostname}
               </a>
               <CopyableText value={cluster.cluster_url} showValue={false} />
+              {/* DR-0047: a profile-resolved name has no DNS record behind it. */}
+              {cluster.hostname_source === "profile" && (
+                <div>
+                  <small style="color: var(--color-text-muted);">
+                    From the deployment profile. seedpod made no DNS record for
+                    this name, so it resolves only where your network knows it.
+                  </small>
+                </div>
+              )}
             </InfoGridRow>
           )}
         </InfoGrid>
