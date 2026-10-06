@@ -210,6 +210,62 @@ async def test_row27_unreachable_carries_apiserver_host():
     assert excinfo.value.host == "https://10.96.0.1:6443"
 
 
+# What kubectl v1.33.9 printed for an apiserver it could not reach, captured 2026-10-06 on the
+# host that runs seedpod (`kubectl cluster-info --request-timeout=10s`, the health probe's own
+# command). Before DR-0048 each of these was a PermanentError, and the health monitor fails a
+# cluster on the first one it sees.
+_DISCOVERY_FAILED = (
+    'E1006 21:37:30.093431   86506 memcache.go:265] "Unhandled Error" err="couldn\'t get current '
+    'server API group list: Get \\"https://192.168.65.250:6443/api?timeout=10s\\": '
+    'dial tcp 192.168.65.250:6443: connect: {cause}"\n'
+)
+_UNREACHABLE_STDERR = {
+    # The discovery cache had expired, so kubectl ran discovery first and logged its failure.
+    # "no route to host" is the cause in the 2026-10-06 failure; its stderr was not kept, so
+    # this one is the captured "host is down" output with the cause swapped.
+    "expired_discovery_cache_no_route": (
+        _DISCOVERY_FAILED.format(cause="no route to host") * 5
+        + "Unable to connect to the server: dial tcp 192.168.65.250:6443: connect: no route to host\n"
+    ),
+    "expired_discovery_cache_host_down": (
+        _DISCOVERY_FAILED.format(cause="host is down") * 5
+        + "Unable to connect to the server: dial tcp 192.168.65.250:6443: connect: host is down\n"
+    ),
+    "host_down": "Unable to connect to the server: dial tcp 192.168.65.250:6443: connect: host is down\n",
+    "connection_refused": "The connection to the server 127.0.0.1:1 was refused - did you specify the right host or port?\n",
+    "request_timeout": (
+        "Unable to connect to the server: context deadline exceeded "
+        "(Client.Timeout exceeded while awaiting headers)\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("stderr", _UNREACHABLE_STDERR.values(), ids=_UNREACHABLE_STDERR.keys())
+async def test_row27_real_kubectl_unreachable_stderr_is_never_permanent(stderr):
+    harness = KubectlHarness()
+    harness.backend.unreachable_stderr_override = stderr.encode()
+    provider = harness.provider(Fault.UNREACHABLE)
+    with pytest.raises(InfrastructureUnreachableError) as excinfo:
+        await _drain(provider, KubeGetClusterInfo(kubeconfig=FAKE_KUBECONFIG))
+    assert excinfo.value.code == "endpoint_unreachable"
+    assert excinfo.value.host == "https://10.96.0.1:6443"
+
+
+async def test_discovery_failure_keeps_its_cause_when_the_cause_is_auth():
+    # The wrapper line is not a verdict, but what it wraps still is: a discovery request the
+    # apiserver rejected is row 28, exactly as it was before DR-0048.
+    harness = KubectlHarness()
+    harness.backend.unreachable_stderr_override = (
+        b'E1006 21:37:30.093431   86506 memcache.go:265] "Unhandled Error" err="couldn\'t get current '
+        b'server API group list: the server has asked for the client to provide credentials"\n'
+        b"error: You must be logged in to the server (the server has asked for the client to provide credentials)\n"
+    )
+    provider = harness.provider(Fault.UNREACHABLE)
+    with pytest.raises(PermanentError) as excinfo:
+        await _drain(provider, KubeGetClusterInfo(kubeconfig=FAKE_KUBECONFIG))
+    assert excinfo.value.code == "auth"
+
+
 async def test_row29_apply_validation_error_is_invalid_input():
     harness = KubectlHarness()
     provider = harness.provider()

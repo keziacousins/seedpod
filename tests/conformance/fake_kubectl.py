@@ -154,6 +154,12 @@ class FakeKubectlBackend:
     # `watch_lines` below lets a test queue deliberately-malformed stream frames.
     get_jobs_raw_stdout_override: bytes | None = None
 
+    # DR-0048: when set, `Fault.UNREACHABLE` fails with this stderr VERBATIM instead of the
+    # one tidy "connection refused" line below. Real kubectl says "cannot reach the
+    # apiserver" in several different sentences, and the classifier is only as good as the
+    # ones it has been shown -- so a test replays what a real kubectl printed.
+    unreachable_stderr_override: bytes | None = None
+
     # rollout undo bookkeeping: names of deployments whose undo should fail this call.
     rollout_undo_failures: frozenset[str] = frozenset()
 
@@ -201,6 +207,8 @@ class FakeKubectlTransport:
             return SubprocessResult(returncode=0, stdout=b"", stderr=b"", binary_missing=True)
 
         if Fault.UNREACHABLE in self.faults:
+            if self.backend.unreachable_stderr_override is not None:
+                return SubprocessResult(returncode=1, stdout=b"", stderr=self.backend.unreachable_stderr_override)
             return SubprocessResult(
                 returncode=1, stdout=b"",
                 stderr=f"Unable to connect to the server: dial tcp {self.backend.apiserver_url}: connection refused".encode(),
