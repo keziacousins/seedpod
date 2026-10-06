@@ -73,8 +73,11 @@ and real kubectl does not print that line.
   the other codes like transient failures. Fail-on-permanent is salvaged v1 behaviour
   (`runtime/health.py`), so a change to it needs its own decision.
 - **The Local Network grant** that started the outage. See the guide.
-- **Recovery.** The cluster stayed `failed` after it was reachable again. `clusters rehabilitate` is
-  the manual path.
+- **Recovery. There is none.** The cluster stayed `failed` after it was reachable again, and the
+  state machine has no transition from `FAILED` to `ACTIVE`. `clusters rehabilitate` is for
+  destroyed, zombie and unmanaged clusters and is rejected here. `RetryRequested` runs the provision
+  workflow again, and nothing emits it. So a cluster that the health monitor fails in error can only
+  be destroyed and deployed again. This makes each wrong `PermanentError` expensive.
 
 ## What pins it
 

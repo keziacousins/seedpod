@@ -84,7 +84,15 @@ away. DR-0048 records what that outage then did to a healthy cluster.
 | Homebrew `python@3.12` | errno 65 |
 | Homebrew `python@3.13` | open |
 | `/usr/bin/python3` | open |
-| `/usr/bin/nc` | open |
+| `/usr/bin/nc`, `/usr/bin/curl`, `/usr/bin/ssh`, `/usr/bin/ssh-keyscan` | open |
+| `kubectl` (the one in `OrbStack.app`), to the VM address | `no route to host` |
+| the same `kubectl`, as a child of Homebrew `python@3.13` | `no route to host` |
+| the same `kubectl`, to the node's Tailscale address | open |
+
+**The rule applies to each program, and a child does not get its parent's grant.** Seedpod runs
+`kubectl` for every cluster read and every apply. So a server on an interpreter that passes can
+provision a VM and install k3s, and then cannot deploy to it or check its health. An address on
+the tailnet is not a local network address, and the rule does not apply to it.
 
 The three Homebrew interpreters all run as a `Python.app` with one bundle id, `org.python.python`.
 The Local Network store holds one rule for that id, and the rule is *allow*. Only the 3.13 build
@@ -93,14 +101,15 @@ reading is that the rule belongs to the build that was approved. This is not pro
 
 **Fixes, in preference order.**
 
-1. **Run seedpod on an interpreter that passes the detached test.** On this host that is Homebrew
-   `python3.13`: `uv sync --locked --python /opt/homebrew/bin/python3.13`. The test suite passes on
-   3.13. This is a candidate: no release has run on it yet. The grant belongs to the build, so do
-   the detached test again after Homebrew upgrades that Python.
-2. **Run seedpod as a child of one live session** — a single
+1. **Run seedpod as a child of one live session** — a single
    `ssh <host> '/path/to/run-everything.sh'` that starts the server *and* drives the work. This is
    what made smoke 5 pass. It is a workaround, not a fix: it borrows the session's grant, and the
-   grant ends with the session.
+   grant ends with the session. It is the only fix here that covers `kubectl`.
+2. **Run seedpod on an interpreter that passes the detached test.** On this host that is Homebrew
+   `python3.13`: `uv sync --locked --python /opt/homebrew/bin/python3.13`. The test suite passes on
+   3.13, and release `2.0.0a0+94257164` ran on it. This is half a fix: the server's own
+   connections pass, and its `kubectl` does not. The grant belongs to the build, so do the detached
+   test again after Homebrew upgrades that Python.
 3. **System Settings → Privacy & Security → Local Network.** Do not expect this to help. The
    store already has the *allow* rule for `org.python.python`, and `python@3.11` is denied anyway.
    Recreating the venv does not help either: the venv path is not what is judged.
