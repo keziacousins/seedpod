@@ -86,7 +86,7 @@ from pydantic import BaseModel, Field
 
 from seedpod.api.auth import require_permission
 from seedpod.api.deps import get_app
-from seedpod.app.services.cluster_service import ClusterNotFound
+from seedpod.app.services.cluster_service import ClusterNotFound, ClusterNotRehabilitatable
 from seedpod.core.cluster_access import access_hostname
 from seedpod.core.errors import ErrorCode, ProviderError
 from seedpod.core.machine import InvalidTransition
@@ -381,8 +381,13 @@ async def rehabilitate_cluster(
         row = await app.services.clusters.rehabilitate(cluster_id, actor=f"api:{api_key.username}")
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    except InvalidTransition as exc:
+    except (InvalidTransition, ClusterNotRehabilitatable) as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except ProviderError as exc:
+        # DR-0049: the reachability check a FAILED cluster must pass first. "Cannot
+        # reach it" is a 502 here as on every provider-plane read -- seedpod could not
+        # determine the cluster's state, and it has left the record as it was.
+        raise _http_error_for_provider_error(exc) from exc
     return {"cluster_id": row.id, "status": row.status}
 
 

@@ -26,11 +26,19 @@ from datetime import timedelta
 
 from sqlalchemy import text
 
-from seedpod.core.events import CreateRequested, Discovered, DiscoveredInfo, ProvisionSucceeded
+from seedpod.core.events import (
+    CreateRequested,
+    Discovered,
+    DiscoveredInfo,
+    HealthCheckFailed,
+    ProvisionFailed,
+    ProvisionSucceeded,
+)
 from seedpod.core.records import ClusterRecord, ClusterState, Origin
 from seedpod.data.repositories import ClusterRow, DeploymentAuditRepository, DeploymentAuditRow
 from seedpod.providers.kubectl import KubectlConfig, KubectlProvider
 from tests.conformance.fake_kubectl import FakeKubectlBackend, FakeKubectlTransport
+from tests.conformance.harness import Fault
 from tests.conformance.kubectl_harness import FAKE_KUBECONFIG
 
 # tests/conformance/fake_kubectl.py's _default_pods() key -- the one pod every
@@ -429,6 +437,68 @@ async def test_extend_without_ttl_is_400(app, client, auth_headers):
 async def test_rehabilitate_unknown_cluster_is_404(client, auth_headers):
     response = await client.post("/api/clusters/does-not-exist/rehabilitate", headers=auth_headers)
     assert response.status_code == 404
+
+
+# DR-0049: FAILED -> ACTIVE, for a cluster the health monitor failed in error.
+
+
+async def _fail_by_health_check(app, cluster_id: str) -> None:
+    await app.dispatcher.apply(
+        "cluster", cluster_id,
+        HealthCheckFailed(at=app.clock.now(), actor="health", reason="kubectl connectivity lost (permanent): boom"),
+    )
+
+
+async def test_rehabilitate_failed_cluster_that_answers_returns_to_active(app, client, auth_headers):
+    await _birth_cluster(app, "c1", slug="c1-slug", ttl_hours=24)
+    await _promote_to_active(app, "c1")
+    await _set_kubeconfig(app, "c1")
+    await _fail_by_health_check(app, "c1")
+    backend = _install_fake_kubectl(app)
+
+    response = await client.post("/api/clusters/c1/rehabilitate", headers=auth_headers)
+
+    assert response.status_code == 200
+    assert response.json() == {"cluster_id": "c1", "status": "active"}
+    assert ("kubectl", "cluster-info", "--request-timeout=10s") in backend.call_log  # it was asked first
+    detail = (await client.get("/api/clusters/c1", headers=auth_headers)).json()
+    assert detail["status"] == "active"
+    assert detail["failure_reason"] is None
+
+
+async def test_rehabilitate_failed_cluster_that_cannot_be_reached_is_502_and_stays_failed(app, client, auth_headers):
+    await _birth_cluster(app, "c1", slug="c1-slug")
+    await _promote_to_active(app, "c1")
+    await _set_kubeconfig(app, "c1")
+    await _fail_by_health_check(app, "c1")
+    backend = FakeKubectlBackend()
+    _install_fake_kubectl(app, backend=backend, transport=FakeKubectlTransport(backend, frozenset({Fault.UNREACHABLE})))
+
+    response = await client.post("/api/clusters/c1/rehabilitate", headers=auth_headers)
+
+    assert response.status_code == 502
+    assert "could not reach" in response.json()["detail"]
+    detail = (await client.get("/api/clusters/c1", headers=auth_headers)).json()
+    assert detail["status"] == "failed"
+    assert detail["failure_reason"] == "kubectl connectivity lost (permanent): boom"
+
+
+async def test_rehabilitate_cluster_that_failed_provisioning_is_409_and_stays_failed(app, client, auth_headers):
+    """No kubeconfig means provisioning never finished: there is no cluster to return to,
+    and the machine alone would have marked it ACTIVE."""
+    await _birth_cluster(app, "c1", slug="c1-slug")
+    await app.dispatcher.apply(
+        "cluster", "c1", ProvisionFailed(at=app.clock.now(), actor="engine:run:r1", reason="ssh gate timed out"),
+    )
+    backend = _install_fake_kubectl(app)
+
+    response = await client.post("/api/clusters/c1/rehabilitate", headers=auth_headers)
+
+    assert response.status_code == 409
+    assert "cannot be rehabilitated" in response.json()["detail"]
+    assert backend.call_log == []  # nothing to probe with
+    detail = (await client.get("/api/clusters/c1", headers=auth_headers)).json()
+    assert detail["status"] == "failed"
 
 
 # ---------------------------------------------------------------------------

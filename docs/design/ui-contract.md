@@ -3,7 +3,7 @@ title: UI contract — v1 SPA consumption audit & v2 migration worklist
 type: design
 status: active
 created: 2026-07-12
-updated: 2026-10-04
+updated: 2026-10-06
 ---
 
 # UI contract — SPA consumption audit & v2 migration worklist
@@ -105,7 +105,7 @@ Direction (DR-0002): **we own the UI, so the SPA adapts to the clean v2 contract
 | ClusterDetail.jsx:284, 295, 699, 823, 839 | `["active","deploying"].includes(cluster.status)` / `=== "deploying"` | **GONE**: cluster never `deploying`. Reduce to `active`; compose with latest deployment.status for "deploy in progress" affordances |
 | ClusterDetail.jsx:540-544 | cluster `destroying, destroyed, zombie, unmanaged` (action disable) | values keep; consider adding `destroy-scheduled`, `destroy-failed`, `failed` to the gate |
 | ClusterDetail.jsx:547 | cluster `active` (canSnapshot) | UNCHANGED |
-| ClusterDetail.jsx:550 | cluster `destroyed, destroy-failed, zombie` (canRehabilitate) | UNCHANGED |
+| ClusterDetail.jsx:550 | cluster `destroyed, destroy-failed, zombie` (canRehabilitate) | add `failed` (DR-0049): the API returns a failed cluster to `active` only if it answers; 409 if it never finished provisioning, 502 if it cannot be reached |
 | ClusterDetail.jsx:717 | deployment `["pending","deploying","active"]` (current-deployment card) | add `new` |
 | DeploymentDetail.jsx:242-248 | deployment `active` / `failed` / `deploying` (border color) | UNCHANGED |
 | DeploymentDetail.jsx:253-254 | deployment `pending \|\| deploying` (Cancel button) | add `new`; update copy per new cancel semantics |

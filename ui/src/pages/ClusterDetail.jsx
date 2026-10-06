@@ -543,10 +543,15 @@ export function ClusterDetail({ clusterId }) {
   // Snapshot is only available for active clusters
   const canSnapshot = cluster.status === "active";
 
-  // Rehabilitate is available for destroyed/destroy-failed/zombie clusters
-  const canRehabilitate = ["destroyed", "destroy-failed", "zombie"].includes(
-    cluster.status,
-  );
+  // Rehabilitate is available for destroyed/destroy-failed/zombie clusters, and for a
+  // failed one (DR-0049): the API checks that a failed cluster answers before it
+  // returns it to active, and refuses one that never finished provisioning.
+  const canRehabilitate = [
+    "destroyed",
+    "destroy-failed",
+    "zombie",
+    "failed",
+  ].includes(cluster.status);
 
   const handleRehabilitate = async () => {
     try {

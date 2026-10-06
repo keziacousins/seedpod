@@ -563,6 +563,26 @@ def _cluster_failed_retry_requested(record: ClusterRecord, event: RetryRequested
     )
 
 
+def _cluster_failed_adopt_requested(record: ClusterRecord, event: AdoptRequested) -> TransitionResult:
+    # DR-0049. FAILED has two causes with one exit between them: ProvisionFailed (the
+    # cluster never worked, so RetryRequested re-provisions it) and HealthCheckFailed
+    # (it was working). For the second, re-provisioning destroys what the operator wants
+    # back. This rule is pure and cannot tell the two apart -- ClusterService.rehabilitate
+    # proves the cluster answers before it sends the event.
+    # The ttl timer is armed again because FAILED does not guarantee one: a destroy that
+    # was requested and then cancelled returns here with the timer gone.
+    extra: tuple[Effect, ...] = ()
+    if record.expires_at is not None:
+        extra = (_ttl_timer(record.id, record.expires_at),)
+    return _cluster_result(
+        record,
+        event,
+        state=ClusterState.ACTIVE,
+        failure_reason=None,
+        extra_effects=extra,
+    )
+
+
 def _cluster_failed_destroy_requested(record: ClusterRecord, event: DestroyRequested) -> TransitionResult:
     _check_discovered_guard(record, event)
     fire_at = event.due_at or event.at
@@ -726,6 +746,7 @@ _CLUSTER_TABLE_RAW: dict[tuple[ClusterState, type], Callable] = {
     (ClusterState.DESTROYING, DestroyFailed): _cluster_destroying_destroy_failed,
     (ClusterState.DESTROYING, InfraMissingObserved): _cluster_destroying_infra_missing_observed,
     (ClusterState.FAILED, RetryRequested): _cluster_failed_retry_requested,
+    (ClusterState.FAILED, AdoptRequested): _cluster_failed_adopt_requested,  # DR-0049
     (ClusterState.FAILED, DestroyRequested): _cluster_failed_destroy_requested,
     (ClusterState.FAILED, TtlExpired): _cluster_failed_ttl_expired,
     (ClusterState.FAILED, InfraMissingObserved): _cluster_failed_infra_missing_observed,
