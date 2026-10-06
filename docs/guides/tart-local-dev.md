@@ -3,7 +3,7 @@ title: Running seedpod against tart on macOS — setup and the Local Network tra
 type: guide
 status: active
 created: 2026-08-09
-updated: 2026-08-09
+updated: 2026-10-06
 ---
 
 # Running seedpod against `tart` on macOS
@@ -69,23 +69,60 @@ same binary **in-session** and it works. In-session the responsible process is t
 session, which already holds a grant, so the binary's own state is never consulted. Detach, and the
 process becomes its own responsible process and is judged on its own record.
 
+**The borrowed grant ends when the session ends (2026-10-06).** Seedpod was started in a `screen`
+from an SSH login and reached its VMs for 38 hours. The SSH login ended at 03:56. The next health
+tick, 55 seconds later, got errno 65. The `screen` and the server were still running. So a
+session-bound server does not fail only at start-up: it fails when the login that started it goes
+away. DR-0048 records what that outage then did to a healthy cluster.
+
+**The same test again (2026-10-06, macOS 15.7.9).** One detached script, one VM, ports 22 and 6443:
+
+| binary | detached result |
+|---|---|
+| Homebrew `python@3.11` 3.11.13 (the venv's interpreter) | errno 65 |
+| pyenv 3.11.13 | errno 65 |
+| Homebrew `python@3.12` | errno 65 |
+| Homebrew `python@3.13` | open |
+| `/usr/bin/python3` | open |
+| `/usr/bin/nc`, `/usr/bin/curl`, `/usr/bin/ssh`, `/usr/bin/ssh-keyscan` | open |
+| `kubectl` (the one in `OrbStack.app`), to the VM address | `no route to host` |
+| the same `kubectl`, as a child of Homebrew `python@3.13` | `no route to host` |
+| the same `kubectl`, to the node's Tailscale address | open |
+
+**The rule applies to each program, and a child does not get its parent's grant.** Seedpod runs
+`kubectl` for every cluster read and every apply. So a server on an interpreter that passes can
+provision a VM and install k3s, and then cannot deploy to it or check its health. An address on
+the tailnet is not a local network address, and the rule does not apply to it.
+
+The three Homebrew interpreters all run as a `Python.app` with one bundle id, `org.python.python`.
+The Local Network store holds one rule for that id, and the rule is *allow*. Only the 3.13 build
+gets the benefit. Each build has an ad-hoc signature, so each has its own code identity. The likely
+reading is that the rule belongs to the build that was approved. This is not proven.
+
 **Fixes, in preference order.**
 
-1. **Grant Local Network to the exact interpreter binary.** System Settings → Privacy & Security →
-   Local Network. Note it is the *resolved* binary that matters — for a venv, follow the symlink:
-   `readlink -f .venv/bin/python3.11` (here, `/opt/homebrew/opt/python@3.11/bin/python3.11`).
-   Recreating the venv does **not** help; the venv path is not what is judged.
-2. **Run seedpod as a child of one live session** — a single
+1. **Run seedpod as a child of one live session** — a single
    `ssh <host> '/path/to/run-everything.sh'` that starts the server *and* drives the work. This is
-   what made smoke 5 pass. It is a workaround, not a fix: it borrows the session's grant.
-3. Use a different interpreter that already holds the grant. Works, but it is luck rather than
-   configuration, and it will surprise the next person.
+   what made smoke 5 pass. It is a workaround, not a fix: it borrows the session's grant, and the
+   grant ends with the session. It is the only fix here that covers `kubectl`.
+2. **Run seedpod on an interpreter that passes the detached test.** On this host that is Homebrew
+   `python3.13`: `uv sync --locked --python /opt/homebrew/bin/python3.13`. The test suite passes on
+   3.13, and release `2.0.0a0+94257164` ran on it. This is half a fix: the server's own
+   connections pass, and its `kubectl` does not. The grant belongs to the build, so do the detached
+   test again after Homebrew upgrades that Python.
+3. **System Settings → Privacy & Security → Local Network.** Do not expect this to help. The
+   store already has the *allow* rule for `org.python.python`, and `python@3.11` is denied anyway.
+   Recreating the venv does not help either: the venv path is not what is judged.
 
-**Checking it yourself.** There is no clean read path — Local Network grants live in the system TCC
-store, which needs sudo/Full Disk Access to enumerate, and they are *not* in the per-user `TCC.db`.
-So test behaviourally: from a detached process (one that outlives the shell that spawned it),
-`connect_ex()` to a running VM's port 22 and look at the errno. In-session tests will pass
-regardless and tell you nothing.
+**Checking it yourself.** Test behaviourally: from a detached process (one that outlives the shell
+that spawned it), `connect_ex()` to a running VM's port 22 and look at the errno. In-session tests
+pass regardless and tell you nothing.
+
+The rules can be read, but they do not replace the test. They are in
+`/Library/Preferences/com.apple.networkextension.plist`, an `NSKeyedArchiver` plist that was
+readable without sudo on 15.7.9. Each rule has a `SigningIdentifier`, `DenyMulticast` (true means
+local network access is off) and `MulticastPreferenceSet` (true means someone made a choice). As
+the table shows, a rule that says *allow* does not mean that a given binary is allowed.
 
 ## Why this was expensive, and what changed
 

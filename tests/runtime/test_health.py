@@ -37,6 +37,8 @@ from seedpod.core.records import ClusterState
 from seedpod.providers.contract import KubeGetClusterInfo, Result
 from seedpod.runtime.health import HealthMonitor
 from seedpod.services.crypto import CryptoService
+from tests.conformance.harness import Fault
+from tests.conformance.kubectl_harness import KubectlHarness
 from tests.runtime.conftest import NOW, make_cluster_row
 
 pytestmark = pytest.mark.asyncio
@@ -238,6 +240,34 @@ async def test_unreachable_neither_increments_nor_fails(uow, repos, dispatcher, 
         after = repos.clusters.get(tx, "c1")
     assert after.status == "active"  # never failed
     assert after.consecutive_health_failures == 1  # untouched -- not incremented
+
+
+async def test_unreachable_apiserver_with_expired_discovery_cache_stays_active(uow, repos, dispatcher, clock, crypto):
+    """The 2026-10-06 failure end to end (DR-0048), with the REAL ``KubectlProvider`` in
+    place of ``FakeProbe``: the verdict under test is the provider's, and a hand-raised
+    ``InfrastructureUnreachableError`` cannot get it wrong. The apiserver could not be
+    reached, kubectl's discovery cache had aged out, and the extra line kubectl then
+    prints was classified as invalid input -- a healthy cluster went ACTIVE -> FAILED on
+    one tick."""
+    row, _ = _kubeconfig_row(crypto, "c1", "demo")
+    async with uow() as tx:
+        repos.clusters.insert(tx, row)
+
+    harness = KubectlHarness()
+    harness.backend.unreachable_stderr_override = (
+        b'E1006 04:14:58.000000   39207 memcache.go:265] "Unhandled Error" err="couldn\'t get current '
+        b'server API group list: Get \\"https://192.168.65.51:6443/api?timeout=10s\\": '
+        b'dial tcp 192.168.65.51:6443: connect: no route to host"\n'
+        b"Unable to connect to the server: dial tcp 192.168.65.51:6443: connect: no route to host\n"
+    )
+    monitor = _monitor(harness.provider(Fault.UNREACHABLE), crypto, repos, dispatcher, uow, clock)
+    await monitor.tick()
+
+    async with uow() as tx:
+        after = repos.clusters.get(tx, "c1")
+    assert after.status == "active"
+    assert after.failure_reason is None
+    assert after.consecutive_health_failures == 0
 
 
 # ---------------------------------------------------------------------------

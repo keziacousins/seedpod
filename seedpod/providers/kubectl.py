@@ -194,10 +194,18 @@ _INVALID_INPUT_STDERR_PHRASES = (
     "unknown field",
     "error loading config file",
     "invalid configuration",
-    "couldn't get current server api group list",
     "no configuration has been provided",
     "error parsing",
 )
+# NOT "couldn't get current server api group list" (here until 2026-10-06, DR-0048). That
+# line is kubectl's wrapper around a failed API discovery, and it says nothing about WHY
+# discovery failed: the cause follows the colon, and it is whatever stopped the request --
+# "no route to host" as readily as a bad kubeconfig. kubectl also only runs discovery when
+# its on-disk cache (6h TTL) has expired, so the line appears and disappears with the age of
+# a cache file. An unreachable apiserver therefore classified as Unreachable for six hours
+# and as INVALID_INPUT from then on, and the health monitor failed a healthy cluster on that
+# tick. The cause is what gets classified: an auth failure still matches
+# _AUTH_STDERR_PHRASES, a connectivity failure falls through to classify_subprocess (row 27).
 _NOT_FOUND_STDERR_PHRASES = ("notfound", "not found")
 
 

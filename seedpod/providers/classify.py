@@ -83,6 +83,15 @@ TRANSIENT_STDERR_PHRASES = frozenset(
         "download failed",              # the k3s installer's own fatal()
         "could not resolve host",       # curl (6), inside the guest
         "failed to connect",            # curl (7), inside the guest
+        # The kubectl family, added 2026-10-06 (DR-0048). Each is what kubectl v1.33
+        # printed, on the host that runs seedpod, for an apiserver it could not reach --
+        # and none of them contains a phrase above, so each was a "clean non-zero exit =>
+        # Permanent", which the health monitor acts on at once. The first is the one a
+        # k3s restart produces: kubectl rewrites ECONNREFUSED into its own sentence,
+        # which says "was refused", never "connection refused".
+        "was refused - did you specify the right host or port",
+        "host is down",                 # EHOSTDOWN: macOS, for a local address nothing answers ARP on
+        "client.timeout exceeded",      # Go net/http: --request-timeout ran out mid-request
     }
 )
 
