@@ -3,7 +3,7 @@ title: UI contract — v1 SPA consumption audit & v2 migration worklist
 type: design
 status: active
 created: 2026-07-12
-updated: 2026-10-04
+updated: 2026-10-06
 ---
 
 # UI contract — SPA consumption audit & v2 migration worklist
@@ -34,8 +34,8 @@ Direction (DR-0002): **we own the UI, so the SPA adapts to the clean v2 contract
 
 | Endpoint | Fields read (response) / sent (request) | v2 status | Required change |
 |---|---|---|---|
-| `GET /api/clusters` (`?show_destroyed=true` ClusterList.jsx:32; `?status=active` CreateSnapshotModal.jsx:28, RestoreSnapshotModal.jsx:38; bare, Login.jsx:24) | reads: `id, repository, branch, status, reconciliation_stale, hostname, cluster_url, created_at, expires_at, slug` (DR-0047: `hostname` replaces the SPA's read of `dns_hostname`); CreateSnapshotModal.jsx:108 also `provider_config.deployment_profile` | CHANGED | `status` gets new value set (no creating/deploying); `?status=active` filter still valid. `provider_config.deployment_profile` is an undocumented nested read — verify it survives (at risk). |
-| `GET /api/clusters/{id}` (ClusterDetail.jsx:48) | `id, status, expires_at, repository, branch, created_at, environment, last_reconciled_at, reconciliation_stale, public_ip, cluster_url, hostname, hostname_source, slug` (DR-0047: `hostname` is the DNS record's name or the name the profile resolved; `hostname_source` is `dns_record` or `profile`; `dns_hostname` is still returned and still means the record seedpod owns) | CHANGED | `environment` → `origin` (managed\|discovered) for provenance (ClusterDetail.jsx:655-657); status set changes drive all gating below. |
+| `GET /api/clusters` (`?show_destroyed=true` ClusterList.jsx:32; `?status=active` CreateSnapshotModal.jsx:28, RestoreSnapshotModal.jsx:38; bare, Login.jsx:24) | reads: `id, repository, branch, status, reconciliation_stale, health_stale, hostname, cluster_url, created_at, expires_at, slug` (DR-0047: `hostname` replaces the SPA's read of `dns_hostname`; DR-0050: `health_stale` is true for an `active` cluster with no healthy probe in 300s, and adds the same warning mark as `reconciliation_stale`); CreateSnapshotModal.jsx:108 also `provider_config.deployment_profile` | CHANGED | `status` gets new value set (no creating/deploying); `?status=active` filter still valid. `provider_config.deployment_profile` is an undocumented nested read — verify it survives (at risk). |
+| `GET /api/clusters/{id}` (ClusterDetail.jsx:48) | `id, status, expires_at, repository, branch, created_at, environment, last_reconciled_at, reconciliation_stale, last_healthy_at, health_stale, public_ip, cluster_url, hostname, hostname_source, slug` (DR-0050: `last_healthy_at` is when a health probe last succeeded, null if never; the page shows it as "Health Confirmed" for an `active` cluster, with a warning when `health_stale`. DR-0047: `hostname` is the DNS record's name or the name the profile resolved; `hostname_source` is `dns_record` or `profile`; `dns_hostname` is still returned and still means the record seedpod owns) | CHANGED | `environment` → `origin` (managed\|discovered) for provenance (ClusterDetail.jsx:655-657); status set changes drive all gating below. |
 | `DELETE /api/clusters/{id}?force&snapshot_before_destroy` (DestroyClusterModal.jsx:18-29) | sends query flags only | CHANGED | `force` gate keyed off `cluster.environment === "discovered"` (line 10) → `cluster.origin === "discovered"`. |
 | `POST /api/clusters/{id}/extend` `{ttl_hours}` (ClusterDetail.jsx:310) | none read | UNCHANGED | none |
 | `POST /api/clusters/{id}/rehabilitate` (ClusterDetail.jsx:557) | none read | UNCHANGED (obligation 6) | none |
@@ -105,7 +105,7 @@ Direction (DR-0002): **we own the UI, so the SPA adapts to the clean v2 contract
 | ClusterDetail.jsx:284, 295, 699, 823, 839 | `["active","deploying"].includes(cluster.status)` / `=== "deploying"` | **GONE**: cluster never `deploying`. Reduce to `active`; compose with latest deployment.status for "deploy in progress" affordances |
 | ClusterDetail.jsx:540-544 | cluster `destroying, destroyed, zombie, unmanaged` (action disable) | values keep; consider adding `destroy-scheduled`, `destroy-failed`, `failed` to the gate |
 | ClusterDetail.jsx:547 | cluster `active` (canSnapshot) | UNCHANGED |
-| ClusterDetail.jsx:550 | cluster `destroyed, destroy-failed, zombie` (canRehabilitate) | UNCHANGED |
+| ClusterDetail.jsx:550 | cluster `destroyed, destroy-failed, zombie` (canRehabilitate) | add `failed` (DR-0049): the API returns a failed cluster to `active` only if it answers; 409 if it never finished provisioning, 502 if it cannot be reached |
 | ClusterDetail.jsx:717 | deployment `["pending","deploying","active"]` (current-deployment card) | add `new` |
 | DeploymentDetail.jsx:242-248 | deployment `active` / `failed` / `deploying` (border color) | UNCHANGED |
 | DeploymentDetail.jsx:253-254 | deployment `pending \|\| deploying` (Cancel button) | add `new`; update copy per new cancel semantics |

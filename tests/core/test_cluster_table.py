@@ -710,6 +710,41 @@ def test_failed_ttl_expired_schedules_destroy():
     )
 
 
+def test_failed_adopt_requested_returns_to_active_with_ttl():
+    """DR-0049: the way back for a cluster failed in error. The deployments were never
+    cascaded (HealthCheckFailed has no cascade), so the cluster record is all that moves."""
+    expires_at = AT + timedelta(days=1)
+    old = a_cluster(state=rec.ClusterState.FAILED, failure_reason="boom", expires_at=expires_at)
+    event = AN_EVENT[ev.AdoptRequested]
+    result = transition(old, event)
+    new = dataclasses.replace(
+        old, state=rec.ClusterState.ACTIVE, version=old.version + 1, failure_reason=None
+    )
+    assert result.record == new
+    assert result.effects == (
+        _persist(new, old.version),
+        _cn(new, "failed"),
+        ef.ScheduleTimer(
+            aggregate_type="cluster",
+            aggregate_id=new.id,
+            timer_key="ttl",
+            fire_at=expires_at,
+            event=ev.TtlExpired(at=expires_at, actor="timer:ttl"),
+        ),
+    )
+
+
+def test_failed_adopt_requested_returns_to_active_without_ttl():
+    old = a_cluster(state=rec.ClusterState.FAILED, failure_reason="boom", expires_at=None)
+    event = AN_EVENT[ev.AdoptRequested]
+    result = transition(old, event)
+    new = dataclasses.replace(
+        old, state=rec.ClusterState.ACTIVE, version=old.version + 1, failure_reason=None
+    )
+    assert result.record == new
+    assert result.effects == (_persist(new, old.version), _cn(new, "failed"))
+
+
 def test_failed_infra_missing_observed_destroys_and_cascades():
     old = a_cluster(state=rec.ClusterState.FAILED)
     event = AN_EVENT[ev.InfraMissingObserved]

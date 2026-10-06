@@ -118,11 +118,15 @@ export function ClusterList() {
       key: "status",
       label: "Status",
       render: (status, row) =>
-        row.reconciliation_stale ? (
+        row.reconciliation_stale || row.health_stale ? (
           <span style="display: inline-flex; align-items: center; gap: 0.35rem;">
             <StatusBadge status={status} />
             <span
-              title="Reconciliation stale — infrastructure unreachable"
+              title={
+                row.reconciliation_stale
+                  ? "Reconciliation stale — infrastructure unreachable"
+                  : "Health not confirmed recently — seedpod cannot check this cluster"
+              }
               style="color: var(--yellow); cursor: help;"
             >
               ⚠

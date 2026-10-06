@@ -86,10 +86,11 @@ from pydantic import BaseModel, Field
 
 from seedpod.api.auth import require_permission
 from seedpod.api.deps import get_app
-from seedpod.app.services.cluster_service import ClusterNotFound
+from seedpod.app.services.cluster_service import ClusterNotFound, ClusterNotRehabilitatable
 from seedpod.core.cluster_access import access_hostname
 from seedpod.core.errors import ErrorCode, ProviderError
 from seedpod.core.machine import InvalidTransition
+from seedpod.core.records import ClusterState
 from seedpod.data.repositories import (
     ClusterRow,
     ClusterStateAuditRow,
@@ -106,6 +107,9 @@ router = APIRouter(tags=["clusters"])
 # v1's threshold, salvaged verbatim (reference-code/seedpod/seedpod/data/models.py:98
 # "Stale if older than 30 minutes (3x typical 10-min reconciliation interval)").
 _STALE_THRESHOLD_SECONDS = 1800
+# DR-0050: five of the health monitor's 60 second ticks. Long enough that one slow
+# probe or a restart of seedpod does not raise it, short enough to be worth reading.
+_HEALTH_STALE_THRESHOLD_SECONDS = 300
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +178,20 @@ def _reconciliation_stale(row: ClusterRow, *, now) -> bool:
     return (now - row.last_reconciled_at).total_seconds() > _STALE_THRESHOLD_SECONDS
 
 
+def _health_stale(row: ClusterRow, *, now) -> bool:
+    """DR-0050: an ACTIVE cluster whose last healthy probe is older than
+    ``_HEALTH_STALE_THRESHOLD_SECONDS``. The health monitor skips a tick when it cannot
+    determine health and says so only in the log; this is how the API says it.
+
+    Derived on read, like ``_reconciliation_stale``, and with the same rule for a
+    cluster never confirmed: not stale, just unknown -- ``last_healthy_at`` is null and
+    the SPA says "never". Only ACTIVE is ever stale, because the monitor probes nothing
+    else: for any other state the timestamp is history, not a missed appointment."""
+    if row.status != ClusterState.ACTIVE.value or row.last_healthy_at is None:
+        return False
+    return (now - row.last_healthy_at).total_seconds() > _HEALTH_STALE_THRESHOLD_SECONDS
+
+
 def _serialize_cluster(row: ClusterRow, *, now, resolved_hostname: str | None = None) -> dict[str, Any]:
     # DR-0047: `hostname` is how to reach the cluster; `dns_hostname` stays "the DNS
     # record seedpod owns". `cluster_url` follows `hostname`, so it is also set for a
@@ -201,6 +219,8 @@ def _serialize_cluster(row: ClusterRow, *, now, resolved_hostname: str | None = 
         "failure_reason": row.failure_reason,
         "last_reconciled_at": row.last_reconciled_at.isoformat() if row.last_reconciled_at else None,
         "reconciliation_stale": _reconciliation_stale(row, now=now),
+        "last_healthy_at": row.last_healthy_at.isoformat() if row.last_healthy_at else None,
+        "health_stale": _health_stale(row, now=now),
         "created_at": row.created_at.isoformat(),
         "updated_at": row.updated_at.isoformat(),
         "expires_at": row.expires_at.isoformat() if row.expires_at else None,
@@ -381,8 +401,13 @@ async def rehabilitate_cluster(
         row = await app.services.clusters.rehabilitate(cluster_id, actor=f"api:{api_key.username}")
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    except InvalidTransition as exc:
+    except (InvalidTransition, ClusterNotRehabilitatable) as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except ProviderError as exc:
+        # DR-0049: the reachability check a FAILED cluster must pass first. "Cannot
+        # reach it" is a 502 here as on every provider-plane read -- seedpod could not
+        # determine the cluster's state, and it has left the record as it was.
+        raise _http_error_for_provider_error(exc) from exc
     return {"cluster_id": row.id, "status": row.status}
 
 

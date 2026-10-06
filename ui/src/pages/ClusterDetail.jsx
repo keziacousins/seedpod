@@ -543,10 +543,15 @@ export function ClusterDetail({ clusterId }) {
   // Snapshot is only available for active clusters
   const canSnapshot = cluster.status === "active";
 
-  // Rehabilitate is available for destroyed/destroy-failed/zombie clusters
-  const canRehabilitate = ["destroyed", "destroy-failed", "zombie"].includes(
-    cluster.status,
-  );
+  // Rehabilitate is available for destroyed/destroy-failed/zombie clusters, and for a
+  // failed one (DR-0049): the API checks that a failed cluster answers before it
+  // returns it to active, and refuses one that never finished provisioning.
+  const canRehabilitate = [
+    "destroyed",
+    "destroy-failed",
+    "zombie",
+    "failed",
+  ].includes(cluster.status);
 
   const handleRehabilitate = async () => {
     try {
@@ -666,6 +671,25 @@ export function ClusterDetail({ clusterId }) {
                     ⚠{" "}
                     <span style="font-size: 0.85em;">
                       Infrastructure unreachable
+                    </span>
+                  </span>
+                )}
+              </span>
+            </InfoGridRow>
+          )}
+          {/* DR-0050: when a health check last succeeded. Shown for an active cluster
+              even when it is null, because "never" is the thing worth seeing. */}
+          {(cluster.status === "active" || cluster.last_healthy_at) && (
+            <InfoGridRow label="Health Confirmed">
+              <span style="display: flex; align-items: center; gap: 0.35rem;">
+                {cluster.last_healthy_at
+                  ? formatDateTime(cluster.last_healthy_at)
+                  : "Never"}
+                {cluster.health_stale && (
+                  <span style="color: var(--yellow); display: flex; align-items: center; gap: 0.25rem;">
+                    ⚠{" "}
+                    <span style="font-size: 0.85em;">
+                      Seedpod cannot check this cluster
                     </span>
                   </span>
                 )}

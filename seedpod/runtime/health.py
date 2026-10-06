@@ -94,9 +94,37 @@ back up (the same "per-row isolation, retried next pass" discipline
 failures).
 
 **Crown jewel #1's health analog.** ``InfrastructureUnreachableError`` means "cannot
-determine health", never "unhealthy" -- this module does NOT increment the transient
+determine health", never "unhealthy" -- this module does NOT increment the failure
 counter and does NOT fail the cluster on it; it logs and skips the cluster for this
 tick only. A network blip to the apiserver must never fail an ACTIVE cluster.
+
+**What can fail a cluster (DR-0050 -- this REPLACES the salvaged fail-on-permanent
+rule above).** Only a failure seedpod understands, and only when it repeats:
+
+| The probe | The monitor |
+|---|---|
+| succeeds | resets the counter, stamps ``last_healthy_at`` |
+| ``InfrastructureUnreachableError`` | skips the tick (warning) |
+| ``PermanentError`` with a code NOT in ``_FAILING_CODES`` | skips the tick (error, with the stderr) |
+| ``PermanentError`` with a code in ``_FAILING_CODES``, or ``TransientError`` | counts it; fails the cluster at ``max_consecutive_failures`` |
+
+The salvaged shape failed a cluster on the first ``PermanentError`` of any code, and in
+v2 that is not what it was in v1. v1 classified by regex and its DEFAULT, for a message
+it did not know, was transient (``core/health_check.py:130``: "safer - gives retry
+chance"); permanent took an explicit pattern. v2's typed taxonomy has the opposite
+default -- a clean non-zero exit nobody recognises is ``PermanentError(SCRIPT_FAILED)``
+-- so "fail on permanent" silently became "fail on anything unknown". On 2026-10-06
+that failed a healthy cluster (DR-0048), and nothing returns a cluster from FAILED on
+its own. Two deliberate differences from v1 remain: v1 failed an unknown error after
+three ticks and this module never does, and v1 failed an auth error at once and this
+module asks for three in a row.
+
+``KubectlProvider`` raises no ``TransientError`` today, so for the real probe the
+counter is fed by ``_FAILING_CODES`` alone.
+
+Skipping is silent to everyone but the log, which is what ``last_healthy_at`` is for:
+the API derives ``health_stale`` from its age, so an ACTIVE cluster seedpod has stopped
+being able to see says so.
 
 **kubeconfig resolution.** ``KubectlProvider`` is stateless (kubeconfig always passed
 in, CLAUDE.md) -- this module decrypts ``ClusterRow.encrypted_kubeconfig`` via the
@@ -111,7 +139,7 @@ captured kubeconfig (should not occur in practice, but is not guaranteed unreach
 by the schema) is treated the same as "cannot determine health": logged and skipped,
 never failed.
 
-**``interval``/``max_transient_failures`` defaults.** No spec pins either. v1's
+**``interval``/``max_consecutive_failures`` defaults.** No spec pins either. v1's
 ``cluster_status_poll_active`` (``reference-code/seedpod/seedpod/core/config.py:174-176``)
 default was 60 seconds and ``health_check_max_transient_failures`` (:190-192) default
 was 3 -- this module keeps both numbers as its own defaults, an implementation choice
@@ -137,7 +165,13 @@ import logging
 from datetime import datetime
 
 from seedpod.core.clock import Clock
-from seedpod.core.errors import InfrastructureUnreachableError, PermanentError, TransientError
+from seedpod.core.errors import (
+    ErrorCode,
+    InfrastructureUnreachableError,
+    PermanentError,
+    ProviderError,
+    TransientError,
+)
 from seedpod.core.events import HealthCheckFailed
 from seedpod.core.machine import InvalidTransition, StaleVersion
 from seedpod.core.records import ClusterState
@@ -149,16 +183,29 @@ from seedpod.services.crypto import CryptoService
 
 __all__ = ["HealthMonitor"]
 
+
+def _stderr_of(exc: ProviderError) -> str:
+    """What kubectl printed, for the log line that asks someone to classify it."""
+    detail = getattr(exc, "detail", None) or {}
+    return str(detail.get("stderr", "")).strip()[:2000] or "<none captured>"
+
 _log = logging.getLogger(__name__)
 
 _DEFAULT_INTERVAL = 60.0  # seconds -- see module docstring's "defaults" note
-_DEFAULT_MAX_TRANSIENT_FAILURES = 3  # ditto
+_DEFAULT_MAX_CONSECUTIVE_FAILURES = 3  # ditto
+# DR-0050: the only PermanentError codes that count against a cluster. Each is a
+# sentence the classifier RECOGNISED -- the apiserver refused the credentials, or the
+# stored kubeconfig cannot be used. Every other code, SCRIPT_FAILED above all, means
+# kubectl exited non-zero and said something nobody has classified yet, and that is
+# "cannot determine health", not "unhealthy". An allowlist, so a new ErrorCode is
+# harmless until someone decides it should be able to fail a cluster.
+_FAILING_CODES = frozenset({ErrorCode.AUTH, ErrorCode.INVALID_INPUT})
 _MAX_STALE_RETRIES = 3  # seam-a-core.md §D: "bounded to 3 attempts"
 
 
 class HealthMonitor:
     """``HealthMonitor(kubectl, crypto, repos, dispatcher, uow, clock,
-    interval=60.0, max_transient_failures=3)`` (module docstring). ``kubectl`` is any
+    interval=60.0, max_consecutive_failures=3)`` (module docstring). ``kubectl`` is any
     ``Provider``-shaped collaborator that accepts ``KubeGetClusterInfo`` (the real
     ``KubectlProvider`` in production; a hand-built fake in tests, CLAUDE.md)."""
 
@@ -171,7 +218,7 @@ class HealthMonitor:
         uow: UnitOfWork,
         clock: Clock,
         interval: float = _DEFAULT_INTERVAL,
-        max_transient_failures: int = _DEFAULT_MAX_TRANSIENT_FAILURES,
+        max_consecutive_failures: int = _DEFAULT_MAX_CONSECUTIVE_FAILURES,
     ) -> None:
         self._kubectl = kubectl
         self._crypto = crypto
@@ -180,7 +227,7 @@ class HealthMonitor:
         self._uow = uow
         self._clock = clock
         self._interval = interval
-        self._max_transient_failures = max_transient_failures
+        self._max_consecutive_failures = max_consecutive_failures
         self._task: asyncio.Task[None] | None = None
         self._last_sync: datetime | None = None
 
@@ -257,10 +304,21 @@ class HealthMonitor:
             _log.warning("health: cluster %s unreachable, skipping this tick: %s", row.id, exc)
             return
         except PermanentError as exc:
-            await self._fail(row, reason=f"kubectl connectivity lost (permanent): {exc}")
+            if exc.code in _FAILING_CODES:
+                await self._count_failure(row, exc)
+                return
+            # DR-0050: an answer the classifier does not know is not an answer about
+            # the cluster. Skipped like "unreachable", but at ERROR and with the
+            # stderr, because the fix is to teach providers/ the sentence -- and
+            # until someone does, this line is the only place it is written down.
+            _log.error(
+                "health: cluster %s: kubectl failed in a way the classifier does not "
+                "know (%s), so health cannot be determined; skipping this tick. stderr: %s",
+                row.id, exc, _stderr_of(exc),
+            )
             return
         except TransientError as exc:
-            await self._transient(row, exc)
+            await self._count_failure(row, exc)
             return
         await self._healthy(row)
 
@@ -279,28 +337,32 @@ class HealthMonitor:
     # -------------------------------------------------------------------------
 
     async def _healthy(self, row: ClusterRow) -> None:
-        if row.consecutive_health_failures > 0:
-            async with self._uow() as t:
+        async with self._uow() as t:
+            if row.consecutive_health_failures > 0:
                 self.repos.clusters.set_health_failures(t, row.id, 0, clock=self._clock)
+            # DR-0050: every healthy probe is stamped, so the age of this column is
+            # how long seedpod has gone without confirming the cluster.
+            self.repos.clusters.set_last_healthy_at(t, row.id, clock=self._clock)
 
-    async def _transient(self, row: ClusterRow, exc: TransientError) -> None:
+    async def _count_failure(self, row: ClusterRow, exc: ProviderError) -> None:
+        """A failure seedpod understands: a ``TransientError``, or a ``PermanentError``
+        whose code is in ``_FAILING_CODES``. One is never enough (DR-0050) -- the
+        cluster fails when ``max_consecutive_failures`` of them arrive in a row. A
+        skipped tick (unreachable, or not understood) neither counts nor resets."""
         new_count = row.consecutive_health_failures + 1
-        if new_count >= self._max_transient_failures:
-            reason = (
-                f"kubectl connectivity lost after {new_count} consecutive "
-                f"transient failures: {exc}"
-            )
+        if new_count >= self._max_consecutive_failures:
+            reason = f"kubectl health check failed {new_count} times in a row: {exc}"
             await self._fail(row, reason=reason)
         else:
             _log.warning(
-                "health: transient failure %d/%d for cluster %s: %s",
-                new_count, self._max_transient_failures, row.id, exc,
+                "health: failure %d/%d for cluster %s: %s",
+                new_count, self._max_consecutive_failures, row.id, exc,
             )
             async with self._uow() as t:
                 self.repos.clusters.set_health_failures(t, row.id, new_count, clock=self._clock)
 
     async def _fail(self, row: ClusterRow, *, reason: str) -> None:
-        """PERMANENT (immediate) or TRANSIENT-threshold-breach -> ``HealthCheckFailed``
+        """Threshold breach (``_count_failure``, the only caller) -> ``HealthCheckFailed``
         -> ACTIVE -> FAILED via ``Dispatcher.apply()`` -- the ONE write path for
         cluster state. See the module docstring's "StaleVersion / mid-redeploy
         safety" for the retry/re-decide loop below."""

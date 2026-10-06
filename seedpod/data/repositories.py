@@ -849,6 +849,9 @@ class ClusterRow:
     created_at: datetime
     updated_at: datetime
     expires_at: datetime | None
+    # migration 0004 (DR-0050); written by set_last_healthy_at only. Last, and defaulted,
+    # because a birth never sets it: no cluster is born with its health confirmed.
+    last_healthy_at: datetime | None = None
 
 
 def _cluster_params(row: ClusterRow) -> dict[str, Any]:
@@ -916,6 +919,7 @@ def _cluster_from_mapping(m: Mapping[str, Any]) -> ClusterRow:
         created_at=_parse(m["created_at"]),
         updated_at=_parse(m["updated_at"]),
         expires_at=_parse_or_none(m["expires_at"]),
+        last_healthy_at=_parse_or_none(m["last_healthy_at"]),
     )
 
 
@@ -1092,6 +1096,21 @@ class ClusterRepository:
                 "WHERE id = :id"
             ),
             {"count": count, "updated_at": _iso(clock.now()), "id": cluster_id},
+        )
+
+    def set_last_healthy_at(self, session: Session, cluster_id: str, *, clock: Clock) -> None:
+        """The health poll's dedicated write path for ``last_healthy_at`` (DR-0050):
+        stamped on every healthy probe, so its age says how long seedpod has gone
+        without confirming the cluster. Same discipline as ``set_health_failures``: a
+        plain UPDATE, no CAS, no ``version`` bump -- the pure machine never reads it.
+
+        Does NOT touch ``updated_at``, for the reason ``set_last_reconciled_at`` gives
+        below: this runs once a minute for every ACTIVE cluster and records that
+        nothing changed. Stamping ``updated_at`` for that would make it mean "when the
+        health poll last ran"."""
+        session.execute(
+            text("UPDATE clusters SET last_healthy_at = :now WHERE id = :id"),
+            {"now": _iso(clock.now()), "id": cluster_id},
         )
 
     def update_cost(self, session: Session, cluster_id: str, total_cost: float, *, clock: Clock) -> None:

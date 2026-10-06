@@ -44,6 +44,7 @@ from seedpod.core.records import ClusterState, Origin
 from seedpod.data.repositories import ClusterRow, Repositories
 from seedpod.data.uow import UnitOfWork
 from seedpod.providers.contract import (
+    KubeGetClusterInfo,
     KubeGetEvents,
     KubeGetPodDetails,
     KubeGetPodLogs,
@@ -84,6 +85,21 @@ class ClusterHasNoKubeconfig(PermanentError):
             code=ErrorCode.NOT_FOUND,
             provider="cluster-service",
             command="kubeconfig",
+            detail={"cluster_id": cluster_id},
+        )
+
+
+class ClusterNotRehabilitatable(PermanentError):
+    """``rehabilitate`` on a FAILED cluster that has no kubeconfig: provisioning never
+    finished, so there is nothing to return to (DR-0049). The API layer's 409."""
+
+    def __init__(self, cluster_id: str) -> None:
+        super().__init__(
+            f"cluster {cluster_id} failed before it had a kubeconfig, so it cannot be rehabilitated; "
+            "destroy it and deploy again",
+            code=ErrorCode.INVALID_INPUT,
+            provider="cluster-service",
+            command="rehabilitate",
             detail={"cluster_id": cluster_id},
         )
 
@@ -204,9 +220,30 @@ class ClusterService:
         return row
 
     async def rehabilitate(self, cluster_id: str, *, actor: str) -> ClusterRow:
+        """``AdoptRequested`` -> ACTIVE. The machine decides which states it is legal from.
+
+        DR-0049: a FAILED cluster must first answer a ``KubeGetClusterInfo`` with its
+        stored kubeconfig. FAILED covers a cluster that never finished provisioning as
+        well as one the health monitor failed, and the machine cannot tell them apart;
+        marking the first kind ACTIVE would report a cluster that does not exist. So a
+        FAILED cluster with no kubeconfig is refused (``ClusterNotRehabilitatable``), and
+        one that cannot be reached raises the probe's own ``ProviderError``. v1 ran this
+        check for every rehabilitatable state
+        (``reference-code/seedpod/seedpod/api/clusters.py:920-937``); the three states v2
+        already adopted from keep their unchecked behaviour here.
+
+        DR-0008: the row read and the probe are over before ``apply()`` opens its own
+        transaction. A cluster that leaves FAILED in that gap is caught by ``apply()``
+        itself, which re-validates against the fresh row."""
+        row = await self.get(cluster_id)
+        if row.status == ClusterState.FAILED.value:
+            if row.encrypted_kubeconfig is None or row.kubeconfig_key_class is None:
+                raise ClusterNotRehabilitatable(row.id)
+            kubeconfig = self._crypto.decrypt(row.encrypted_kubeconfig, row.kubeconfig_key_class)
+            await self._execute_kubectl(KubeGetClusterInfo(kubeconfig=kubeconfig))
         event: Event = AdoptRequested(at=self._clock.now(), actor=actor)
-        await self._dispatcher.apply("cluster", cluster_id, event)
-        return await self.get(cluster_id)
+        await self._dispatcher.apply("cluster", row.id, event)
+        return await self.get(row.id)
 
     async def destroy(
         self,

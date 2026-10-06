@@ -340,6 +340,27 @@ async def test_set_last_reconciled_at_does_not_touch_updated_at(uow):
     assert fetched.updated_at == before  # and the one that must not
 
 
+async def test_set_last_healthy_at_moves_only_its_own_column(uow):
+    """DR-0050. Written once a minute for every ACTIVE cluster, so it follows
+    ``set_last_reconciled_at``'s discipline and not ``set_health_failures``': no
+    ``updated_at``, and no ``version`` bump for an in-flight Persist to trip over."""
+    async with uow() as tx:
+        clusters.insert(tx, make_cluster_row("c1", "demo", version=5))
+
+    async with uow() as tx:
+        before = clusters.get(tx, "c1")
+    assert before.last_healthy_at is None  # a birth never sets it
+
+    async with uow() as tx:
+        clusters.set_last_healthy_at(tx, "c1", clock=FrozenClock(LATER))
+
+    async with uow() as tx:
+        fetched = clusters.get(tx, "c1")
+    assert fetched.last_healthy_at == LATER
+    assert fetched.updated_at == before.updated_at
+    assert fetched.version == 5
+
+
 async def test_update_cost_dedicated_write_path(uow):
     """v1's update_cluster_cost (reference-code/seedpod/seedpod/data/repositories.py
     lines 318-326) salvaged as a dedicated repo method, same shape as
