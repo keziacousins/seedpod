@@ -677,6 +677,25 @@ export function ClusterDetail({ clusterId }) {
               </span>
             </InfoGridRow>
           )}
+          {/* DR-0050: when a health check last succeeded. Shown for an active cluster
+              even when it is null, because "never" is the thing worth seeing. */}
+          {(cluster.status === "active" || cluster.last_healthy_at) && (
+            <InfoGridRow label="Health Confirmed">
+              <span style="display: flex; align-items: center; gap: 0.35rem;">
+                {cluster.last_healthy_at
+                  ? formatDateTime(cluster.last_healthy_at)
+                  : "Never"}
+                {cluster.health_stale && (
+                  <span style="color: var(--yellow); display: flex; align-items: center; gap: 0.25rem;">
+                    ⚠{" "}
+                    <span style="font-size: 0.85em;">
+                      Seedpod cannot check this cluster
+                    </span>
+                  </span>
+                )}
+              </span>
+            </InfoGridRow>
+          )}
           {cluster.public_ip && (
             <InfoGridRow label="IP">
               <CopyableText value={cluster.public_ip} />

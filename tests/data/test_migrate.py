@@ -23,7 +23,8 @@ def test_migrate_applies_every_file_and_stamps_user_version(tmp_path):
     migrate(db.engine)
     # 0001 initial + 0002 clusters.dns_record_id (DR-0034)
     # + 0003 deployment_presets.default_provider (DR-0046)
-    assert _user_version(db) == 3
+    # + 0004 clusters.last_healthy_at (DR-0050)
+    assert _user_version(db) == 4
 
     with db.engine.begin() as conn:
         tables = {
@@ -49,7 +50,8 @@ def test_migrate_is_idempotent(tmp_path):
     migrate(db.engine)  # second call: every migration file's n <= current, all skipped
     # 0001 initial + 0002 clusters.dns_record_id (DR-0034)
     # + 0003 deployment_presets.default_provider (DR-0046)
-    assert _user_version(db) == 3
+    # + 0004 clusters.last_healthy_at (DR-0050)
+    assert _user_version(db) == 4
 
     # and the schema is still intact / usable, not double-applied
     with db.engine.begin() as conn:

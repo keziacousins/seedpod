@@ -314,6 +314,47 @@ async def test_reconciliation_stale_flips_after_threshold(app, client, auth_head
     assert stale.json()["last_reconciled_at"] is not None
 
 
+async def test_health_stale_flips_after_threshold_for_an_active_cluster(app, client, auth_headers):
+    """DR-0050: the health monitor skips a tick it cannot decide and says so only in the
+    log. The age of ``last_healthy_at`` is how the API says it."""
+    await _birth_cluster(app, "c1", slug="c1-slug")
+    await _promote_to_active(app, "c1")
+
+    never = (await client.get("/api/clusters/c1", headers=auth_headers)).json()
+    assert never["last_healthy_at"] is None
+    assert never["health_stale"] is False  # never confirmed is unknown, not stale
+
+    async with app.uow() as tx:
+        app.repos.clusters.set_last_healthy_at(tx, "c1", clock=app.clock)
+    confirmed_at = app.clock.now().isoformat()
+    fresh = (await client.get("/api/clusters/c1", headers=auth_headers)).json()
+    assert fresh["last_healthy_at"] == confirmed_at
+    assert fresh["health_stale"] is False
+
+    app.clock.advance(timedelta(minutes=6))
+    stale = (await client.get("/api/clusters/c1", headers=auth_headers)).json()
+    assert stale["health_stale"] is True
+    assert stale["last_healthy_at"] == confirmed_at
+    listed = (await client.get("/api/clusters", headers=auth_headers)).json()["clusters"]
+    assert [c["health_stale"] for c in listed if c["id"] == "c1"] == [True]
+
+
+async def test_health_stale_is_only_for_active_clusters(app, client, auth_headers):
+    """The monitor probes ACTIVE clusters and nothing else. For a failed cluster the
+    timestamp is history: when it was last seen well, not a missed check."""
+    await _birth_cluster(app, "c1", slug="c1-slug")
+    await _promote_to_active(app, "c1")
+    async with app.uow() as tx:
+        app.repos.clusters.set_last_healthy_at(tx, "c1", clock=app.clock)
+    await _fail_by_health_check(app, "c1")
+
+    app.clock.advance(timedelta(hours=2))
+    detail = (await client.get("/api/clusters/c1", headers=auth_headers)).json()
+    assert detail["status"] == "failed"
+    assert detail["last_healthy_at"] is not None
+    assert detail["health_stale"] is False
+
+
 async def test_get_unknown_cluster_is_404(client, auth_headers):
     response = await client.get("/api/clusters/does-not-exist", headers=auth_headers)
     assert response.status_code == 404

@@ -3,10 +3,13 @@
 fixtures), a real ``CryptoService`` (never Mock/patch, CLAUDE.md), and hand-built fake
 probes: a fake ``execute()`` returns a healthy ``Result`` or RAISES a typed error.
 
-Covers: healthy resets the counter (and is a no-op when already 0); transient
-increments below threshold with no state change; transient threshold breach emits
-``HealthCheckFailed`` -> FAILED and resets the counter; permanent fails immediately
-regardless of counter; the health analog of crown jewel #1 (an
+Covers: healthy resets the counter and stamps ``last_healthy_at`` without touching
+``updated_at``; transient increments below threshold with no state change; transient
+threshold breach emits ``HealthCheckFailed`` -> FAILED and resets the counter; DR-0050's
+rules for a ``PermanentError`` (a recognised code counts like a transient and fails only
+at the threshold; an unrecognised one never fails, never counts, and is logged with its
+stderr -- once with a hand-raised error, once through the real ``KubectlProvider``);
+the health analog of crown jewel #1 (an
 ``InfrastructureUnreachableError``-raising probe neither increments nor fails --
 fault-injected); a cluster that left ACTIVE during the probe's no-tx window loses the
 CAS and is dropped, not failed (StaleVersion re-decide, real race via a legitimate
@@ -34,7 +37,8 @@ from seedpod.core.errors import (
 )
 from seedpod.core.machine import StaleVersion
 from seedpod.core.records import ClusterState
-from seedpod.providers.contract import KubeGetClusterInfo, Result
+from seedpod.providers.contract import KubeGetClusterInfo, Result, SubprocessResult
+from seedpod.providers.kubectl import KubectlConfig, KubectlProvider
 from seedpod.runtime.health import HealthMonitor
 from seedpod.services.crypto import CryptoService
 from tests.conformance.harness import Fault
@@ -153,7 +157,8 @@ async def test_healthy_noop_when_counter_already_zero(uow, repos, dispatcher, cl
     async with uow() as tx:
         after = repos.clusters.get(tx, "c1")
     assert after.consecutive_health_failures == 0
-    assert after.updated_at == NOW  # untouched -- no write happened at all
+    assert after.updated_at == NOW  # untouched -- a healthy tick records no change to the row
+    assert after.last_healthy_at == clock.now()  # DR-0050: but it is stamped
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +173,7 @@ async def test_transient_increments_below_threshold(uow, repos, dispatcher, cloc
 
     exc = TransientError("api timeout", code=ErrorCode.API_TIMEOUT, provider="kubectl")
     probe = FakeProbe(raise_exc=exc)
-    monitor = _monitor(probe, crypto, repos, dispatcher, uow, clock, max_transient_failures=3)
+    monitor = _monitor(probe, crypto, repos, dispatcher, uow, clock, max_consecutive_failures=3)
     await monitor.tick()
 
     async with uow() as tx:
@@ -184,7 +189,7 @@ async def test_transient_threshold_breach_fails_and_resets_counter(uow, repos, d
 
     exc = TransientError("endpoint unreachable", code=ErrorCode.ENDPOINT_UNREACHABLE, provider="kubectl")
     probe = FakeProbe(raise_exc=exc)
-    monitor = _monitor(probe, crypto, repos, dispatcher, uow, clock, max_transient_failures=3)
+    monitor = _monitor(probe, crypto, repos, dispatcher, uow, clock, max_consecutive_failures=3)
     await monitor.tick()
 
     async with uow() as tx:
@@ -192,7 +197,7 @@ async def test_transient_threshold_breach_fails_and_resets_counter(uow, repos, d
         audits = repos.cluster_state_audits.list_for_cluster(tx, "c1")
     assert after.status == "failed"
     assert after.consecutive_health_failures == 0
-    assert "3 consecutive transient failures" in after.failure_reason
+    assert "failed 3 times in a row" in after.failure_reason
     assert len(audits) == 1
     assert audits[0].event == "HealthCheckFailed"
 
@@ -202,13 +207,30 @@ async def test_transient_threshold_breach_fails_and_resets_counter(uow, repos, d
 # ---------------------------------------------------------------------------
 
 
-async def test_permanent_fails_immediately_regardless_of_counter(uow, repos, dispatcher, clock, crypto):
+@pytest.mark.parametrize("code", [ErrorCode.AUTH, ErrorCode.INVALID_INPUT])
+async def test_recognised_permanent_error_counts_and_does_not_fail_at_once(uow, repos, dispatcher, clock, crypto, code):
+    """DR-0050: one failure is never enough, even one seedpod understands."""
     row, _ = _kubeconfig_row(crypto, "c1", "demo", consecutive_health_failures=0)
     async with uow() as tx:
         repos.clusters.insert(tx, row)
 
-    exc = PermanentError("auth failed", code=ErrorCode.AUTH, provider="kubectl")
-    probe = FakeProbe(raise_exc=exc)
+    probe = FakeProbe(raise_exc=PermanentError("auth failed", code=code, provider="kubectl"))
+    monitor = _monitor(probe, crypto, repos, dispatcher, uow, clock)
+    await monitor.tick()
+
+    async with uow() as tx:
+        after = repos.clusters.get(tx, "c1")
+    assert after.status == "active"
+    assert after.consecutive_health_failures == 1
+
+
+@pytest.mark.parametrize("code", [ErrorCode.AUTH, ErrorCode.INVALID_INPUT])
+async def test_recognised_permanent_error_fails_the_cluster_at_the_threshold(uow, repos, dispatcher, clock, crypto, code):
+    row, _ = _kubeconfig_row(crypto, "c1", "demo", consecutive_health_failures=2)
+    async with uow() as tx:
+        repos.clusters.insert(tx, row)
+
+    probe = FakeProbe(raise_exc=PermanentError("auth failed", code=code, provider="kubectl"))
     monitor = _monitor(probe, crypto, repos, dispatcher, uow, clock)
     await monitor.tick()
 
@@ -216,7 +238,81 @@ async def test_permanent_fails_immediately_regardless_of_counter(uow, repos, dis
         after = repos.clusters.get(tx, "c1")
     assert after.status == "failed"
     assert after.consecutive_health_failures == 0
-    assert "permanent" in after.failure_reason
+    assert after.failure_reason == "kubectl health check failed 3 times in a row: auth failed"
+
+
+async def test_unrecognised_error_never_fails_and_is_logged_with_its_stderr(uow, repos, dispatcher, clock, crypto, caplog):
+    """DR-0050: SCRIPT_FAILED is kubectl exiting non-zero with a sentence nobody has
+    classified. That is not an answer about the cluster. One tick short of the
+    threshold, on purpose: it must not count, and it must not reset either."""
+    row, _ = _kubeconfig_row(crypto, "c1", "demo", consecutive_health_failures=2)
+    async with uow() as tx:
+        repos.clusters.insert(tx, row)
+
+    exc = PermanentError(
+        "kubectl.get_cluster_info: exited 1", code=ErrorCode.SCRIPT_FAILED, provider="kubectl",
+        detail={"exit_code": "1", "stderr": "error: a sentence nobody has seen before\n"},
+    )
+    monitor = _monitor(FakeProbe(raise_exc=exc), crypto, repos, dispatcher, uow, clock)
+    with caplog.at_level(logging.WARNING, logger="seedpod.runtime.health"):
+        for _ in range(5):
+            await monitor.tick()
+
+    async with uow() as tx:
+        after = repos.clusters.get(tx, "c1")
+    assert after.status == "active"
+    assert after.failure_reason is None
+    assert after.consecutive_health_failures == 2
+    assert after.last_healthy_at is None  # and it was not confirmed healthy either
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 5
+    assert "a sentence nobody has seen before" in errors[0].getMessage()
+
+
+class _UnknownStderrTransport:
+    """Hand-built ``SubprocessRunner``: kubectl exits 1 with a sentence no phrase list
+    knows. Used with the REAL ``KubectlProvider``, so the classification under test is
+    the provider's own."""
+
+    async def run(self, argv, *, env=None, timeout=None, cluster_id=None):
+        return SubprocessResult(returncode=1, stdout=b"", stderr=b"error: the flux capacitor is not charged\n")
+
+
+async def test_real_provider_unknown_kubectl_failure_leaves_the_cluster_active(uow, repos, dispatcher, clock, crypto):
+    """The DR-0048 failure with the classifier still wrong: whatever kubectl says that
+    nobody has classified, a healthy cluster must survive it."""
+    row, _ = _kubeconfig_row(crypto, "c1", "demo")
+    async with uow() as tx:
+        repos.clusters.insert(tx, row)
+
+    provider = KubectlProvider(KubectlConfig(), _UnknownStderrTransport())
+    monitor = _monitor(provider, crypto, repos, dispatcher, uow, clock)
+    for _ in range(5):
+        await monitor.tick()
+
+    async with uow() as tx:
+        after = repos.clusters.get(tx, "c1")
+    assert after.status == "active"
+    assert after.consecutive_health_failures == 0
+
+
+async def test_healthy_probe_stamps_last_healthy_at_and_a_skipped_one_does_not(uow, repos, dispatcher, clock, crypto):
+    row, _ = _kubeconfig_row(crypto, "c1", "demo")
+    async with uow() as tx:
+        repos.clusters.insert(tx, row)
+
+    unreachable = InfrastructureUnreachableError(
+        "control plane outage", code=ErrorCode.API_TIMEOUT, provider="kubectl", host="1.2.3.4"
+    )
+    await _monitor(FakeProbe(raise_exc=unreachable), crypto, repos, dispatcher, uow, clock).tick()
+    async with uow() as tx:
+        assert repos.clusters.get(tx, "c1").last_healthy_at is None
+
+    await _monitor(FakeProbe(), crypto, repos, dispatcher, uow, clock).tick()
+    async with uow() as tx:
+        after = repos.clusters.get(tx, "c1")
+    assert after.last_healthy_at == clock.now()
+    assert after.updated_at == NOW
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +402,7 @@ async def test_cluster_left_active_during_probe_is_dropped_not_failed(
     tick-start row>)`` then genuinely loses the CAS (a real, unmocked
     ``StaleVersion``), re-reads, sees the fresh row is no longer ACTIVE, and drops
     the ``HealthCheckFailed`` without failing the cluster."""
-    row, _ = _kubeconfig_row(crypto, "c1", "demo", consecutive_health_failures=0)
+    row, _ = _kubeconfig_row(crypto, "c1", "demo", consecutive_health_failures=2)  # this tick is the third
     async with uow() as tx:
         repos.clusters.insert(tx, row)
 
@@ -333,7 +429,7 @@ async def test_cluster_left_active_during_probe_is_dropped_not_failed(
 
 
 async def test_stale_version_retry_bounded_to_three_attempts(uow, repos, dispatcher, clock, crypto, caplog):
-    row, _ = _kubeconfig_row(crypto, "c1", "demo", consecutive_health_failures=0)
+    row, _ = _kubeconfig_row(crypto, "c1", "demo", consecutive_health_failures=2)  # this tick is the third
     async with uow() as tx:
         repos.clusters.insert(tx, row)
 
@@ -367,7 +463,7 @@ async def test_counter_persists_across_ticks(uow, repos, dispatcher, clock, cryp
 
     exc = TransientError("api timeout", code=ErrorCode.API_TIMEOUT, provider="kubectl")
     probe = FakeProbe(raise_exc=exc)
-    monitor = _monitor(probe, crypto, repos, dispatcher, uow, clock, max_transient_failures=5)
+    monitor = _monitor(probe, crypto, repos, dispatcher, uow, clock, max_consecutive_failures=5)
 
     await monitor.tick()
     await monitor.tick()
