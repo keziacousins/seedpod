@@ -1,15 +1,14 @@
 ---
 title: DR-0052 — k3s.install pins the k3s version, so a provision does not depend on update.k3s.io
 type: decision
-status: proposal
+status: active
 created: 2026-10-11
 updated: 2026-10-11
 ---
 
 # DR-0052: `k3s.install` pins the k3s version
 
-**Status: PROPOSAL — decision 1 was agreed with Kezia on 2026-10-11. Decisions 2 to 4 are the
-author's proposal. Not yet ratified.**
+**Status: ACTIVE — ratified by Kezia, 2026-10-11.**
 
 ## Context
 
