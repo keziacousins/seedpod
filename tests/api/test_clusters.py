@@ -631,6 +631,15 @@ async def test_pods_pod_details_logs_events_shapes(app, client, auth_headers):
     assert pod["name"] == _SEEDED_POD
     assert "hostIP" in pod
     assert "initContainers" in pod
+    # A secret is a reference (DR-0051), and the response says so: without
+    # `valueFrom` the SPA cannot tell it from a variable that is empty.
+    assert pod["containers"][0]["env"] == [
+        {"name": "LOG_LEVEL", "value": "info"},
+        {
+            "name": "DATABASE_PASSWORD", "value": "",
+            "valueFrom": {"secretKeyRef": {"name": "web-secrets", "key": "database_password-5b96677c"}},
+        },
+    ]
 
     missing = await client.get(f"/api/clusters/c1/pods/{_NAMESPACE}/does-not-exist", headers=auth_headers)
     assert missing.status_code == 404

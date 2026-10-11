@@ -134,6 +134,9 @@ an older template.
 - A secret in a place that is not an env var goes through one. Put it in an env var with `.ref`,
   and write `$(NAME)` in `args`, in `command`, or in the value of a later env var (a connection
   string). A ConfigMap cannot hold a secret.
+- A pod's env var for a secret has no `value`. The pod-details API now passes `valueFrom` through,
+  and the container page shows `from secret <name> / <key>`. Before this, the page showed each
+  secret as `(not set)`, on a pod that had it. Found on the first full deployment.
 - A deployment preview shows the generated `Secret` documents, with the placeholder of DR-0026 as
   each value. The key suffixes in a preview are not those of a real deployment.
 - A cluster that has the old `tailscale-auth` Secret keeps it. Nothing refers to it (issue #24).

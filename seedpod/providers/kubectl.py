@@ -752,6 +752,20 @@ def _parse_pod(item: Mapping[str, Any], *, now: datetime) -> PodInfo:
     )
 
 
+def _env_entry(env: Mapping[str, Any]) -> dict[str, Any]:
+    """One container env var for the pod-details response. v1 kept ``name`` and
+    ``value`` only (reference-code .../kubernetes.py:606-690), which was the whole
+    truth while every variable was a literal. Since DR-0051 a secret is a
+    ``valueFrom.secretKeyRef``: it has NO ``value``, and with only those two fields a
+    reader cannot tell it from a variable that is empty. ``valueFrom`` is passed
+    through when the pod has one. It names where the value comes from (a Secret and a
+    key, a ConfigMap, a field); the value itself is not in the pod object at all."""
+    entry: dict[str, Any] = {"name": env.get("name", ""), "value": env.get("value", "")}
+    if env.get("valueFrom"):
+        entry["valueFrom"] = env["valueFrom"]
+    return entry
+
+
 def _parse_pod_details(item: Mapping[str, Any], *, now: datetime) -> PodDetails:
     """Salvaged verbatim from ``get_pod_details`` (reference-code .../kubernetes.py:606-690)."""
     metadata = item.get("metadata", {}) or {}
@@ -782,7 +796,7 @@ def _parse_pod_details(item: Mapping[str, Any], *, now: datetime) -> PodDetails:
                     "restarts": cs.get("restartCount", 0) if cs else 0,
                     "state": cs.get("state", {}) if cs else {},
                     "ports": c.get("ports", []),
-                    "env": [{"name": e.get("name", ""), "value": e.get("value", "")} for e in c.get("env", []) or []],
+                    "env": [_env_entry(e) for e in c.get("env", []) or []],
                 }
             )
         return out

@@ -61,7 +61,21 @@ def _default_pods(namespace: str = "default") -> dict[tuple[str, str], dict]:
                 "name": "web-abc123", "namespace": namespace, "creationTimestamp": "2026-01-01T00:00:00Z",
                 "labels": {"app": "web"}, "annotations": {},
             },
-            "spec": {"nodeName": "node-1", "containers": [{"name": "web", "image": "web:1.0", "ports": [], "env": []}]},
+            "spec": {
+                "nodeName": "node-1",
+                "containers": [{
+                    "name": "web", "image": "web:1.0", "ports": [],
+                    # One literal and one secret reference (DR-0051): the two shapes a
+                    # real pod's env has, as `kubectl get pod -o json` gives them.
+                    "env": [
+                        {"name": "LOG_LEVEL", "value": "info"},
+                        {
+                            "name": "DATABASE_PASSWORD",
+                            "valueFrom": {"secretKeyRef": {"name": "web-secrets", "key": "database_password-5b96677c"}},
+                        },
+                    ],
+                }],
+            },
             "status": {
                 "phase": "Running", "podIP": "10.42.0.7", "hostIP": "10.0.0.1",
                 "containerStatuses": [{"name": "web", "ready": True, "restartCount": 0, "state": {"running": {}}}],
