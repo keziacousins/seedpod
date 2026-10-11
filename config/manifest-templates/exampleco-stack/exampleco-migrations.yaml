@@ -21,11 +21,16 @@ spec:
       containers:
         - name: migrate
           image: "{{ images.exampleco_migrations }}"
+          # The password reaches `args` through the env var: Kubernetes expands
+          # `$(DATABASE_PASSWORD)` itself, so the value never sits in the pod spec.
+          env:
+            - name: DATABASE_PASSWORD
+              valueFrom: {{ secrets.database_password.ref }}
           # Use args instead of command to preserve the image's ENTRYPOINT
           args:
             - "migrate"
             - "--database-password"
-            - "{{ secrets.database_password }}"
+            - "$(DATABASE_PASSWORD)"
             {% for key, value in environment_variables.get('exampleco-migrations', {}).items() %}
             - "--var"
             - "{{ key }}={{ value }}"

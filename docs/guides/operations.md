@@ -3,7 +3,7 @@ title: Operations runbook — running seedpod v2, and what to do when something 
 type: guide
 status: active
 created: 2026-08-11
-updated: 2026-08-11
+updated: 2026-10-10
 ---
 
 # Operations runbook
@@ -44,6 +44,9 @@ Two related facts worth knowing:
 
 - `.env` is gitignored and holds these keys plus `DIGITALOCEAN_TOKEN`, `GITHUB_TOKEN` and
   `CLOUDFLARE_API_TOKEN`. A backup of `.env` is a backup of everything.
+- A new `SEEDPOD_SECRET_KEY_DEV` also changes the key names in each generated `<service>-secrets`
+  Secret, because their suffixes are derived from it (DR-0051). The next deployment to a cluster
+  then restarts each workload that uses a secret. This is one restart, not a fault.
 - v1's DEV key is a separate artifact, needed only to decrypt v1's old secrets and snapshots. It
   exists solely inside a single backup archive held offline. If v1 data is ever wanted
   again, that tarball is the whole story.
@@ -133,5 +136,9 @@ For a DNS-enabled profile, also check the Cloudflare zone is clean:
   exactly like a v2 regression.
 - **A cold database needs a `tailscale_auth_key` secret** or manifest resolution raises for every
   secret-bearing profile. The raise is designed; a placeholder is fine.
+- **A template that renders a secret directly fails its deployment** (DR-0051). Each deployment is
+  then `manifest resolution failed`, and the reason names the template and the secret. A
+  configuration from before DR-0051 must be converted first:
+  [manifest-templates.md](manifest-templates.md).
 - **Ephemeral clusters use Let's Encrypt STAGING** (DR-0036), so browsers will not trust their
   certificates. That is correct, not a misconfiguration.

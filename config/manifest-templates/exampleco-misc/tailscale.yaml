@@ -32,25 +32,6 @@ subjects:
     name: tailscale
     namespace: default
 ---
-apiVersion: v1
-kind: Secret
-metadata:
-  name: tailscale-auth
-  namespace: default
-  labels:
-    app: tailscale
-    environment: "{{ config.environment }}"
-    cluster-id: "{{ config.cluster_id }}"
-type: Opaque
-# `data` (base64), NOT `stringData`. stringData is write-only: the API server
-# converts it to `data` and never echoes it back, so kubectl re-sends it on
-# every apply and reports this Secret `configured` forever. That false
-# `configured` poisons ApplyChangeSummary.all_unchanged, which is the only
-# signal deploy.ensure_rollouts uses to decide on a rollout restart -- one
-# stringData Secret disables that rule for the whole wave.
-data:
-  TS_AUTHKEY: "{{ secrets.tailscale_auth_key | b64encode }}"
----
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -78,12 +59,11 @@ spec:
         - name: tailscale
           image: tailscale/tailscale:latest
           env:
-            # Authenticate with Tailscale
+            # Authenticate with Tailscale. `.ref` is a secretKeyRef into the
+            # `tailscale-secrets` Secret that seedpod writes for this template
+            # (DR-0051); the key never appears in the pod spec.
             - name: TS_AUTHKEY
-              valueFrom:
-                secretKeyRef:
-                  name: tailscale-auth
-                  key: TS_AUTHKEY
+              valueFrom: {{ secrets.tailscale_auth_key.ref }}
             # Accept routes from other nodes
             - name: TS_ACCEPT_ROUTES
               value: "true"

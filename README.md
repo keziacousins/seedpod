@@ -162,6 +162,11 @@ deployment's configuration, which lives in its own repo rather than in the artif
 erratum E3). A relative value is ignored, and a path that does not exist is refused rather
 than quietly replaced with the example config.
 
+A template in your own configuration cannot render the value of a secret. It refers to one with
+`secrets.<name>.ref`, and a template that renders one directly fails its deployment before
+anything is applied. `docs/guides/manifest-templates.md` has the forms, and how to convert an
+older template (DR-0051).
+
 ```bash
 ~/seedpod/current/bin/seedpodctl clusters list
 ```

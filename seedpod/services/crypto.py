@@ -58,10 +58,12 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from seedpod.core.errors import ErrorCode, PermanentError
 
-__all__ = ["SecretManager", "CryptoService"]
+__all__ = ["SecretManager", "CryptoService", "derive_key"]
 
 
 class SecretManager:
@@ -90,6 +92,17 @@ class SecretManager:
 
 def _key_bytes(key: bytes | str) -> bytes:
     return key.encode("ascii") if isinstance(key, str) else key
+
+
+def derive_key(key: bytes | str, purpose: str) -> bytes:
+    """A 32-byte key for one named ``purpose``, derived from a configured Fernet key
+    (HKDF-SHA256, ``purpose`` as the ``info``). For a use that needs a stable secret
+    key but must not be handed the encryption key itself -- DR-0051's secret-ref
+    suffix is the first. Same inputs, same output, on every process start: nothing is
+    stored. Rotating the Fernet key rotates every key derived from it."""
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=purpose.encode("utf-8")).derive(
+        _key_bytes(key)
+    )
 
 
 class CryptoService:

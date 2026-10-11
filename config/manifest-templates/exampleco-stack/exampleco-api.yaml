@@ -29,6 +29,28 @@ spec:
           ports:
             - containerPort: 8000
           env:
+            # Secrets, by reference (docs/guides/manifest-templates.md). They come
+            # FIRST: Kubernetes expands `$(NAME)` in an env value only for a
+            # variable defined earlier in this list, so a profile variable below
+            # can be written `postgres://user:$(DATABASE_PASSWORD)@host/db`.
+            - name: DATABASE_PASSWORD
+              valueFrom: {{ secrets.database_password.ref }}
+
+            - name: CACHE_PASSWORD
+              valueFrom: {{ secrets.cache_password.ref }}
+
+            - name: S3_ACCESS_KEY
+              valueFrom: {{ secrets.s3_access_key.ref }}
+
+            - name: S3_SECRET_KEY
+              valueFrom: {{ secrets.s3_secret_key.ref }}
+
+            - name: JWT_SECRET
+              valueFrom: {{ secrets.jwt_secret.ref }}
+
+            - name: MAIL_PASSWORD
+              valueFrom: {{ secrets.mail_password.ref }}
+
             # Environment variables from deployment profile (shared + this
             # service's own, already merged by EnvironmentVariables.resolve_
             # all_services)
@@ -36,25 +58,6 @@ spec:
             - name: {{ key }}
               value: "{{ value }}"
             {% endfor %}
-            # Secrets
-
-            - name: DATABASE_PASSWORD
-              value: "{{ secrets.database_password }}"
-
-            - name: CACHE_PASSWORD
-              value: "{{ secrets.cache_password }}"
-
-            - name: S3_ACCESS_KEY
-              value: "{{ secrets.s3_access_key }}"
-
-            - name: S3_SECRET_KEY
-              value: "{{ secrets.s3_secret_key }}"
-
-            - name: JWT_SECRET
-              value: "{{ secrets.jwt_secret }}"
-
-            - name: MAIL_PASSWORD
-              value: "{{ secrets.mail_password }}"
 
           livenessProbe:
             httpGet:
