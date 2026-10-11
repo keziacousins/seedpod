@@ -308,6 +308,11 @@ on that host was Homebrew `python@3.11`. A detached process on that build cannot
 tart VM. The same test on Homebrew `python@3.13` connects. So the consequence above that says
 the denied grant "stops mattering" did not hold.
 
+CI named no version either. `uv sync --locked` took the runner's system Python, which was
+3.12.3 on 2026-10-11. So CI tested neither the floor nor the version the appliance runs. The
+`python` job is now a matrix of 3.11 and 3.13, and each entry fails if its venv is on another
+version.
+
 Nothing else in decision 1 changes. The version is still in the install command, and
 `requires-python` is still `>=3.11`.
 

@@ -58,6 +58,17 @@ jobs:
     # The suite runs in well under a minute. A job still going after 15 is hung or
     # is doing something it should not be; without this it would burn six hours.
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is the floor `requires-python` promises. 3.13 is what the appliance
+        # runs (DR-0041 erratum E4). With no version named, uv took the runner's
+        # system Python, which was 3.12: neither of the two.
+        python: ["3.11", "3.13"]
+    env:
+      # uv reads UV_PYTHON in `uv sync` and in `uv run`. The version goes through
+      # `env:` because rule 4 keeps `${{ }}` out of every `run:` block.
+      UV_PYTHON: ${{ matrix.python }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -72,6 +83,11 @@ jobs:
         # `--locked` fails rather than silently re-resolving, so CI installs the
         # exact versions in uv.lock and a stale lockfile is an error, not a drift.
         run: uv sync --locked
+      - name: Check the interpreter
+        # A job named 3.13 that runs on another version is the defect this matrix
+        # removes. Fail if the venv is not on the version the job asked for.
+        run: |
+          uv run python -c 'import os, sys; want = os.environ["UV_PYTHON"]; got = "%d.%d" % sys.version_info[:2]; sys.exit(None if got == want else f"asked for Python {want}, got {got}")'
       - name: Lint
         run: uv run ruff check .
       - name: Tests
