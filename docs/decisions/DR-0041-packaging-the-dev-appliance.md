@@ -3,7 +3,7 @@ title: DR-0041 — packaging seedpod as a dev appliance: a versioned release roo
 type: decision
 status: active
 created: 2026-08-14
-updated: 2026-08-16
+updated: 2026-10-11
 ---
 
 # DR-0041: packaging the dev appliance
@@ -295,6 +295,26 @@ operator action it exists for. Three questions come first:
 
 Not started. Recorded so the gap between "config is separate now" and "the appliance can
 still get config" stays visible rather than being discovered on a host.
+
+### Erratum E4 — the install command names Python 3.13 (2026-10-11)
+
+Erratum E1 gives the install command as `uv sync --locked --python 3.11`. The appliance runs
+on 3.13. Release `2.0.0a0+e5ed924d` was installed there on 2026-10-11 with
+`--python /opt/homebrew/bin/python3.13`. The README, the launcher's missing-runtime message
+and a comment in `scripts/build_release.py` still said 3.11. All three now say 3.13.
+
+The reason is in `docs/guides/tart-local-dev.md`. With `--python 3.11`, the venv's interpreter
+on that host was Homebrew `python@3.11`. A detached process on that build cannot connect to a
+tart VM. The same test on Homebrew `python@3.13` connects. So the consequence above that says
+the denied grant "stops mattering" did not hold.
+
+CI named no version either. `uv sync --locked` took the runner's system Python, which was
+3.12.3 on 2026-10-11. So CI tested neither the floor nor the version the appliance runs. The
+`python` job is now a matrix of 3.11 and 3.13, and each entry fails if its venv is on another
+version.
+
+Nothing else in decision 1 changes. The version is still in the install command, and
+`requires-python` is still `>=3.11`.
 
 ### D. A succinct ops section in `README.md`
 

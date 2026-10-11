@@ -87,11 +87,15 @@ swaps it back.
 ```bash
 mkdir -p ~/seedpod/releases ~/seedpod/var
 tar -xzf seedpod-<release>.tar.gz -C ~/seedpod/releases/
-(cd ~/seedpod/releases/<release> && uv sync --locked --python 3.11)
+(cd ~/seedpod/releases/<release> && uv sync --locked --python 3.13)
 ln -sfn ~/seedpod/releases/<release> ~/seedpod/current
 ```
 
-`--python 3.11` is explicit rather than a `.python-version` file. pyenv reads that filename
+`--python 3.13` is the version the appliance runs. `requires-python` stays `>=3.11`. On macOS
+the Local Network grant belongs to one interpreter build, and `docs/guides/tart-local-dev.md`
+records which builds reach a tart VM. To use a specific build, give `--python` its full path.
+
+The version is in the command, not in a `.python-version` file. pyenv reads that filename
 too, and where `uv` is installed as a pyenv shim, the file makes `uv` itself unrunnable
 (`pyenv: uv: command not found`).
 

@@ -56,7 +56,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # shim (this laptop), a version pyenv does not have makes `pyenv: uv: command
 # not found` -- the file pins the interpreter by disabling the tool that
 # installs it. The pin lives in the install command instead
-# (`uv sync --locked --python 3.11`, README), which no other tool reads.
+# (`uv sync --locked --python 3.13`, README), which no other tool reads.
 FILES = ("pyproject.toml", "uv.lock", "README.md")
 
 # (source, destination-inside-artifact). `ui/dist` is re-rooted so the artifact

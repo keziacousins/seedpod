@@ -73,7 +73,7 @@ PY="$RELEASE_ROOT/.venv/bin/python"
 if [ ! -x "$PY" ]; then
     echo "seedpod: no runtime at $PY" >&2
     echo "  DR-0041 decision 1: the venv is materialised on the appliance, not shipped." >&2
-    echo "  Fix: cd $RELEASE_ROOT && uv sync --locked --python 3.11" >&2
+    echo "  Fix: cd $RELEASE_ROOT && uv sync --locked --python 3.13" >&2
     # --python is explicit rather than a `.python-version` file: pyenv reads that
     # filename too, and where uv is a pyenv shim the file breaks uv itself.
     exit 78
