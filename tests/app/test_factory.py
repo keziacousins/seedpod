@@ -10,6 +10,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+import yaml
 from cryptography.fernet import Fernet
 
 from seedpod.app.config import AppConfig
@@ -149,6 +150,67 @@ def test_ssh_identities_has_no_ssh_plane_entry_for_kind_or_orbstack(tmp_path, te
 
     assert "kind" not in identities
     assert "orbstack" not in identities
+
+
+def test_shipped_provider_configs_pin_a_k3s_version(tmp_path, test_config_dir):
+    """DR-0052: both SSH-plane providers ship with a pinned k3s release, so a
+    provision does not depend on the channel server at update.k3s.io.
+
+    The loader is what this pins, plus the fact that a pin exists. The release
+    itself is the YAML's choice and is not asserted here."""
+    from seedpod.app.factory import _k3s_versions
+
+    versions = _k3s_versions(_config(tmp_path, test_config_dir))
+
+    assert set(versions) == {"digitalocean", "tart"}
+    for provider in ("digitalocean", "tart"):
+        raw = yaml.safe_load((test_config_dir / "providers" / f"{provider}.yml").read_text())
+        assert versions[provider] == raw["k3s_config"]["version"]
+
+
+def _provider_config_dir(tmp_path: Path, **k3s_config_by_provider) -> AppConfig:
+    providers = tmp_path / "providers"
+    providers.mkdir()
+    for provider, k3s_config in k3s_config_by_provider.items():
+        (providers / f"{provider}.yml").write_text(yaml.safe_dump({"k3s_config": k3s_config}))
+    return AppConfig(
+        database_url=f"sqlite:///{tmp_path}/t.db",
+        secret_key_dev=Fernet.generate_key().decode(),
+        config_dir=tmp_path,
+    )
+
+
+def test_k3s_versions_leaves_out_a_provider_with_no_version(tmp_path):
+    """`version: null`, no `version` key, and no file at all are the same answer:
+    no entry, so `cluster.load_spec` yields `None` and the installer uses its
+    stable channel."""
+    from seedpod.app.factory import _k3s_versions
+
+    config = _provider_config_dir(tmp_path, tart={"version": None, "install_timeout": 600})
+
+    assert _k3s_versions(config) == {}
+
+
+def test_k3s_versions_reads_each_provider_separately(tmp_path):
+    from seedpod.app.factory import _k3s_versions
+
+    config = _provider_config_dir(
+        tmp_path, tart={"version": "v1.37.0-rc1+k3s1"}, digitalocean={"version": "v1.36.5+k3s1"}
+    )
+
+    assert _k3s_versions(config) == {"tart": "v1.37.0-rc1+k3s1", "digitalocean": "v1.36.5+k3s1"}
+
+
+@pytest.mark.parametrize("version", ["1.36.5+k3s1", "v1.36.5", "stable", "latest", "v1.36.5+k3s1; reboot", 1.36])
+def test_k3s_versions_rejects_a_value_that_is_not_a_release_tag(tmp_path, version):
+    """A boot failure. The other outcome is a GitHub download that fails 3 minutes
+    into a provision, after the VM exists."""
+    from seedpod.app.factory import InvalidK3sVersion, _k3s_versions
+
+    config = _provider_config_dir(tmp_path, tart={"version": version})
+
+    with pytest.raises(InvalidK3sVersion, match="tart.yml"):
+        _k3s_versions(config)
 
 
 def test_verify_ssh_identities_raises_when_an_enabled_providers_key_is_missing(tmp_path):

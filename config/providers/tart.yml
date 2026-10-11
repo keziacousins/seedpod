@@ -95,7 +95,9 @@ ssh_config:
 # K3s install tuning (passed to SSHBasedK3sInstaller)
 k3s_config:
   install_url: "https://get.k3s.io"
-  version: null  # null = latest stable
+  # Sent as INSTALL_K3S_VERSION (DR-0052). null = ask update.k3s.io for the stable
+  # release at each install, so each provision then depends on that server.
+  version: "v1.36.5+k3s1"
   install_timeout: 600
 
 # Health check timeouts

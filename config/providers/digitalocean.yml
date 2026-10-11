@@ -160,8 +160,10 @@ droplet_config:
 
 # K3s installation configuration
 k3s_config:
-  version: "v1.28.5+k3s1" # Specific K3s version
-  channel: "stable" # Or use channel instead of version
+  # Sent as INSTALL_K3S_VERSION (DR-0052). null = ask update.k3s.io for the stable
+  # release at each install, so each provision then depends on that server.
+  version: "v1.36.5+k3s1"
+  channel: "stable" # not read: only version reaches the installer
   install_url: "https://get.k3s.io"
 
   # K3s server arguments

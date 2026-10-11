@@ -308,6 +308,11 @@ class InstallK3sParams(BaseModel):
     known_hosts: str
     ssh_user: str | None
     ssh_private_key_path: str | None
+    # DR-0052: bound from `cluster.load_spec`'s `k3s_version`. None is a legal value
+    # (the installer then asks the channel server), but there is no default: a
+    # workflow that does not bind it fails V2, and fails this step at run time,
+    # instead of installing unpinned.
+    k3s_version: str | None
     # DR-0036: Optional, bound from `cluster.load_spec`'s `acme` output. Present only
     # when the profile enabled BOTH ssl and dns, which is exactly when the Ingress
     # templates render `router.tls.certresolver: letsencrypt` -- the two halves are
@@ -333,6 +338,7 @@ class K3sInstall(ProviderStep[InstallK3sParams, EmptyOutput]):
             service_cidr=service_cidr,
             tls_sans=(params.extra_tls_san,),
             ingress=_ingress_for(params.spec, params.acme),
+            k3s_version=params.k3s_version,
         )
 
     def output_from(self, value: object) -> EmptyOutput:

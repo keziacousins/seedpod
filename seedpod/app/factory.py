@@ -92,6 +92,7 @@ One prerequisite component this task's brief explicitly permits to be partial
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -201,6 +202,7 @@ __all__ = [
     "build_app",
     "load_enabled_providers",
     "load_workflow_definitions",
+    "InvalidK3sVersion",
     "MissingGithubOrganization",
 ]
 
@@ -357,6 +359,7 @@ def build_app(
         crypto=crypto,
         clock=clock,
         ssh_identities=ssh_identities,
+        k3s_versions=_k3s_versions(config),
         config_dir=config.config_dir,
         dns=dns,
         deployment_audits=deployment_audits_repo,
@@ -653,6 +656,40 @@ def _expand_user(path: str | None) -> str | None:
     return os.path.expanduser(path) if path else None
 
 
+class InvalidK3sVersion(RuntimeError):
+    """Raised by ``_k3s_versions`` -- a ``k3s_config.version`` that is not a k3s
+    release tag. A boot failure, like ``MissingGithubOrganization`` below: the
+    alternative is a failed download 3 minutes into a provision."""
+
+
+# A k3s release tag: v1.36.5+k3s1, v1.37.0-rc1+k3s1.
+_K3S_VERSION_RE = re.compile(r"v\d+\.\d+\.\d+(-[0-9a-z.]+)?\+k3s\d+")
+
+
+def _k3s_versions(config: AppConfig) -> Mapping[str, str]:
+    """DR-0052: the k3s release ``k3s.install`` installs, per provider, read from
+    ``k3s_config.version`` in ``config/providers/{digitalocean,tart}.yml``. The same
+    files and the same route as ``_ssh_identities()`` above.
+
+    A provider with no version (key absent, or ``null``) is absent from the mapping.
+    ``cluster.load_spec`` then yields ``None`` and the installer asks the channel
+    server at ``update.k3s.io`` for the stable release. That is a legal choice, and it
+    makes each provision depend on that server."""
+    versions: dict[str, str] = {}
+    for provider in ("digitalocean", "tart"):
+        raw = _load_yaml(config.config_dir / "providers" / f"{provider}.yml") or {}
+        version = (raw.get("k3s_config", {}) or {}).get("version")
+        if version is None:
+            continue
+        if not isinstance(version, str) or not _K3S_VERSION_RE.fullmatch(version):
+            raise InvalidK3sVersion(
+                f"config/providers/{provider}.yml: k3s_config.version is {version!r}, "
+                f"which is not a k3s release tag (expected the form 'v1.36.5+k3s1')"
+            )
+        versions[provider] = version
+    return versions
+
+
 # ---------------------------------------------------------------------------
 # GitHub organization (PARITY-BACKLOG #0b) -- config/org.yml + GITHUB_ORGANIZATION
 # ---------------------------------------------------------------------------
@@ -767,6 +804,7 @@ def _build_step_registry(
     crypto: CryptoService,
     clock: Clock,
     ssh_identities: Mapping[str, SshIdentity],
+    k3s_versions: Mapping[str, str],
     config_dir: Path,
     dns: DnsService | None,
     deployment_audits: DeploymentAuditRepository,
@@ -856,7 +894,9 @@ def _build_step_registry(
     HERE, not via ``ctx.services`` at call time."""
     return StepRegistry(
         {
-            LoadSpec.verb: LoadSpec(uow=uow, clusters=repos.clusters, ssh_identities=ssh_identities),
+            LoadSpec.verb: LoadSpec(
+                uow=uow, clusters=repos.clusters, ssh_identities=ssh_identities, k3s_versions=k3s_versions
+            ),
             StoreKubeconfig.verb: StoreKubeconfig(uow=uow, clusters=repos.clusters, crypto=crypto, clock=clock),
             StoreDnsRecord.verb: StoreDnsRecord(uow=uow, clusters=repos.clusters, clock=clock),
             # DR-0040: the 33rd verb. Fires only on an unattended (TTL) destroy --

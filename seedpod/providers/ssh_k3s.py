@@ -84,6 +84,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import re
+import shlex
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import ClassVar
@@ -377,7 +378,11 @@ class SshK3sProvider:
         flags.append("--disable=servicelb")
 
         flag_str = " ".join(flags)
-        install_cmd = f"curl -sfL https://get.k3s.io | sudo INSTALL_K3S_EXEC='{flag_str}' sh -"
+        # DR-0052: with INSTALL_K3S_VERSION set, the installer skips its channel lookup
+        # at update.k3s.io and downloads that release from GitHub. That lookup was the
+        # only use of update.k3s.io, and an outage there failed every provision.
+        version_env = f"INSTALL_K3S_VERSION={shlex.quote(cmd.k3s_version)} " if cmd.k3s_version else ""
+        install_cmd = f"curl -sfL https://get.k3s.io | sudo {version_env}INSTALL_K3S_EXEC='{flag_str}' sh -"
         yield Progress(phase="k3s.installing")
         await self._run_strict(cmd.ssh, cmd.known_hosts, install_cmd, command_name="install_k3s")
         yield Result(K3sInstalled())

@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import re
+from dataclasses import replace
 
 import pytest
 
@@ -248,6 +249,44 @@ async def test_install_k3s_flags_verbatim():
     assert "--tls-san=10.42.0.7" in cmd
     assert "--disable=servicelb" in cmd
     assert "--disable=traefik" not in cmd  # traefik loadbalancer: keep enabled
+
+
+async def test_install_k3s_pins_the_version_it_is_given():
+    """DR-0052: with INSTALL_K3S_VERSION set, the installer does not ask
+    update.k3s.io which release is stable."""
+    harness = SshK3sHarness()
+    provider = harness.provider()
+
+    await _drain(provider, replace(harness.install_k3s_command(), k3s_version="v1.36.5+k3s1"))
+
+    cmd = harness.backend.install_flags_seen
+    # sudo takes the assignments, so both must come after it and before `sh`.
+    assert "| sudo INSTALL_K3S_VERSION=v1.36.5+k3s1 INSTALL_K3S_EXEC='" in cmd
+    assert cmd.endswith("' sh -")
+
+
+async def test_install_k3s_sends_no_version_when_none_is_pinned():
+    """DR-0052: `None` leaves the command as it was, so the installer uses its
+    stable channel."""
+    harness = SshK3sHarness()
+    provider = harness.provider()
+
+    await _drain(provider, harness.install_k3s_command())
+
+    cmd = harness.backend.install_flags_seen
+    assert "INSTALL_K3S_VERSION" not in cmd
+    assert "| sudo INSTALL_K3S_EXEC='" in cmd
+
+
+async def test_install_k3s_quotes_the_version_for_the_remote_shell():
+    """The provider does not trust its input. The composition root rejects a value
+    like this at boot, but a command built elsewhere must not run a second command."""
+    harness = SshK3sHarness()
+    provider = harness.provider()
+
+    await _drain(provider, replace(harness.install_k3s_command(), k3s_version="v1; touch /tmp/x"))
+
+    assert "INSTALL_K3S_VERSION='v1; touch /tmp/x' " in harness.backend.install_flags_seen
 
 
 async def test_install_k3s_disables_traefik_when_ingress_none():
