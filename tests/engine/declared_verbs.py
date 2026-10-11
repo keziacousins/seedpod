@@ -361,6 +361,9 @@ class LoadSpecOutput(BaseModel):
     # dns.enabled (v1's `use_acme_certs` -- the same condition under which the Ingress
     # templates render the annotation naming it). Bound into `k3s.install`.
     acme: AcmeConfig | None = None
+    # `k3s_version` added by DR-0052: the provider's own `k3s_config.version`. `None`
+    # when that file pins none, and for kind/orbstack. Bound into `k3s.install`.
+    k3s_version: str | None = None
 
 
 class CreateInstanceParams(BaseModel):
@@ -450,6 +453,9 @@ class InstallK3sParams(BaseModel):
     known_hosts: str
     ssh_user: str | None
     ssh_private_key_path: str | None
+    # DR-0052: bound from `cluster.load_spec`'s `k3s_version`. No default, so a
+    # workflow that does not bind it fails V2.
+    k3s_version: str | None
     # DR-0036: bound from `cluster.load_spec`'s `acme`. The certresolver goes into the
     # SAME HelmChartConfig the hostport strategy already writes BEFORE k3s starts --
     # v1 wrote a second, competing one at DEPLOYING instead, and v2 keeps one writer.

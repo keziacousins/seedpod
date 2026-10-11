@@ -3,9 +3,10 @@ title: Seam C — Provider contract (Pillar 3)
 type: design
 status: active
 created: 2026-07-12
-updated: 2026-08-09
+updated: 2026-10-11
 amended-by: coherence-review.md   # Conflicts 5–7, 12 override where they touch this spec (incl. errors moving to core/errors.py)
 # DR-0033 adds SshPortState.detail (diagnostic-only); edited in place per DR-0001.
+# DR-0052 adds InstallK3s.k3s_version; edited in place per DR-0001.
 ---
 
 # Seam C — Provider contract (Decision 5): FINAL SPECIFICATION
@@ -339,6 +340,8 @@ class InstallK3s:
     service_cidr: str
     tls_sans: tuple[str, ...]
     ingress: IngressConfig
+    k3s_version: str | None = None          # DR-0052: sent as INSTALL_K3S_VERSION. None ⇒ the installer asks
+                                            # the channel server (update.k3s.io) for the stable release
 # Result: K3sInstalled()
 
 @dataclass(frozen=True)

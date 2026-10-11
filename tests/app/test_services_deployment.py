@@ -200,7 +200,7 @@ services:
     )
     assert result.cluster_id is not None
 
-    load_spec = LoadSpec(uow=uow, clusters=repos.clusters, ssh_identities={})
+    load_spec = LoadSpec(uow=uow, clusters=repos.clusters, ssh_identities={}, k3s_versions={})
     output = await load_spec.execute(
         LoadSpecParams(cluster_id=result.cluster_id), make_step_context(cluster_id=result.cluster_id)
     )

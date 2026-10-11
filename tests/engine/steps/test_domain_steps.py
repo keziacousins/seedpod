@@ -103,6 +103,10 @@ SSH_IDENTITIES = {
     "tart": SshIdentity(user="admin", private_key_path="/home/test/.ssh/id_ed25519"),
 }
 
+# DR-0052: one version per SSH-plane provider, and two different ones, so a test can
+# tell that each provider gets its own.
+K3S_VERSIONS = {"digitalocean": "v1.36.5+k3s1", "tart": "v1.35.9+k3s1"}
+
 
 def _birth_row(
     cluster_id: str,
@@ -141,7 +145,7 @@ async def _insert(uow: UnitOfWork, clusters: ClusterRepository, row: ClusterRow)
 
 
 def test_load_spec_declares_the_dr_0022_contract():
-    step = LoadSpec(uow=object(), clusters=object(), ssh_identities={})  # construction only -- no IO
+    step = LoadSpec(uow=object(), clusters=object(), ssh_identities={}, k3s_versions={})  # construction only -- no IO
     assert step.verb == "cluster.load_spec"
     assert step.plane == "domain"
     assert step.thin is False
@@ -151,7 +155,7 @@ def test_load_spec_declares_the_dr_0022_contract():
 
 async def test_load_spec_produces_spec_and_provider(uow, clusters):
     await _insert(uow, clusters, _birth_row("c1", provider="digitalocean"))
-    step = LoadSpec(uow=uow, clusters=clusters, ssh_identities=SSH_IDENTITIES)
+    step = LoadSpec(uow=uow, clusters=clusters, ssh_identities=SSH_IDENTITIES, k3s_versions=K3S_VERSIONS)
     ctx = make_step_context(cluster_id="c1")
 
     output = await step.execute(LoadSpecParams(cluster_id="c1"), ctx)
@@ -172,7 +176,7 @@ async def test_load_spec_threads_the_tart_ssh_identity(uow, clusters):
     """DR-0023: v1 used a genuinely DIFFERENT identity per provider -- tart's
     must not be digitalocean's, and vice versa."""
     await _insert(uow, clusters, _birth_row("c-tart", provider="tart"))
-    step = LoadSpec(uow=uow, clusters=clusters, ssh_identities=SSH_IDENTITIES)
+    step = LoadSpec(uow=uow, clusters=clusters, ssh_identities=SSH_IDENTITIES, k3s_versions=K3S_VERSIONS)
 
     output = await step.execute(LoadSpecParams(cluster_id="c-tart"), make_step_context(cluster_id="c-tart"))
 
@@ -188,7 +192,7 @@ async def test_load_spec_ssh_identity_is_none_for_providers_with_no_ssh_plane(uo
     prevents a silently-wrong credential is `k3s.py`'s `_target()` raising a
     loud PermanentError on a None.)"""
     await _insert(uow, clusters, _birth_row(f"c-{provider}", provider=provider))
-    step = LoadSpec(uow=uow, clusters=clusters, ssh_identities=SSH_IDENTITIES)
+    step = LoadSpec(uow=uow, clusters=clusters, ssh_identities=SSH_IDENTITIES, k3s_versions=K3S_VERSIONS)
 
     output = await step.execute(
         LoadSpecParams(cluster_id=f"c-{provider}"), make_step_context(cluster_id=f"c-{provider}")
@@ -203,7 +207,7 @@ async def test_load_spec_ssh_identity_is_none_for_a_provider_absent_from_the_map
     explicitly) must still resolve to (None, None), not raise -- `LoadSpec`
     never invents a fallback identity (DR-0023 point 5)."""
     await _insert(uow, clusters, _birth_row("c-fake", provider="fake"))
-    step = LoadSpec(uow=uow, clusters=clusters, ssh_identities=SSH_IDENTITIES)
+    step = LoadSpec(uow=uow, clusters=clusters, ssh_identities=SSH_IDENTITIES, k3s_versions=K3S_VERSIONS)
 
     output = await step.execute(LoadSpecParams(cluster_id="c-fake"), make_step_context(cluster_id="c-fake"))
 
@@ -211,12 +215,40 @@ async def test_load_spec_ssh_identity_is_none_for_a_provider_absent_from_the_map
     assert output.ssh_private_key_path is None
 
 
+@pytest.mark.parametrize("provider", ["digitalocean", "tart"])
+async def test_load_spec_threads_each_providers_own_k3s_version(uow, clusters, provider):
+    """DR-0052: the version comes from the provider's own config file, so the two
+    SSH-plane providers can pin different releases."""
+    await _insert(uow, clusters, _birth_row(f"c-{provider}", provider=provider))
+    step = LoadSpec(uow=uow, clusters=clusters, ssh_identities=SSH_IDENTITIES, k3s_versions=K3S_VERSIONS)
+
+    output = await step.execute(
+        LoadSpecParams(cluster_id=f"c-{provider}"), make_step_context(cluster_id=f"c-{provider}")
+    )
+
+    assert output.k3s_version == K3S_VERSIONS[provider]
+
+
+@pytest.mark.parametrize("provider", ["kind", "orbstack", "fake"])
+async def test_load_spec_k3s_version_is_none_for_a_provider_absent_from_the_mapping(uow, clusters, provider):
+    """DR-0052: no entry means no pinned version. `LoadSpec` does not borrow another
+    provider's version."""
+    await _insert(uow, clusters, _birth_row(f"c-{provider}", provider=provider))
+    step = LoadSpec(uow=uow, clusters=clusters, ssh_identities=SSH_IDENTITIES, k3s_versions=K3S_VERSIONS)
+
+    output = await step.execute(
+        LoadSpecParams(cluster_id=f"c-{provider}"), make_step_context(cluster_id=f"c-{provider}")
+    )
+
+    assert output.k3s_version is None
+
+
 async def test_load_spec_cidrs_are_bit_identical_to_the_committed_allocator(uow, clusters):
     """Tailscale-critical: the step must CALL allocate_cluster_cidrs, never
     reimplement or drift from it."""
     cluster_id = "3c8cf9ed-8229-45b1-a188-7cdcd726fe02"
     await _insert(uow, clusters, _birth_row(cluster_id))
-    step = LoadSpec(uow=uow, clusters=clusters, ssh_identities=SSH_IDENTITIES)
+    step = LoadSpec(uow=uow, clusters=clusters, ssh_identities=SSH_IDENTITIES, k3s_versions=K3S_VERSIONS)
     ctx = make_step_context(cluster_id=cluster_id)
 
     output = await step.execute(LoadSpecParams(cluster_id=cluster_id), ctx)
@@ -230,7 +262,7 @@ async def test_load_spec_cidrs_vary_deterministically_with_cluster_id(uow, clust
     ids = ["aaaaaaaa-0000-0000-0000-000000000000", "bbbbbbbb-0000-0000-0000-000000000000", "cccccccc-0000-0000-0000-000000000000"]
     for cid in ids:
         await _insert(uow, clusters, _birth_row(cid))
-    step = LoadSpec(uow=uow, clusters=clusters, ssh_identities=SSH_IDENTITIES)
+    step = LoadSpec(uow=uow, clusters=clusters, ssh_identities=SSH_IDENTITIES, k3s_versions=K3S_VERSIONS)
 
     seen = set()
     for cid in ids:
@@ -251,7 +283,7 @@ async def test_load_spec_overlays_sibling_shaped_ingress_strategy(uow, clusters)
         "ingress_strategy": {"type": "traefik", "traefik": {"enabled": True}},
     }
     await _insert(uow, clusters, _birth_row("c-sibling", provider_config=provider_config))
-    step = LoadSpec(uow=uow, clusters=clusters, ssh_identities=SSH_IDENTITIES)
+    step = LoadSpec(uow=uow, clusters=clusters, ssh_identities=SSH_IDENTITIES, k3s_versions=K3S_VERSIONS)
 
     output = await step.execute(LoadSpecParams(cluster_id="c-sibling"), make_step_context(cluster_id="c-sibling"))
 
@@ -267,7 +299,7 @@ async def test_load_spec_preserves_nested_ingress_strategy_and_does_not_overwrit
         "cluster_config": {"node_count": 1, "ingress_strategy": {"type": "nodeport"}},
     }
     await _insert(uow, clusters, _birth_row("c-nested", provider_config=provider_config))
-    step = LoadSpec(uow=uow, clusters=clusters, ssh_identities=SSH_IDENTITIES)
+    step = LoadSpec(uow=uow, clusters=clusters, ssh_identities=SSH_IDENTITIES, k3s_versions=K3S_VERSIONS)
 
     output = await step.execute(LoadSpecParams(cluster_id="c-nested"), make_step_context(cluster_id="c-nested"))
 
@@ -275,7 +307,7 @@ async def test_load_spec_preserves_nested_ingress_strategy_and_does_not_overwrit
 
 
 async def test_load_spec_unknown_cluster_raises_permanent_error(uow, clusters):
-    step = LoadSpec(uow=uow, clusters=clusters, ssh_identities=SSH_IDENTITIES)
+    step = LoadSpec(uow=uow, clusters=clusters, ssh_identities=SSH_IDENTITIES, k3s_versions=K3S_VERSIONS)
     ctx = make_step_context(cluster_id="does-not-exist")
     with pytest.raises(PermanentError):
         await step.execute(LoadSpecParams(cluster_id="does-not-exist"), ctx)
@@ -567,7 +599,7 @@ async def test_load_spec_yields_no_dns_intent_for_a_profile_that_never_enabled_d
     """The majority. `_provider_config_from` only writes the block when the profile
     enabled DNS, so absence in the blob IS absence of intent -- no second opinion."""
     await _insert(uow, clusters, _birth_row("c-nodns"))
-    step = LoadSpec(uow=uow, clusters=clusters, ssh_identities={})
+    step = LoadSpec(uow=uow, clusters=clusters, ssh_identities={}, k3s_versions={})
 
     output = await step.execute(LoadSpecParams(cluster_id="c-nodns"), make_step_context(cluster_id="c-nodns"))
 
@@ -589,7 +621,7 @@ async def test_load_spec_reads_the_dns_intent_off_provider_config(uow, clusters)
         },
     }
     await _insert(uow, clusters, _birth_row("c-dnsintent", provider_config=config))
-    step = LoadSpec(uow=uow, clusters=clusters, ssh_identities={})
+    step = LoadSpec(uow=uow, clusters=clusters, ssh_identities={}, k3s_versions={})
 
     output = await step.execute(
         LoadSpecParams(cluster_id="c-dnsintent"), make_step_context(cluster_id="c-dnsintent")
@@ -604,7 +636,7 @@ async def test_load_spec_dns_config_does_not_disturb_the_cluster_specification(u
     provisions the machine."""
     config = {**PROVIDER_CONFIG, "dns_config": {"enabled": True, "zone": "example.com"}}
     await _insert(uow, clusters, _birth_row("c-both", provider_config=config))
-    step = LoadSpec(uow=uow, clusters=clusters, ssh_identities={})
+    step = LoadSpec(uow=uow, clusters=clusters, ssh_identities={}, k3s_versions={})
 
     output = await step.execute(LoadSpecParams(cluster_id="c-both"), make_step_context(cluster_id="c-both"))
 

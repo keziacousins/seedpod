@@ -175,6 +175,24 @@ def test_provision_digitalocean_known_hosts_threaded_per_conflict_14():
         assert step.with_["known_hosts"].path == "trust_host.known_hosts"
 
 
+@pytest.mark.parametrize("filename", ["provision-digitalocean.yml", "provision-tart.yml"])
+def test_k3s_install_binds_the_providers_k3s_version_per_dr_0052(filename: str):
+    wf = _load(WORKFLOWS_DIR / filename)
+    install = next(s for s in wf.steps if s.uses == "k3s.install")
+    assert install.with_["k3s_version"].path == "spec.k3s_version"
+
+
+@pytest.mark.parametrize("filename", ["provision-digitalocean.yml", "provision-tart.yml"])
+def test_k3s_install_without_a_k3s_version_binding_is_rejected(filename: str):
+    """DR-0052: the binding has no default. A workflow file that predates it must
+    fail to load here, not install an unpinned k3s."""
+    text = (WORKFLOWS_DIR / filename).read_text()
+    line = next(ln for ln in text.splitlines(keepends=True) if "k3s_version: {from: spec.k3s_version}" in ln)
+    with pytest.raises(ConfigError) as exc_info:
+        load_workflow(text.replace(line, ""), _registry())
+    assert exc_info.value.rule == "V2"
+
+
 def test_provision_digitalocean_tail_never_carries_raw_kubeconfig_per_conflict_9():
     wf = _load(WORKFLOWS_DIR / "provision-digitalocean.yml")
     by_id = {s.id: s for s in wf.steps}

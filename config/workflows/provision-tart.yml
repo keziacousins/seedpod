@@ -102,6 +102,7 @@ steps:
   - id: k3s                           # salvaged SSHBasedK3sInstaller body: CIDR flags,
     uses: k3s.install                 # extra TLS SANs = address. undoable=False (no inverse --
     with: {host: {from: vm.address}, spec: {from: spec.spec}, extra_tls_san: {from: vm.address},
+           k3s_version: {from: spec.k3s_version},   # DR-0052: k3s_config.version -- tart.yml
            acme: {from: spec.acme},          # DR-0036: Optional -- present only when the profile
                                               # enabled BOTH ssl and dns, which is exactly when the
                                               # Ingress templates render the certresolver annotation

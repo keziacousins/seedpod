@@ -529,6 +529,9 @@ class InstallK3s:
     service_cidr: str
     tls_sans: tuple[str, ...]
     ingress: IngressConfig
+    # DR-0052: sent as INSTALL_K3S_VERSION. None ⇒ the installer asks the release
+    # channel server (update.k3s.io) for the stable version.
+    k3s_version: str | None = None
     # Result: K3sInstalled
 
 

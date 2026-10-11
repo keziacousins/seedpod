@@ -253,6 +253,10 @@ class LoadSpecOutput(BaseModel):
     # `k3s.install`, which writes it into the SAME HelmChartConfig the hostport strategy
     # already lays down before k3s starts. None for every profile that did not enable both.
     acme: AcmeConfig | None = None
+    # DR-0052: the k3s release to install, from the provider's own
+    # `config/providers/<provider>.yml` (`k3s_config.version`). Bound into `k3s.install`.
+    # None when that file does not pin one, and for providers with no SSH plane.
+    k3s_version: str | None = None
 
 
 class LoadSpec(Step[LoadSpecParams, LoadSpecOutput]):
@@ -270,6 +274,7 @@ class LoadSpec(Step[LoadSpecParams, LoadSpecOutput]):
         uow: UnitOfWork,
         clusters: ClusterRepository,
         ssh_identities: Mapping[str, SshIdentity],
+        k3s_versions: Mapping[str, str],
     ) -> None:
         """``ssh_identities`` (DR-0023): keyed by provider name, sourced by the
         composition root from each provider's OWN ``config/providers/*.yml``
@@ -280,10 +285,15 @@ class LoadSpec(Step[LoadSpecParams, LoadSpecOutput]):
         keyword is now a boot-time ``TypeError`` instead). A provider absent
         from the mapping (``kind``/``orbstack``, which have no SSH plane)
         resolves to ``SshIdentity()`` -- ``(None, None)`` -- never a fallback
-        identity."""
+        identity.
+
+        ``k3s_versions`` (DR-0052): keyed by provider name, from the same files
+        (``app/factory.py``'s ``_k3s_versions()``). Required for the same reason.
+        A provider absent from the mapping has no pinned version."""
         self._uow = uow
         self._clusters = clusters
         self._ssh_identities = ssh_identities
+        self._k3s_versions = k3s_versions
 
     async def execute(self, params: LoadSpecParams, ctx: StepContext) -> LoadSpecOutput:
         async with self._uow() as tx:
@@ -302,6 +312,7 @@ class LoadSpec(Step[LoadSpecParams, LoadSpecOutput]):
             ssh_private_key_path=identity.private_key_path,
             dns_intent=DnsIntent.from_provider_config(row.provider_config),
             acme=AcmeConfig.from_provider_config(row.provider_config),
+            k3s_version=self._k3s_versions.get(row.provider),
         )
 
 

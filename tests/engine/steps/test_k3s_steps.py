@@ -44,6 +44,7 @@ from __future__ import annotations
 import inspect
 
 import pytest
+from pydantic import ValidationError
 
 from seedpod.core.acme import AcmeConfig
 from seedpod.core.cluster_spec import ClusterConfiguration, ClusterSpecification, NodeSpecification
@@ -84,6 +85,7 @@ _DIGITALOCEAN_USER = "root"
 _DIGITALOCEAN_KEY = "/home/test/.ssh/id_exampleco_testing"
 _TART_USER = "admin"
 _TART_KEY = "/home/test/.ssh/id_ed25519"
+_K3S_VERSION = "v1.36.5+k3s1"  # DR-0052
 
 
 def _spec(*, ingress_strategy: dict | None = None) -> ClusterSpecification:
@@ -377,6 +379,7 @@ def test_install_command_is_pure_and_maps_all_fields(ssh_user, ssh_key):
         known_hosts="10.42.0.11 ssh-ed25519 AAAA\n",
         ssh_user=ssh_user,
         ssh_private_key_path=ssh_key,
+        k3s_version=_K3S_VERSION,
     )
 
     first = step.command(params)
@@ -391,12 +394,37 @@ def test_install_command_is_pure_and_maps_all_fields(ssh_user, ssh_key):
     assert first.pod_cidr == "10.42.9.0/24"
     assert first.service_cidr == "10.43.9.0/24"
     assert first.tls_sans == ("10.42.0.11",)
+    assert first.k3s_version == _K3S_VERSION
+
+
+def test_install_command_carries_an_unpinned_version_as_none():
+    """DR-0052: `None` is a legal value. It reaches the command as `None`, and the
+    provider then sends no INSTALL_K3S_VERSION."""
+    params = InstallK3sParams(
+        host="h", spec=_spec(), extra_tls_san="h", known_hosts="known",
+        ssh_user=_TART_USER, ssh_private_key_path=_TART_KEY, k3s_version=None,
+    )
+
+    assert K3sInstall().command(params).k3s_version is None
+
+
+def test_install_params_have_no_default_for_k3s_version():
+    """DR-0052: a workflow that does not bind `k3s_version` must fail. A default of
+    `None` would install an unpinned k3s and say nothing."""
+    with pytest.raises(ValidationError) as exc_info:
+        InstallK3sParams(
+            host="h", spec=_spec(), extra_tls_san="h", known_hosts="known",
+            ssh_user=_TART_USER, ssh_private_key_path=_TART_KEY,
+        )
+
+    assert [e["loc"] for e in exc_info.value.errors()] == [("k3s_version",)]
 
 
 def test_install_command_raises_loudly_when_identity_is_none():
     step = K3sInstall()
     params = InstallK3sParams(
-        host="h", spec=_spec(), extra_tls_san="h", known_hosts="known", ssh_user=None, ssh_private_key_path=None
+        host="h", spec=_spec(), extra_tls_san="h", known_hosts="known", ssh_user=None, ssh_private_key_path=None,
+        k3s_version=_K3S_VERSION,
     )
 
     with pytest.raises(PermanentError):
@@ -428,6 +456,7 @@ def test_install_translates_ingress_strategy_dict_to_ingress_config(
         known_hosts="known",
         ssh_user=_DIGITALOCEAN_USER,
         ssh_private_key_path=_DIGITALOCEAN_KEY,
+        k3s_version=_K3S_VERSION,
     )
 
     cmd = step.command(params)
@@ -450,6 +479,7 @@ def test_install_raises_loudly_when_spec_missing_cidrs():
         known_hosts="known",
         ssh_user=_DIGITALOCEAN_USER,
         ssh_private_key_path=_DIGITALOCEAN_KEY,
+        k3s_version=_K3S_VERSION,
     )
 
     with pytest.raises(PermanentError):
@@ -476,6 +506,7 @@ async def test_install_execute_consumes_known_hosts_from_trust_host_keys_and_ins
         known_hosts=trust_output.known_hosts,
         ssh_user=_DIGITALOCEAN_USER,
         ssh_private_key_path=_DIGITALOCEAN_KEY,
+        k3s_version=_K3S_VERSION,
     )
 
     assert install_step.command(install_params).known_hosts == trust_output.known_hosts
@@ -500,6 +531,7 @@ async def test_install_rejects_empty_known_hosts_install_before_keys_is_unrepres
         known_hosts="",
         ssh_user=_DIGITALOCEAN_USER,
         ssh_private_key_path=_DIGITALOCEAN_KEY,
+        k3s_version=_K3S_VERSION,
     )
 
     with pytest.raises(PermanentError):
@@ -517,6 +549,7 @@ async def test_install_no_in_step_retry_loop_on_transient_fault():
         known_hosts="known-hosts",
         ssh_user=_DIGITALOCEAN_USER,
         ssh_private_key_path=_DIGITALOCEAN_KEY,
+        k3s_version=_K3S_VERSION,
     )
 
     with pytest.raises(TransientError):
@@ -722,6 +755,7 @@ def _install_params(*, acme, ingress_strategy=None):
         known_hosts="known",
         ssh_user=_DIGITALOCEAN_USER,
         ssh_private_key_path=_DIGITALOCEAN_KEY,
+        k3s_version=_K3S_VERSION,
         acme=acme,
     )
 
