@@ -31,6 +31,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+import yaml
 
 from seedpod.core.environment_config import EnvironmentVariables
 from seedpod.core.errors import PermanentError
@@ -39,6 +40,7 @@ from seedpod.services.manifests import (
     ManifestProfile,
     ManifestResolver,
     ServiceSpec,
+    generated_secret_name,
     normalize_resolved_manifests,
 )
 from tests.services.fake_ghcr import FakeGhcrBackend, FakeGhcrTransport
@@ -72,7 +74,7 @@ async def test_golden_render_over_inline_template_fixture(tmp_path: Path):
     _write_template(
         tmp_path,
         "exampleco-core.yaml",
-        "kind: Deployment\nimage: {{ images.exampleco_core }}\ndb: {{ secrets.db_password }}\nreplicas: {{ config.replicas }}\n",
+        "kind: Deployment\nimage: {{ images.exampleco_core }}\ndb: {{ secrets.db_password | b64encode }}\nreplicas: {{ config.replicas }}\n",
     )
     _write_template(tmp_path, "exampleco-web.yaml", "kind: Deployment\nimage: {{ images.exampleco_web }}\n")
     # not a declared service -> must be skipped entirely, even though it's a .yaml file
@@ -104,7 +106,9 @@ async def test_golden_render_over_inline_template_fixture(tmp_path: Path):
     assert "# Generated from exampleco-core.yaml" in result.rendered_manifests
     assert "# Generated from exampleco-web.yaml" in result.rendered_manifests
     assert "image: ghcr.io/exampleco/exampleco-core:main-abc123" in result.rendered_manifests
-    assert "db: hunter2" in result.rendered_manifests
+    # A secret's value is written as base64 only (DR-0051); bare, it does not render.
+    assert f"db: {base64.b64encode(b'hunter2').decode()}" in result.rendered_manifests
+    assert "hunter2" not in result.rendered_manifests
     assert "replicas: 3" in result.rendered_manifests
     assert "image: ghcr.io/x/exampleco-web:pinned" in result.rendered_manifests
     # rendered_parts = [header1, content1, header2, content2] -> 3 separators
@@ -1031,3 +1035,304 @@ async def test_dns_name_test_still_raises_when_cluster_hostname_is_omitted(tmp_p
 def test_normalize_rejects_other_types():
     with pytest.raises(TypeError):
         normalize_resolved_manifests(123)  # type: ignore[arg-type]
+
+
+# ============================================================================
+# secrets.<name>.ref and the generated Secret of each service (DR-0051)
+# ============================================================================
+
+_REF_KEY = b"tests-services-secret-ref-key"
+
+_API_TEMPLATE = """\
+kind: Deployment
+metadata:
+  name: api
+spec:
+  template:
+    spec:
+      containers:
+        - name: api
+          env:
+            - name: DATABASE_PASSWORD
+              valueFrom: {{ secrets.database_password.ref }}
+            - name: JWT_SECRET
+              valueFrom: {{ secrets.jwt_secret.ref }}
+"""
+
+_DB_TEMPLATE = """\
+kind: Deployment
+metadata:
+  name: db
+spec:
+  template:
+    spec:
+      containers:
+        - name: db
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom: {{ secrets.database_password.ref }}
+"""
+
+_CACHE_TEMPLATE = """\
+kind: Deployment
+metadata:
+  name: cache
+spec:
+  template:
+    spec:
+      containers:
+        - name: cache
+          env:
+            - name: CACHE_PASSWORD
+              valueFrom: {{ secrets.cache_password.ref }}
+"""
+
+_REF_SECRETS = {"database_password": "db-pass", "jwt_secret": "jwt-pass", "cache_password": "cache-pass"}
+
+
+def _ref_profile(manifests_dir: Path, templates: dict[str, str]) -> ManifestProfile:
+    for name, content in templates.items():
+        _write_template(manifests_dir, f"{name}.yaml", content)
+    return ManifestProfile(
+        name="ref-stack",
+        manifests_dir=manifests_dir,
+        services={name: ServiceSpec(repository=name, image_override=f"example/{name}:1") for name in templates},
+    )
+
+
+async def _render_refs(
+    profile: ManifestProfile, secrets: dict, *, key: bytes | None = _REF_KEY, config: dict | None = None
+) -> dict[str, dict]:
+    """Render and return the documents by ``metadata.name``."""
+    result = await ManifestResolver(ghcr_service=None, secret_ref_key=key).resolve(
+        profile, triggering_repo="__none__", triggering_branch="main", triggering_image="unused:unused",
+        secrets=secrets, config=config or {},
+    )
+    return _docs_by_name(result.rendered_manifests)
+
+
+def _docs_by_name(rendered: str) -> dict[str, dict]:
+    # A `# Generated from ...` header is a document of its own, and parses to None.
+    return {doc["metadata"]["name"]: doc for doc in yaml.safe_load_all(rendered) if doc is not None}
+
+
+def _env(doc: dict) -> dict[str, dict]:
+    return {entry["name"]: entry for entry in doc["spec"]["template"]["spec"]["containers"][0]["env"]}
+
+
+async def test_secret_ref_renders_a_secret_key_ref_and_the_generated_secret_holds_the_value(tmp_path: Path):
+    profile = _ref_profile(tmp_path, {"api": _API_TEMPLATE})
+    result = await ManifestResolver(ghcr_service=None, secret_ref_key=_REF_KEY).resolve(
+        profile, triggering_repo="__none__", triggering_branch="main", triggering_image="unused:unused",
+        secrets=_REF_SECRETS, config={"environment": "ephemeral", "cluster_id": "c-1"},
+    )
+    docs = _docs_by_name(result.rendered_manifests)
+
+    # The value is nowhere in the rendered text: not in the pod spec, and base64 in the Secret.
+    assert "db-pass" not in result.rendered_manifests
+    assert "jwt-pass" not in result.rendered_manifests
+    # The generated Secret came from no template file, and is written in front of
+    # the documents of the template it serves.
+    assert result.template_files == ("api.yaml",)
+    assert list(docs) == ["api-secrets", "api"]
+
+    env = _env(docs["api"])
+    assert "value" not in env["DATABASE_PASSWORD"]
+    ref = env["DATABASE_PASSWORD"]["valueFrom"]["secretKeyRef"]
+    assert ref["name"] == generated_secret_name("api") == "api-secrets"
+    assert ref["key"].startswith("database_password-")
+
+    secret = docs["api-secrets"]
+    assert secret["kind"] == "Secret"
+    assert secret["type"] == "Opaque"
+    assert "stringData" not in secret  # backlog #14 -- see `_b64encode`
+    assert base64.b64decode(secret["data"][ref["key"]]).decode() == "db-pass"
+    assert secret["metadata"]["labels"] == {
+        "app": "api", "app.kubernetes.io/managed-by": "seedpod", "environment": "ephemeral", "cluster-id": "c-1",
+    }
+    # Only what a template asked for: `cache_password` was resolved but never referenced.
+    assert sorted(key.rsplit("-", 1)[0] for key in secret["data"]) == ["database_password", "jwt_secret"]
+
+
+async def test_template_without_a_ref_gets_no_generated_secret(tmp_path: Path):
+    """A template that asks for no key gets no Secret, and needs no ``secret_ref_key``:
+    the tailscale template writes its own Secret with ``| b64encode``."""
+    template = "kind: Secret\nmetadata:\n  name: own\ndata:\n  KEY: {{ secrets.database_password | b64encode }}\n"
+    profile = _ref_profile(tmp_path, {"api": template})
+    docs = await _render_refs(profile, _REF_SECRETS, key=None)
+    assert list(docs) == ["own"]
+    assert base64.b64decode(docs["own"]["data"]["KEY"]).decode() == "db-pass"
+
+
+async def test_bare_secret_raises_naming_the_template_and_the_secret_and_not_the_value(tmp_path: Path):
+    """The hard cut (DR-0051 decision 4): v1's ``value: "{{ secrets.x }}"`` is an error."""
+    template = 'kind: Deployment\nmetadata:\n  name: api\nvalue: "{{ secrets.database_password }}"\n'
+    profile = _ref_profile(tmp_path, {"api": template})
+    with pytest.raises(PermanentError) as excinfo:
+        await _render_refs(profile, _REF_SECRETS)
+
+    message = str(excinfo.value)
+    assert "api.yaml" in message
+    assert "secrets.database_password" in message
+    assert "secrets.database_password.ref" in message  # says what to write
+    assert "db-pass" not in message
+    assert "db-pass" not in repr(excinfo.value.__dict__)
+    # Nothing chained either: a traceback must not be a way to read the value.
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__suppress_context__
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "secrets.database_password",
+        "secrets.database_password ~ ''",
+        "'' ~ secrets.database_password",
+        "secrets.database_password + ''",
+        "secrets.database_password[0:7]",
+        "secrets.database_password | string",
+        "secrets.database_password | trim",
+        "secrets.database_password | upper | lower",
+        "secrets.database_password | replace('x', 'y')",
+        "secrets.database_password | default('none')",
+        "secrets.database_password | e",
+        "secrets.database_password | safe",
+        "secrets.database_password | urlencode",
+        "secrets.database_password | tojson",
+        "secrets.database_password | pprint",
+        "secrets.database_password | list | join",
+        "[secrets.database_password] | join",
+        "'%s' | format(secrets.database_password)",
+        "secrets",
+        "secrets.values() | list",
+        "secrets | tojson",
+    ],
+)
+async def test_no_template_expression_renders_a_secret_value(tmp_path: Path, expression: str):
+    """A secret is not a string to a template, so there is no string operation that
+    gives the value back. Each expression must fail, or render without the value."""
+    template = f"kind: Deployment\nmetadata:\n  name: api\nvalue: {{{{ {expression} }}}}\n"
+    profile = _ref_profile(tmp_path, {"api": template})
+    resolver = ManifestResolver(ghcr_service=None, secret_ref_key=_REF_KEY)
+    try:
+        result = await resolver.resolve(
+            profile, triggering_repo="__none__", triggering_branch="main", triggering_image="unused:unused",
+            secrets=_REF_SECRETS, config={},
+        )
+    except (PermanentError, TypeError) as exc:
+        assert "db-pass" not in str(exc)
+    else:
+        assert "db-pass" not in result.rendered_manifests
+
+
+async def test_secret_truthiness_still_works_for_an_optional_secret(tmp_path: Path):
+    template = (
+        "kind: Deployment\nmetadata:\n  name: api\n"
+        "set: {{ 'present' if secrets.database_password else 'absent' }}\n"
+        "empty: {{ 'present' if secrets.unset else 'absent' }}\n"
+    )
+    docs = await _render_refs(_ref_profile(tmp_path, {"api": template}), {"database_password": "db-pass", "unset": ""})
+    assert (docs["api"]["set"], docs["api"]["empty"]) == ("present", "absent")
+
+
+async def test_secret_ref_on_a_value_that_is_not_a_string_raises(tmp_path: Path):
+    profile = _ref_profile(tmp_path, {"api": _API_TEMPLATE})
+    with pytest.raises(PermanentError, match=r"secrets\.jwt_secret\.ref needs a string"):
+        await _render_refs(profile, {"database_password": "db-pass", "jwt_secret": 12345})
+
+
+async def test_changed_secret_changes_only_the_workloads_that_refer_to_it(tmp_path: Path):
+    """Why the key carries a suffix. With a fixed key, a rotated secret changes the
+    Secret and no pod template, so nothing rolls and the pods keep the old value."""
+    profile = _ref_profile(tmp_path, {"api": _API_TEMPLATE, "db": _DB_TEMPLATE, "cache": _CACHE_TEMPLATE})
+    before = await _render_refs(profile, _REF_SECRETS)
+    after = await _render_refs(profile, {**_REF_SECRETS, "database_password": "db-pass-rotated"})
+
+    assert after["api"] != before["api"]
+    assert after["db"] != before["db"]
+    assert after["cache"] == before["cache"]
+    # Within a workload, only the rotated secret's ref moves.
+    assert _env(after["api"])["JWT_SECRET"] == _env(before["api"])["JWT_SECRET"]
+    assert _env(after["api"])["DATABASE_PASSWORD"] != _env(before["api"])["DATABASE_PASSWORD"]
+
+
+async def test_each_service_gets_a_secret_of_its_own_with_only_its_own_keys(tmp_path: Path):
+    profile = _ref_profile(tmp_path, {"api": _API_TEMPLATE, "db": _DB_TEMPLATE})
+    docs = await _render_refs(profile, _REF_SECRETS)
+
+    api_ref = _env(docs["api"])["DATABASE_PASSWORD"]["valueFrom"]["secretKeyRef"]
+    db_ref = _env(docs["db"])["POSTGRES_PASSWORD"]["valueFrom"]["secretKeyRef"]
+    assert (api_ref["name"], db_ref["name"]) == ("api-secrets", "db-secrets")
+    # One secret, one key name, in whichever Secret holds it.
+    assert api_ref["key"] == db_ref["key"]
+
+    def names(secret: dict) -> list[str]:
+        return sorted(key.rsplit("-", 1)[0] for key in secret["data"])
+
+    assert names(docs["api-secrets"]) == ["database_password", "jwt_secret"]
+    assert names(docs["db-secrets"]) == ["database_password"]
+
+
+async def test_a_service_secret_does_not_depend_on_the_other_services_in_the_render(tmp_path: Path):
+    """Why there is one Secret for each service. Applying a Secret removes the keys
+    that the render did not ask for, and nothing else in a deployment removes
+    anything. So what a service's Secret holds must not change when another service
+    joins or leaves the profile -- or the workload that was left out, which keeps
+    running, loses its keys."""
+    alone = await _render_refs(_ref_profile(tmp_path / "alone", {"api": _API_TEMPLATE}), _REF_SECRETS)
+    together = await _render_refs(
+        _ref_profile(tmp_path / "together", {"api": _API_TEMPLATE, "db": _DB_TEMPLATE, "cache": _CACHE_TEMPLATE}),
+        _REF_SECRETS,
+    )
+    assert together["api-secrets"] == alone["api-secrets"]
+    assert together["api"] == alone["api"]
+
+
+async def test_secret_ref_keys_are_stable_across_renders_and_between_resolve_and_render_only(tmp_path: Path):
+    """``resolve`` (decision time) and ``render_only`` (deploy time) must agree, or the
+    deploy would apply different keys from the ones the audit recorded."""
+    profile = _ref_profile(tmp_path, {"api": _API_TEMPLATE})
+    resolver = ManifestResolver(ghcr_service=None, secret_ref_key=_REF_KEY)
+    resolved = await resolver.resolve(
+        profile, triggering_repo="__none__", triggering_branch="main", triggering_image="unused:unused",
+        secrets=_REF_SECRETS, config={},
+    )
+    _files, rendered_again = resolver.render_only(
+        profile, resolved_image_urls={"api": "example/api:1"}, resolved_secrets=_REF_SECRETS, resolved_config={},
+    )
+    assert rendered_again == resolved.rendered_manifests
+
+
+async def test_secret_ref_suffix_does_not_reveal_the_value(tmp_path: Path):
+    """The suffix is in every pod spec. It must not be checkable against a guess
+    without the key, and two secrets with one value must not look alike."""
+    profile = _ref_profile(tmp_path, {"api": _API_TEMPLATE})
+    same_value = {"database_password": "shared", "jwt_secret": "shared", "cache_password": "x"}
+
+    def suffixes(docs: dict[str, dict]) -> dict[str, str]:
+        return dict(key.rsplit("-", 1) for key in docs["api-secrets"]["data"])
+
+    under_key = suffixes(await _render_refs(profile, same_value))
+    under_other_key = suffixes(await _render_refs(profile, same_value, key=b"another-key"))
+
+    assert under_key["database_password"] != under_key["jwt_secret"]
+    assert under_key["database_password"] != under_other_key["database_password"]
+
+
+async def test_secret_ref_without_a_key_raises(tmp_path: Path):
+    profile = _ref_profile(tmp_path, {"api": _API_TEMPLATE})
+    with pytest.raises(PermanentError, match="secret_ref_key"):
+        await _render_refs(profile, _REF_SECRETS, key=None)
+
+
+async def test_secret_ref_to_a_missing_secret_raises_naming_the_template(tmp_path: Path):
+    profile = _ref_profile(tmp_path, {"api": _API_TEMPLATE})
+    with pytest.raises(PermanentError, match=r"api\.yaml.*jwt_secret"):
+        await _render_refs(profile, {"database_password": "db-pass"})
+
+
+async def test_secret_ref_with_a_name_kubernetes_cannot_use_as_a_key_raises(tmp_path: Path):
+    template = "kind: Deployment\nmetadata:\n  name: api\nref: {{ secrets['odd name'].ref }}\n"
+    profile = _ref_profile(tmp_path, {"api": template})
+    with pytest.raises(PermanentError, match="odd name"):
+        await _render_refs(profile, {"odd name": "value"})

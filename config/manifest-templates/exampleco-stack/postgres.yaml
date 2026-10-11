@@ -29,7 +29,7 @@ spec:
             - name: POSTGRES_USER
               value: "exampleco"
             - name: POSTGRES_PASSWORD
-              value: "{{ secrets.database_password }}"
+              valueFrom: {{ secrets.database_password.ref }}
             - name: PGDATA
               value: "/var/lib/postgresql/data/pgdata"
           volumeMounts:

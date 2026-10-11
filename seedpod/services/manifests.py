@@ -233,13 +233,26 @@ unreachable ... now raises"). ``GhcrService.find_image`` already returns ``None`
 genuine absence and raises a typed ``ProviderError`` only for real failures (its own
 module docstring); this resolver lets those raises propagate instead of swallowing
 them into a ``RegistryQuery(found=False)``.
+
+**Secrets by reference (DR-0051) -- not salvaged, and a deliberate difference from v1.**
+v1 rendered every secret into the pod spec as an env ``value``, where anyone who can
+read a pod reads it. A template now writes ``valueFrom: {{ secrets.<name>.ref }}``
+(``_SecretValue``), and ``_render_templates`` writes one generated ``Secret`` for
+each template that asked for a key (``generated_secret_name``, ``_SecretRefs``,
+``_render_generated_secret``), holding the keys that template asked for. A bare
+``{{ secrets.<name> }}`` is an ERROR that names the template and the secret
+(``_PlainSecretError``); ``| b64encode`` is the one way to write a value, for the
+``data`` of a Secret that a template writes itself.
 """
 
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import ipaddress
 import json
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -260,6 +273,7 @@ __all__ = [
     "ResolvedManifest",
     "ManifestResolver",
     "normalize_resolved_manifests",
+    "generated_secret_name",
 ]
 
 
@@ -409,6 +423,184 @@ _INFRASTRUCTURE_TEMPLATES: Mapping[str, Callable[[Mapping[str, Any]], bool]] = {
 }
 
 
+def generated_secret_name(service: str) -> str:
+    """The name of the Secret this resolver writes for one service's template
+    (DR-0051): ``exampleco-api`` -> ``exampleco-api-secrets``.
+
+    **One Secret for each service, not one for the cluster.** A Secret is the only
+    document this resolver writes whose apply REMOVES something: a key that the
+    current render does not ask for is deleted from it. Every other document is
+    additive -- nothing in the deploy path prunes -- so a workload that the current
+    render no longer mentions (its service left the profile, or another profile was
+    deployed to the same cluster) keeps running. With one shared Secret such a
+    workload would lose its keys and fail at its next pod restart. With a Secret of
+    its own, it is not touched, exactly as its Deployment is not.
+
+    The name starts with the service name on purpose: ``deploy.plan_waves``'s
+    ``_service_for`` matches a document to a service by name PREFIX, so the Secret
+    goes into the same wave as the workload that refers to it."""
+    return f"{service}-secrets"
+
+
+# What the API server accepts as a Secret ``data`` key. A name reached with
+# ``secrets.<name>`` is already a Jinja identifier and always passes; this guards the
+# subscript form (``secrets['odd name'].ref``), so that a bad key fails here, at
+# render time with the key named, and not later as a kubectl validation error.
+_SECRET_DATA_KEY = re.compile(r"[-._a-zA-Z0-9]+")
+_SECRET_REF_SUFFIX_HEX_CHARS = 8
+
+
+class _SecretRefs:
+    """The keys ONE template asked for through ``secrets.<name>.ref``, and the
+    ``data`` of the Secret that will be written for it (DR-0051). Built for each
+    template in each ``_render_templates`` call and dropped with it: the resolver
+    itself stays stateless.
+
+    **Why the key carries a suffix.** A ``secretKeyRef`` takes the secret value out of
+    the pod template, and with it the only thing that made a rotated secret roll its
+    workloads: with a fixed key, a changed value reports the Secret ``configured`` and
+    every Deployment ``unchanged``, so ``ApplyChangeSummary.all_unchanged`` is false,
+    ``deploy.ensure_rollouts`` forces no restart, kubectl triggers none, and the pods
+    keep the old value. Deriving the key from the value puts the change back into the
+    pod template -- of exactly the workloads that refer to that secret, and no others,
+    which is the behaviour inline values had.
+
+    **Why an HMAC and not a hash.** The suffix is readable by anyone who can read a pod
+    spec, which is the audience this change exists to keep the value from. A plain
+    digest would let that reader confirm a guessed password offline. The key name is
+    part of the message so that two secrets with the same value do not show the same
+    suffix.
+    """
+
+    def __init__(self, suffix_key: bytes | None, *, secret_name: str) -> None:
+        self._suffix_key = suffix_key
+        self.secret_name = secret_name
+        self.data: dict[str, str] = {}
+
+    def ref_for(self, key_name: str, value: str) -> str:
+        if self._suffix_key is None:
+            raise PermanentError(
+                f"manifests.resolve: a template refers to secrets.{key_name}.ref, but this "
+                "ManifestResolver was built without a secret_ref_key",
+                code=ErrorCode.INVALID_INPUT,
+                provider="manifests",
+                command="resolve",
+                detail={"secret": key_name},
+            )
+        if not _SECRET_DATA_KEY.fullmatch(key_name):
+            raise PermanentError(
+                f"manifests.resolve: secret name {key_name!r} cannot be a Kubernetes Secret key "
+                "(letters, digits, '-', '_' and '.' only)",
+                code=ErrorCode.INVALID_INPUT,
+                provider="manifests",
+                command="resolve",
+                detail={"secret": key_name},
+            )
+        digest = hmac.new(self._suffix_key, f"{key_name}\x00{value}".encode(), hashlib.sha256).hexdigest()
+        data_key = f"{key_name}-{digest[:_SECRET_REF_SUFFIX_HEX_CHARS]}"
+        self.data[data_key] = value
+        # JSON is a YAML flow mapping: one line, so the template has no indentation
+        # to get right -- `valueFrom: {{ secrets.database_password.ref }}`.
+        return json.dumps({"secretKeyRef": {"name": self.secret_name, "key": data_key}})
+
+
+class _PlainSecretError(Exception):
+    """A template tried to render a secret's value. Raised by ``_SecretValue.__str__``
+    and turned into the taxonomy's ``PermanentError`` by ``_render_template_or_raise``,
+    which is where the template's name is known. Carries the secret's NAME only."""
+
+    def __init__(self, key_name: str) -> None:
+        super().__init__(key_name)
+        self.key_name = key_name
+
+
+# Values that are ALREADY the base64 text of a Secret's ``data`` field when they reach
+# a template, so the template writes them as they are and ``| b64encode`` would be
+# wrong. One exists: ``_add_ghcr_auth_if_needed`` builds ``ghcr_dockerconfig_json``
+# in exactly that form (``_build_ghcr_dockerconfig_json``), for ``ghcr-secret.yaml``
+# and nothing else. These reach the template as plain strings, not ``_SecretValue``.
+_PRE_ENCODED_SECRETS = frozenset({"ghcr_dockerconfig_json"})
+
+
+class _SecretValue:
+    """A resolved secret as a template sees it (DR-0051). It is NOT a string, and a
+    template cannot render it: ``{{ secrets.x }}`` raises, naming the template and the
+    secret. A secret reaches a cluster in two ways only:
+
+    - ``{{ secrets.x.ref }}`` -- a ``secretKeyRef`` to this value's key in the Secret
+      generated for the template being rendered. For a pod's ``env``.
+    - ``{{ secrets.x | b64encode }}`` -- the value, as base64. For the ``data`` of a
+      Secret that a template writes itself.
+
+    Deliberately not a ``str`` subclass. A subclass could refuse ``str()``, but every
+    string method on it (``+``, slicing, ``| trim``, ``| replace``) would still return
+    the value as a plain ``str``, which then renders. An object that has no string
+    behaviour at all has no such way out: an operation on it either goes through
+    ``__str__`` and raises here, or is not defined for it.
+
+    ``{% if secrets.x %}`` keeps working (``__bool__``), so a template can still test
+    whether an optional secret is set.
+
+    This stops a template that renders a value by accident or by habit. It does not
+    stop one that reaches for ``secrets.x._value`` on purpose: the manifest
+    ``Environment`` is not sandboxed, and a template is trusted configuration."""
+
+    __slots__ = ("_value", "_key_name", "_refs")
+
+    def __init__(self, value: Any, key_name: str, refs: _SecretRefs) -> None:
+        self._value = value
+        self._key_name = key_name
+        self._refs = refs
+
+    @property
+    def ref(self) -> str:
+        if not isinstance(self._value, str):
+            raise PermanentError(
+                f"manifests.resolve: secrets.{self._key_name}.ref needs a string value, "
+                f"got {type(self._value).__name__}",
+                code=ErrorCode.INVALID_INPUT,
+                provider="manifests",
+                command="resolve",
+                detail={"secret": self._key_name},
+            )
+        return self._refs.ref_for(self._key_name, self._value)
+
+    def __bool__(self) -> bool:
+        return bool(self._value)
+
+    def __str__(self) -> str:
+        raise _PlainSecretError(self._key_name)
+
+    def __repr__(self) -> str:
+        return f"<secret {self._key_name}>"
+
+
+def _render_generated_secret(refs: _SecretRefs, service: str, resolved_config: Mapping[str, Any]) -> str:
+    """One service's generated Secret document (DR-0051). ``data`` (base64), never
+    ``stringData`` -- ``_b64encode``'s own docstring has the reason, and it applies to
+    this document exactly as it does to a hand-written one. Keys are sorted so that
+    the same secrets always render the same text, whatever order the template asked in.
+
+    ``app`` is the service, as on the service's own resources. ``environment``/
+    ``cluster-id`` match what every shipped template puts on its resources, copied by
+    PRESENCE (the module docstring's silent-empty decision): absent from
+    ``resolved_config`` means no label, never an empty one."""
+    data = refs.data
+    labels = {"app": service, "app.kubernetes.io/managed-by": "seedpod"}
+    if "environment" in resolved_config:
+        labels["environment"] = str(resolved_config["environment"])
+    if "cluster_id" in resolved_config:
+        labels["cluster-id"] = str(resolved_config["cluster_id"])
+    document = {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {"name": refs.secret_name, "labels": labels},
+        "type": "Opaque",
+        "data": {key: _b64encode(data[key]) for key in sorted(data)},
+    }
+    return yaml.safe_dump(document, sort_keys=False)
+
+
 def _b64encode(value: Any) -> str:
     """The ``| b64encode`` template filter — lets a manifest write a Secret's ``data:``
     (base64, the field Kubernetes actually stores) instead of ``stringData:``.
@@ -428,7 +620,13 @@ def _b64encode(value: Any) -> str:
     ``str(value)`` rather than requiring ``str``: a template may hand this an int or a
     ``SecretStr``-rendered value, and silently base64-ing the repr of the wrong type is
     worse than the obvious coercion. UTF-8 is the only encoding Kubernetes accepts here.
+
+    This filter is also the ONE place that reads a ``_SecretValue``'s value into
+    rendered text (DR-0051): ``{{ secrets.x | b64encode }}`` is how a template writes a
+    secret into a Secret's ``data``, and ``str()`` on the wrapper raises by design.
     """
+    if isinstance(value, _SecretValue):
+        value = value._value
     return base64.b64encode(str(value).encode("utf-8")).decode("ascii")
 
 
@@ -502,6 +700,20 @@ def _render_template_or_raise(template: Template, template_name: str, template_v
             command="resolve",
             detail={"template": template_name},
         ) from exc
+    except _PlainSecretError as exc:
+        # DR-0051: a secret's value never goes into rendered text as it is. `from
+        # None`, not `from exc`: nothing in the chain holds the value, and this
+        # message is the whole of what an operator needs.
+        name = exc.key_name
+        raise PermanentError(
+            f"manifests.resolve: template {template_name!r} renders secrets.{name} as plain text. "
+            f"For a pod env var write `valueFrom: {{{{ secrets.{name}.ref }}}}`; for the data of a "
+            f"Secret write `{{{{ secrets.{name} | b64encode }}}}` (DR-0051)",
+            code=ErrorCode.INVALID_INPUT,
+            provider="manifests",
+            command="resolve",
+            detail={"template": template_name, "secret": name},
+        ) from None
 
 
 def normalize_resolved_manifests(value: str | Mapping[str, Any] | None) -> str:
@@ -530,12 +742,21 @@ def normalize_resolved_manifests(value: str | Mapping[str, Any] | None) -> str:
 
 
 class ManifestResolver:
-    """Stateless (construction takes only the injected ``GhcrService``, no DB, no
-    file-loading — module docstring). One bounded GHCR lookup per branch tried; no
-    internal retry (the engine's ``Schedule``, or a future caller, owns that)."""
+    """Stateless (construction takes only the injected ``GhcrService`` and the
+    secret-ref key, no DB, no file-loading — module docstring). One bounded GHCR
+    lookup per branch tried; no internal retry (the engine's ``Schedule``, or a future
+    caller, owns that).
 
-    def __init__(self, ghcr_service: GhcrService | None) -> None:
+    ``secret_ref_key`` (DR-0051) keys the suffix on every generated-Secret key --
+    ``_SecretRefs``. It must be the SAME bytes for every render of a deployment:
+    ``resolve`` at decision time and ``render_only`` at deploy time have to produce the
+    same keys, and a key that changes between two deploys rolls every workload that
+    refers to a secret. Optional only so that a caller whose templates never use
+    ``.ref`` need not invent one; a template that does use ``.ref`` without it raises."""
+
+    def __init__(self, ghcr_service: GhcrService | None, *, secret_ref_key: bytes | None = None) -> None:
         self.ghcr_service = ghcr_service
+        self._secret_ref_key = secret_ref_key
 
     async def resolve(
         self,
@@ -1070,7 +1291,6 @@ class ManifestResolver:
         dns_enabled = bool(resolved_config.get("dns_enabled", False))
         template_vars = {
             "images": images_dict,
-            "secrets": dict(resolved_secrets),
             "config": dict(resolved_config),
             "environment_variables": environment_variables,
             "ssl_enabled": ssl_enabled,
@@ -1084,15 +1304,34 @@ class ManifestResolver:
         template_files: list[str] = []
         rendered_parts: list[str] = []
 
+        def render(template_name: str) -> None:
+            """One template, with a ``secrets`` of its own (DR-0051): each value is
+            bound to THIS template's ``_SecretRefs``, so a ``.ref`` in it refers to,
+            and fills, the Secret generated for this template and no other. That
+            Secret goes in FRONT of the template's own documents, so that an apply
+            in document order creates it before the workload that refers to it. It
+            is not added to ``template_files``: no template file produced it."""
+            service = Path(template_name).stem
+            refs = _SecretRefs(self._secret_ref_key, secret_name=generated_secret_name(service))
+            secrets = {
+                name: value if name in _PRE_ENCODED_SECRETS else _SecretValue(value, name, refs)
+                for name, value in resolved_secrets.items()
+            }
+            template = jinja_env.get_template(template_name)
+            rendered = _render_template_or_raise(template, template_name, {**template_vars, "secrets": secrets})
+            if not rendered.strip():
+                return
+            if refs.data:
+                rendered_parts.append(f"# Generated by seedpod ({refs.secret_name})")
+                rendered_parts.append(_render_generated_secret(refs, service, resolved_config))
+            template_files.append(template_name)
+            rendered_parts.append(f"# Generated from {template_name}")
+            rendered_parts.append(rendered)
+
         for template_file in sorted(profile.manifests_dir.glob("*.yaml")):
             if template_file.stem not in service_names_set:
                 continue
-            template = jinja_env.get_template(template_file.name)
-            rendered = _render_template_or_raise(template, template_file.name, template_vars)
-            if rendered.strip():
-                template_files.append(template_file.name)
-                rendered_parts.append(f"# Generated from {template_file.name}")
-                rendered_parts.append(rendered)
+            render(template_file.name)
 
         # Infra-template pass (Round 9, the org-and-ghcr component): salvaged
         # from v1's OWN second loop over ``self.infrastructure_templates``
@@ -1141,11 +1380,6 @@ class ManifestResolver:
             template_path = profile.manifests_dir / infra_template
             if not template_path.exists() or not condition(resolved_secrets):
                 continue
-            template = jinja_env.get_template(infra_template)
-            rendered = _render_template_or_raise(template, infra_template, template_vars)
-            if rendered.strip():
-                template_files.append(infra_template)
-                rendered_parts.append(f"# Generated from {infra_template}")
-                rendered_parts.append(rendered)
+            render(infra_template)
 
         return tuple(template_files), "\n---\n".join(rendered_parts)

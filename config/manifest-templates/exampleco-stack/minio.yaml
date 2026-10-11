@@ -28,15 +28,16 @@ spec:
             - containerPort: 9001
               name: console
           env:
+            # Secrets, by reference, before the profile's variables (see
+            # exampleco-api.yaml for why the order matters).
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom: {{ secrets.minio_root_password.ref }}
+
             # Environment variables from deployment profile
             {% for key, value in environment_variables.get('minio', {}).items() %}
             - name: {{ key }}
               value: "{{ value }}"
             {% endfor %}
-            # Secrets
-
-            - name: MINIO_ROOT_PASSWORD
-              value: "{{ secrets.minio_root_password }}"
 
           livenessProbe:
             tcpSocket:

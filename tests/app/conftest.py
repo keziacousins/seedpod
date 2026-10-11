@@ -112,7 +112,9 @@ def api_keys_repo() -> ApiKeyRepository:
 
 @pytest.fixture
 def manifest_resolver() -> ManifestResolver:
-    return ManifestResolver(ghcr_service=None)
+    # A fixed key, as the composition root always supplies one (DR-0051): the shipped
+    # stack templates use `secrets.<name>.ref` and cannot render without it.
+    return ManifestResolver(ghcr_service=None, secret_ref_key=b"tests-app-secret-ref-key")
 
 
 @pytest.fixture

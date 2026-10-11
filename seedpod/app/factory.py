@@ -192,7 +192,7 @@ from seedpod.runtime.subprocess_manager import (
     TrackedSubprocessRunner,
 )
 from seedpod.runtime.timers import TimerService
-from seedpod.services.crypto import CryptoService, SecretManager
+from seedpod.services.crypto import CryptoService, SecretManager, derive_key
 from seedpod.services.dns import DnsConfig, DnsService
 from seedpod.services.ghcr import GhcrConfig, GhcrService
 from seedpod.services.manifests import ManifestResolver
@@ -312,7 +312,15 @@ def build_app(
         ghcr_service = GhcrService(
             GhcrConfig(token=config.github_token, organization=_resolve_github_organization(config)), transport
         )
-    manifest_resolver = ManifestResolver(ghcr_service=ghcr_service)
+    # `secret_ref_key` (DR-0051): derived, not configured -- there is no new setting,
+    # and it is the same bytes on every start. From the DEV key because that is the
+    # one key every installation has (`prod_key` is optional). The cost, accepted in
+    # DR-0051: a holder of the DEV key who can also read production pod specs could
+    # test a guess at a production secret against its suffix.
+    manifest_resolver = ManifestResolver(
+        ghcr_service=ghcr_service,
+        secret_ref_key=derive_key(config.secret_key_dev, "manifests/secret-ref-suffix/v1"),
+    )
 
     dns: DnsService | None = None
     if config.cloudflare_api_token:

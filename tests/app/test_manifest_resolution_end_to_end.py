@@ -29,6 +29,7 @@ from __future__ import annotations
 import base64
 import dataclasses
 import json
+import re
 from pathlib import Path
 
 import httpx
@@ -37,12 +38,16 @@ import yaml
 
 from seedpod.app.services.deployment_service import _build_resolved_config
 from seedpod.app.services.profiles import load_deployment_profile
+from seedpod.app.services.secret_requirements import required_secrets
+from seedpod.core.deploy_wave import parse_manifest_documents
 from seedpod.core.errors import PermanentError
+from seedpod.engine.steps.deploy import _wave_index_for
 from seedpod.services.ghcr import GhcrConfig, GhcrService
-from seedpod.services.manifests import ManifestResolver
+from seedpod.services.manifests import ManifestResolver, generated_secret_name
 from tests.services.fake_ghcr import FakeGhcrBackend, FakeGhcrTransport
 
 _REPO_CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
+_SECRET_REF_KEY = b"tests-app-secret-ref-key"
 
 # asyncio_mode = "auto" (pyproject.toml) picks up every `async def test_*` here
 # without an explicit marker.
@@ -95,7 +100,7 @@ async def test_exampleco_web_2_end_to_end_render_pins_2026_08_03_smoke_environme
     assert resolved_config["cluster_id"] == cluster_id
     assert resolved_config["environment"] == "ephemeral"
 
-    resolver = ManifestResolver(ghcr_service=None)
+    resolver = ManifestResolver(ghcr_service=None, secret_ref_key=_SECRET_REF_KEY)
 
     # SUCCEEDS where the 2026-08-03 smoke's real deployments came back
     # 'manifest resolution failed: 'environment_variables' is undefined'.
@@ -126,11 +131,13 @@ async def test_exampleco_web_2_end_to_end_render_pins_2026_08_03_smoke_environme
 
     docs = [d for d in yaml.safe_load_all(result.rendered_manifests) if d is not None]
     kinds = [d["kind"] for d in docs]
-    # exampleco-web-2.yaml -> 3 docs (Deployment/Service/Ingress), tailscale.yaml -> 5
-    # docs (ServiceAccount/Role/RoleBinding/Secret/DaemonSet) -- DIAGNOSIS, PROVEN.
+    # exampleco-web-2.yaml -> 3 docs (Deployment/Service/Ingress), tailscale.yaml -> 4
+    # docs (ServiceAccount/Role/RoleBinding/DaemonSet) -- DIAGNOSIS, PROVEN. The
+    # Secret is the one seedpod generates for tailscale.yaml (DR-0051), written in
+    # front of that template's own documents.
     assert kinds == [
         "Deployment", "Service", "Ingress",
-        "ServiceAccount", "Role", "RoleBinding", "Secret", "DaemonSet",
+        "Secret", "ServiceAccount", "Role", "RoleBinding", "DaemonSet",
     ]
 
     deployment = next(d for d in docs if d["kind"] == "Deployment")
@@ -146,8 +153,13 @@ async def test_exampleco_web_2_end_to_end_render_pins_2026_08_03_smoke_environme
     assert env["APP_NAME"] == "exampleco-web-2"
     assert env["SERVICE_PORT"] == "8000"
 
-    # Deliverable 2's silent-empty close: the tailscale-auth Secret ships the REAL
-    # secret value, never an empty string (the DIAGNOSIS's own silent-empty case).
+    # Deliverable 2's silent-empty close: the Secret ships the REAL secret value,
+    # never an empty string (the DIAGNOSIS's own silent-empty case).
+    #
+    # DR-0051: the template no longer writes that Secret. It asks for
+    # `secrets.tailscale_auth_key.ref`, and the resolver writes `tailscale-secrets`.
+    # The DaemonSet refers to the key by name; the value is in neither the pod spec
+    # nor, as plain text, anywhere in the render.
     #
     # Backlog #14: the field is `data` (base64) and NOT `stringData`. stringData is
     # write-only -- the API server converts it to `data` and never echoes it back -- so
@@ -156,10 +168,15 @@ async def test_exampleco_web_2_end_to_end_render_pins_2026_08_03_smoke_environme
     # deploy.ensure_rollouts' restart rule for the whole wave. Decoding here rather
     # than comparing the base64 blob keeps this assertion about the SECRET VALUE (the
     # silent-empty close it was written for) rather than about the encoding.
-    secret_doc = next(d for d in docs if d["kind"] == "Secret" and d["metadata"]["name"] == "tailscale-auth")
+    daemonset = next(d for d in docs if d["kind"] == "DaemonSet")
+    ts_env = {e["name"]: e for e in daemonset["spec"]["template"]["spec"]["containers"][0]["env"]}
+    ref = ts_env["TS_AUTHKEY"]["valueFrom"]["secretKeyRef"]
+    assert ref["name"] == "tailscale-secrets"
+    secret_doc = next(d for d in docs if d["kind"] == "Secret" and d["metadata"]["name"] == "tailscale-secrets")
     assert "stringData" not in secret_doc, "stringData never round-trips through kubectl apply (#14)"
-    decoded = base64.b64decode(secret_doc["data"]["TS_AUTHKEY"]).decode()
+    decoded = base64.b64decode(secret_doc["data"][ref["key"]]).decode()
     assert decoded == "tskey-test-not-a-real-key"  # pragma: allowlist secret
+    assert "tskey-test-not-a-real-key" not in result.rendered_manifests  # pragma: allowlist secret
 
 
 async def test_exampleco_web_2_end_to_end_render_with_ghcr_token_includes_rendered_ghcr_secret():
@@ -196,7 +213,7 @@ async def test_exampleco_web_2_end_to_end_render_with_ghcr_token_includes_render
     backend = FakeGhcrBackend()  # deliberately empty -- must never be queried (see docstring)
     transport = httpx.AsyncClient(transport=FakeGhcrTransport(backend))
     ghcr_service = GhcrService(GhcrConfig(token="fake-token", organization="exampleco"), transport)
-    resolver = ManifestResolver(ghcr_service=ghcr_service)
+    resolver = ManifestResolver(ghcr_service=ghcr_service, secret_ref_key=_SECRET_REF_KEY)
 
     result = await resolver.resolve(
         profile,
@@ -234,7 +251,7 @@ async def test_exampleco_web_2_missing_tailscale_secret_fails_loudly_not_silentl
         "3c8cf9ed-8229-45b1-a188-7cdcd726fe02", "ephemeral", raw_profile,
         config_overrides={}, cluster_slug="exampleco-web-2-smoke-3c8cf9ed", profile_name="exampleco-web-2",
     )
-    resolver = ManifestResolver(ghcr_service=None)
+    resolver = ManifestResolver(ghcr_service=None, secret_ref_key=_SECRET_REF_KEY)
 
     with pytest.raises(PermanentError, match="tailscale_auth_key"):
         await resolver.resolve(
@@ -291,7 +308,7 @@ async def test_provider_host_profile_with_no_known_host_raises_naming_cluster_ho
     # provider_host strategy, no known host anywhere -- DR-0025 part 1's premise.
     assert "cluster_hostname" not in resolved_config
 
-    resolver = ManifestResolver(ghcr_service=None)
+    resolver = ManifestResolver(ghcr_service=None, secret_ref_key=_SECRET_REF_KEY)
     image_overrides = {name: f"test.registry/{name}:pinned" for name in profile.services}
 
     with pytest.raises(PermanentError) as excinfo:
@@ -334,7 +351,7 @@ async def test_provider_host_profile_with_known_host_renders_no_malformed_url():
     )
     assert resolved_config["cluster_hostname"] == "203.0.113.42"
 
-    resolver = ManifestResolver(ghcr_service=None)
+    resolver = ManifestResolver(ghcr_service=None, secret_ref_key=_SECRET_REF_KEY)
     exampleco_api_secrets = dict.fromkeys(
         ("database_password", "cache_password", "s3_access_key", "s3_secret_key", "jwt_secret", "mail_password"),
         "x",
@@ -353,9 +370,17 @@ async def test_provider_host_profile_with_known_host_renders_no_malformed_url():
     # No malformed URL escaped anywhere in the actual K8s YAML that ships.
     assert "https:///" not in result.rendered_manifests
 
-    docs = list(yaml.safe_load_all(result.rendered_manifests))
+    # A `# Generated ...` header between two documents parses as a document of its
+    # own, None. `parse_manifest_documents` skips those; so does this.
+    docs = [d for d in yaml.safe_load_all(result.rendered_manifests) if d is not None]
     deployment = next(d for d in docs if d["kind"] == "Deployment")
-    env = {e["name"]: e["value"] for e in deployment["spec"]["template"]["spec"]["containers"][0]["env"]}
+    # Secrets are `valueFrom` entries (DR-0051) and carry no `value`; the URLs
+    # this test reads are plain ones.
+    env = {
+        e["name"]: e["value"]
+        for e in deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+        if "value" in e
+    }
     # services.exampleco-api's own cluster_hostname-bearing keys:
     assert env["API_BASE_URL"] == "https://203.0.113.42/api"
     assert env["ADMIN_DASHBOARD_URL"] == "https://203.0.113.42/admin"
@@ -391,7 +416,7 @@ async def _render_nodns_exampleco_api(host: str):
         ("database_password", "cache_password", "s3_access_key", "s3_secret_key", "jwt_secret", "mail_password"),
         "x",
     )
-    result = await ManifestResolver(ghcr_service=None).resolve(
+    result = await ManifestResolver(ghcr_service=None, secret_ref_key=_SECRET_REF_KEY).resolve(
         exampleco_api_only,
         triggering_repo="__nothing-triggers-this-repo__",
         triggering_branch="feature/backlog-17",
@@ -400,7 +425,9 @@ async def _render_nodns_exampleco_api(host: str):
         config=resolved_config,
         secrets=secrets,
     )
-    docs = list(yaml.safe_load_all(result.rendered_manifests))
+    # A `# Generated ...` header between two documents parses as a document of its
+    # own, None. `parse_manifest_documents` skips those; so does this.
+    docs = [d for d in yaml.safe_load_all(result.rendered_manifests) if d is not None]
     return result, next(d for d in docs if d["kind"] == "Ingress")
 
 
@@ -429,9 +456,17 @@ async def test_provider_host_ip_is_omitted_from_the_ingress_host():
     # The SAME variable still fills the env-var URLs, where an IP is perfectly valid.
     # This is the half a "resolve an IP hostname to None" fix would have broken, and
     # it is the `https:///auth` rendering DR-0025 exists to prevent.
-    docs = list(yaml.safe_load_all(result.rendered_manifests))
+    # A `# Generated ...` header between two documents parses as a document of its
+    # own, None. `parse_manifest_documents` skips those; so does this.
+    docs = [d for d in yaml.safe_load_all(result.rendered_manifests) if d is not None]
     deployment = next(d for d in docs if d["kind"] == "Deployment")
-    env = {e["name"]: e["value"] for e in deployment["spec"]["template"]["spec"]["containers"][0]["env"]}
+    # Secrets are `valueFrom` entries (DR-0051) and carry no `value`; the URLs
+    # this test reads are plain ones.
+    env = {
+        e["name"]: e["value"]
+        for e in deployment["spec"]["template"]["spec"]["containers"][0]["env"]
+        if "value" in e
+    }
     assert env["API_BASE_URL"] == "https://203.0.113.42/api"
     assert "https:///" not in result.rendered_manifests
 
@@ -506,3 +541,141 @@ def test_shipped_templates_avoid_fields_kubectl_can_never_report_unchanged(templ
         f"{template.relative_to(_REPO_CONFIG_DIR)} uses a field kubectl can never report "
         f"'unchanged' (backlog #14): {offenders}"
     )
+
+
+# ============================================================================
+# DR-0051 on the real shipped stack: no secret value in any pod spec, each
+# generated Secret in its service's wave, and a rotated secret rolling exactly
+# its users.
+# ============================================================================
+
+_STACK_PROFILE = "exampleco-dev-stack-nodns"
+
+
+async def _render_shipped_stack(secret_overrides: dict[str, str] | None = None):
+    """The WHOLE shipped stack profile, every declared service, with one distinct
+    value per required secret so that a leaked value is attributable to its secret."""
+    profile, raw_profile = load_deployment_profile(_REPO_CONFIG_DIR, _STACK_PROFILE)
+    resolved_config = _build_resolved_config(
+        _NODNS_CLUSTER_ID, "ephemeral", raw_profile, config_overrides={"provider_host": "stack.example.com"},
+        cluster_slug="exampleco-dev-nodns-3c8cf9ed", profile_name=_STACK_PROFILE,
+    )
+    secrets = {req.key_name: f"value-of-{req.key_name}" for req in required_secrets(_REPO_CONFIG_DIR, _STACK_PROFILE)}
+    secrets.update(secret_overrides or {})
+    result = await ManifestResolver(ghcr_service=None, secret_ref_key=_SECRET_REF_KEY).resolve(
+        profile,
+        triggering_repo="__nothing-triggers-this-repo__",
+        triggering_branch="feature/dr-0051",
+        triggering_image="unused:unused",
+        image_overrides={name: f"test.registry/{name}:pinned" for name in profile.services},
+        config=resolved_config,
+        secrets=secrets,
+    )
+    return result, resolved_config, secrets
+
+
+_STACK_SERVICES_WITH_SECRETS = ("cache", "exampleco-api", "exampleco-migrations", "minio", "postgres")
+
+
+async def test_shipped_stack_renders_no_secret_value_and_each_secret_is_in_its_services_wave():
+    result, resolved_config, secrets = await _render_shipped_stack()
+
+    leaked = sorted(name for name, value in secrets.items() if value in result.rendered_manifests)
+    assert not leaked, f"secret values rendered in plaintext: {leaked}"
+
+    docs = parse_manifest_documents(result.rendered_manifests)
+    generated = {doc.name: doc for doc in docs if doc.kind == "Secret"}
+    assert sorted(generated) == sorted(generated_secret_name(s) for s in _STACK_SERVICES_WITH_SECRETS)
+    # Every secret the stack needs reaches the cluster through a generated Secret.
+    held = {key.rsplit("-", 1)[0] for doc in generated.values() for key in doc.body["data"]}
+    assert held == set(secrets)
+
+    deploy_wave = resolved_config["deploy_wave"]
+    for service in _STACK_SERVICES_WITH_SECRETS:
+        secret = generated[generated_secret_name(service)]
+        # The same wave as the service, so the Secret is in the same apply as the
+        # workload that refers to it -- and in front of it in that apply.
+        assert _wave_index_for(secret, deploy_wave) == deploy_wave[service]
+        referring = [i for i, doc in enumerate(docs) if doc is not secret and secret.name in str(doc.body)]
+        assert referring and docs.index(secret) < min(referring)
+        # No workload refers to another service's Secret.
+        assert all(docs[i].name.startswith(service) for i in referring)
+
+
+async def test_shipped_stack_service_secret_is_the_same_when_the_service_is_rendered_alone():
+    """The orphan case, on the real stack: a service that leaves the profile keeps
+    running, so the deployments that follow must leave its Secret as it was. They do
+    if no other service's render has any part in it."""
+    whole, _config, secrets = await _render_shipped_stack()
+    profile, raw_profile = load_deployment_profile(_REPO_CONFIG_DIR, _STACK_PROFILE)
+    alone = await ManifestResolver(ghcr_service=None, secret_ref_key=_SECRET_REF_KEY).resolve(
+        dataclasses.replace(profile, services={"postgres": profile.services["postgres"]}),
+        triggering_repo="__nothing-triggers-this-repo__",
+        triggering_branch="feature/dr-0051",
+        triggering_image="unused:unused",
+        image_overrides={"postgres": "test.registry/postgres:pinned"},
+        config=_build_resolved_config(
+            _NODNS_CLUSTER_ID, "ephemeral", raw_profile, config_overrides={"provider_host": "stack.example.com"},
+            cluster_slug="exampleco-dev-nodns-3c8cf9ed", profile_name=_STACK_PROFILE,
+        ),
+        secrets=secrets,
+    )
+
+    def postgres_secret(rendered: str) -> dict:
+        return next(dict(d.body) for d in parse_manifest_documents(rendered) if d.name == "postgres-secrets")
+
+    assert postgres_secret(alone.rendered_manifests) == postgres_secret(whole.rendered_manifests)
+
+
+async def test_shipped_stack_rotated_secret_changes_exactly_the_workloads_that_use_it():
+    before, _config, _secrets = await _render_shipped_stack()
+    after, _config, _secrets = await _render_shipped_stack({"database_password": "rotated"})
+
+    def by_identity(rendered: str) -> dict[tuple[str, str], dict]:
+        return {(doc.kind, doc.name): dict(doc.body) for doc in parse_manifest_documents(rendered)}
+
+    old, new = by_identity(before.rendered_manifests), by_identity(after.rendered_manifests)
+    assert old.keys() == new.keys()
+    assert sorted(identity for identity in old if old[identity] != new[identity]) == [
+        ("Deployment", "exampleco-api"),
+        ("Deployment", "postgres"),
+        ("Job", "exampleco-migrations"),
+        ("Secret", "exampleco-api-secrets"),
+        ("Secret", "exampleco-migrations-secrets"),
+        ("Secret", "postgres-secrets"),
+    ]
+
+
+async def test_shipped_stack_secrets_come_before_the_profiles_variables():
+    """Kubernetes expands ``$(NAME)`` in an env value only for a variable EARLIER in
+    the list. The guide tells a profile author to write a connection string that way,
+    so the shipped templates must put their secrets first."""
+    result, _config, _secrets = await _render_shipped_stack()
+    docs = {(d.kind, d.name): d.body for d in parse_manifest_documents(result.rendered_manifests)}
+    for name in ("exampleco-api", "minio"):
+        env = docs[("Deployment", name)]["spec"]["template"]["spec"]["containers"][0]["env"]
+        secret_positions = [i for i, entry in enumerate(env) if "valueFrom" in entry]
+        plain_positions = [i for i, entry in enumerate(env) if "value" in entry]
+        assert secret_positions and plain_positions
+        assert max(secret_positions) < min(plain_positions), name
+
+
+@pytest.mark.parametrize(
+    "template", sorted((_REPO_CONFIG_DIR / "manifest-templates").rglob("*.yaml")), ids=lambda p: p.name
+)
+def test_shipped_templates_never_render_a_secret_as_plain_text(template):
+    """The resolver refuses a bare ``{{ secrets.x }}`` at render time (DR-0051), but
+    only in a template that a test or a deployment renders. This reads every shipped
+    template, rendered or not. A secret may be written as ``.ref`` or as
+    ``| b64encode`` into a Secret's ``data``; ``ghcr_dockerconfig_json`` is already
+    base64 when it arrives (``_build_ghcr_dockerconfig_json``)."""
+    offenders = [
+        (n, line.strip())
+        for n, line in enumerate(template.read_text().splitlines(), start=1)
+        for name, tail in re.findall(r"\{\{\s*secrets\.(\w+)([^}]*)\}\}", line)
+        if name != "ghcr_dockerconfig_json" and tail.strip() not in (".ref", "| b64encode")
+    ]
+    assert not offenders, (
+        f"{template.relative_to(_REPO_CONFIG_DIR)} renders a secret value as plain text: {offenders}"
+    )
+

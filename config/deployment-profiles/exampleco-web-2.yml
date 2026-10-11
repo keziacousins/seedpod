@@ -43,8 +43,9 @@ services:
   # A second declared service with no image to build -- image_override
   # means it needs no GHCR lookup -- that ALSO needs a secret
   # (secrets.tailscale_auth_key, read by manifest-templates/exampleco-misc/
-  # tailscale.yaml). Demonstrates a service whose manifest template requires
-  # a secret to render at all.
+  # tailscale.yaml as `secrets.tailscale_auth_key.ref`). Demonstrates a
+  # service whose manifest template requires a secret to render at all.
+  # How a template may use a secret: docs/guides/manifest-templates.md.
   tailscale:
     repository: "tailscale"
     port: 0

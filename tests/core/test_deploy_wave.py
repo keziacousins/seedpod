@@ -9,6 +9,8 @@ shipped manifest template read straight off disk, or a plain literal.
 
 from __future__ import annotations
 
+import json
+import re
 from pathlib import Path
 
 import pytest
@@ -28,6 +30,7 @@ from seedpod.core.errors import ErrorCode, PermanentError
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLECO_STACK_TEMPLATES = REPO_ROOT / "config" / "manifest-templates" / "exampleco-stack"
+_SECRET_REF = re.compile(r"\{\{ secrets\.(\w+)\.ref \}\}")
 
 
 def _real_multi_doc_manifest() -> str:
@@ -41,9 +44,18 @@ def _real_multi_doc_manifest() -> str:
     ``{{ }}`` in them sits inside an already-quoted YAML string, so plain
     ``yaml.safe_load_all`` parses it as literal text, never rendered -- this
     module is about ``ManifestDoc``'s own parse/serialize mechanics, not
-    template rendering (``tests/services/test_manifests.py``'s job)."""
+    template rendering (``tests/services/test_manifests.py``'s job).
+
+    The one exception is ``valueFrom: {{ secrets.<name>.ref }}`` (DR-0051), which
+    is unquoted because it renders to a mapping, not a string. It is replaced
+    here with a mapping of the shape the resolver renders, so the text stays
+    plain YAML without a render."""
     rbac = (EXAMPLECO_STACK_TEMPLATES / "rbac.yaml").read_text()
     postgres = (EXAMPLECO_STACK_TEMPLATES / "postgres.yaml").read_text()
+    postgres, refs = _SECRET_REF.subn(
+        lambda match: json.dumps({"secretKeyRef": {"name": "postgres-secrets", "key": match[1]}}), postgres
+    )
+    assert refs == 1  # the substitution above is not silently a no-op
     return rbac + "\n---\n" + postgres
 
 
