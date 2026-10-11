@@ -4,6 +4,7 @@ import { StatusBadge } from "../components/StatusBadge";
 import { Breadcrumb } from "../components/Breadcrumb";
 import { apiClient } from "../lib/api-client";
 import { sseClient } from "../lib/sse-client";
+import { describeEnvVar } from "../lib/env-var";
 
 export function ContainerDetail({
   clusterId,
@@ -227,12 +228,19 @@ export function ContainerDetail({
               Environment Variables
             </h4>
             <div style="font-family: monospace; font-size: 0.85rem; max-height: 200px; overflow-y: auto;">
-              {container.env.map((envVar, idx) => (
-                <div key={idx}>
-                  <span style="color: var(--cyan);">{envVar.name}</span>:{" "}
-                  <span>{envVar.value || "(not set)"}</span>
-                </div>
-              ))}
+              {container.env.map((envVar, idx) => {
+                const described = describeEnvVar(envVar);
+                return (
+                  <div key={idx}>
+                    <span style="color: var(--cyan);">{envVar.name}</span>:{" "}
+                    <span
+                      style={described.source === "literal" ? undefined : "color: var(--color-text-muted);"}
+                    >
+                      {described.text}
+                    </span>
+                  </div>
+                );
+              })}
             </div>
           </div>
         )}
