@@ -4,6 +4,7 @@ import { Card } from "../components/Card";
 import { Breadcrumb } from "../components/Breadcrumb";
 import { CopyableText } from "../components/CopyableText";
 import { apiClient } from "../lib/api-client";
+import { selectedPermissions } from "../lib/permissions";
 
 export function CreateApiKey() {
   const [formData, setFormData] = useState({
@@ -55,12 +56,9 @@ export function CreateApiKey() {
       return;
     }
 
-    // Filter to only enabled permissions
-    const enabledPermissions = Object.fromEntries(
-      Object.entries(formData.permissions).filter(([_, enabled]) => enabled),
-    );
+    const enabledPermissions = selectedPermissions(formData.permissions);
 
-    if (Object.keys(enabledPermissions).length === 0) {
+    if (enabledPermissions.length === 0) {
       setFormError("Please select at least one permission");
       return;
     }
