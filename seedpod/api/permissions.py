@@ -39,13 +39,18 @@ grained than v1's single ``secrets:write``, no catalog gap to fill); config reus
 ``config:read``; and ``/api/keys``/``/api/permissions`` are both gated behind the
 bare ``"*"`` super-wildcard (v1's ``admin:*`` on every ``/keys`` route,
 ``reference-code/seedpod/seedpod/api/auth.py``, translated to v2's convention --
-this module's own docstring)."""
+this module's own docstring).
+
+**DR-0053:** ``kubeconfig:read`` gates ``GET /api/clusters/{id}/kubeconfig``. It is
+its own category, not ``clusters:kubeconfig``: rule 3 of ``has_permission`` would
+give a ``clusters:kubeconfig`` scope to every key that holds ``clusters:*``, and a
+kubeconfig is admin access to the cluster, which no ``clusters:*`` key had before."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 
-__all__ = ["AVAILABLE_PERMISSIONS", "PERMISSION_CATEGORIES", "has_permission"]
+__all__ = ["AVAILABLE_PERMISSIONS", "PERMISSION_CATEGORIES", "environment_admits", "has_permission"]
 
 AVAILABLE_PERMISSIONS: dict[str, str] = {
     "*": "Full administrative access to all resources",
@@ -74,6 +79,7 @@ AVAILABLE_PERMISSIONS: dict[str, str] = {
     "snapshots:create": "Create and restore snapshots",
     "snapshots:delete": "Delete snapshots",
     "snapshots:*": "All snapshot permissions",
+    "kubeconfig:read": "Download a cluster's kubeconfig (admin access to the cluster itself)",
 }
 
 PERMISSION_CATEGORIES: dict[str, list[str]] = {
@@ -99,6 +105,7 @@ PERMISSION_CATEGORIES: dict[str, list[str]] = {
     "Events": ["events:stream"],
     "Workflows": ["workflows:*", "workflows:read"],
     "Snapshots": ["snapshots:*", "snapshots:read", "snapshots:create", "snapshots:delete"],
+    "Kubeconfig": ["kubeconfig:read"],
 }
 
 
@@ -120,3 +127,11 @@ def has_permission(granted: Sequence[str], required: str) -> bool:
         return True
     category = required.split(":", 1)[0]
     return f"{category}:*" in granted
+
+
+def environment_admits(key_environment: str, resource_environment: str) -> bool:
+    """``True`` iff a key scoped to ``key_environment`` may act on a resource in
+    ``resource_environment``: the key is ``'all'``-scoped, or the two are equal.
+    The REST half of DR-0010's rule (``'all'`` behaves as unscoped). DR-0053: only
+    ``GET /api/clusters/{id}/kubeconfig`` enforces it so far."""
+    return key_environment == "all" or key_environment == resource_environment

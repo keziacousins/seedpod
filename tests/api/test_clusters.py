@@ -719,6 +719,85 @@ async def test_events_without_kubeconfig_is_404(app, client, auth_headers):
 
 
 # ---------------------------------------------------------------------------
+# GET /api/clusters/{id}/kubeconfig -- DR-0053
+# ---------------------------------------------------------------------------
+
+
+async def _headers_for(app, permissions: list[str], *, environment: str = "all") -> dict[str, str]:
+    _, plaintext = await app.services.api_keys.create_api_key(
+        username="deploy-vm", environment=environment, permissions=permissions
+    )
+    return {"Authorization": f"Bearer {plaintext}"}
+
+
+async def test_kubeconfig_returns_the_decrypted_file_by_id_or_slug(app, client, caplog):
+    await _birth_cluster(app, "c1", slug="c1-slug")
+    await _promote_to_active(app, "c1")
+    await _set_kubeconfig(app, "c1")
+    headers = await _headers_for(app, ["kubeconfig:read"])
+    with caplog.at_level("INFO", logger="seedpod.app.services.cluster_service"):
+        by_id = await client.get("/api/clusters/c1/kubeconfig", headers=headers)
+    by_slug = await client.get("/api/clusters/c1-slug/kubeconfig", headers=headers)
+    assert by_id.status_code == 200
+    assert by_id.json() == {"cluster_id": "c1", "slug": "c1-slug", "status": "active", "kubeconfig": FAKE_KUBECONFIG}
+    assert by_slug.json() == by_id.json()
+    # The log line is the only record of who took a copy.
+    assert any("api:deploy-vm" in r.getMessage() and "c1" in r.getMessage() for r in caplog.records)
+
+
+async def test_kubeconfig_needs_its_own_scope(app, client):
+    """``clusters:*`` must not admit it -- that is why the scope is not ``clusters:kubeconfig``."""
+    await _birth_cluster(app, "c1", slug="c1-slug")
+    await _set_kubeconfig(app, "c1")
+    for permissions in (["clusters:read"], ["clusters:*"], ["deployments:*", "secrets:*"]):
+        response = await client.get("/api/clusters/c1/kubeconfig", headers=await _headers_for(app, permissions))
+        assert response.status_code == 403, permissions
+    for permissions in (["kubeconfig:read"], ["kubeconfig:*"], ["*"]):
+        response = await client.get("/api/clusters/c1/kubeconfig", headers=await _headers_for(app, permissions))
+        assert response.status_code == 200, permissions
+
+
+async def test_kubeconfig_needs_a_key_whose_environment_admits_the_cluster(app, client):
+    """DR-0053: the key's environment must be ``'all'`` or the cluster's own."""
+    await _birth_cluster(app, "c1", slug="c1-slug", environment="ephemeral")
+    await _set_kubeconfig(app, "c1")
+    await _birth_cluster(app, "s1", slug="s1-slug", environment="staging")
+    await _set_kubeconfig(app, "s1", environment="staging")
+
+    ephemeral_key = await _headers_for(app, ["kubeconfig:read"], environment="ephemeral")
+    assert (await client.get("/api/clusters/c1/kubeconfig", headers=ephemeral_key)).status_code == 200
+    refused = await client.get("/api/clusters/s1-slug/kubeconfig", headers=ephemeral_key)
+    assert refused.status_code == 403
+    assert "'ephemeral'" in refused.json()["detail"] and "'staging'" in refused.json()["detail"]
+
+    staging_key = await _headers_for(app, ["kubeconfig:read"], environment="staging")
+    assert (await client.get("/api/clusters/s1/kubeconfig", headers=staging_key)).status_code == 200
+    assert (await client.get("/api/clusters/c1/kubeconfig", headers=staging_key)).status_code == 403
+
+    # The super-wildcard grants every scope, not every environment.
+    scoped_admin = await _headers_for(app, ["*"], environment="production")
+    assert (await client.get("/api/clusters/c1/kubeconfig", headers=scoped_admin)).status_code == 403
+
+
+async def test_kubeconfig_requires_auth(app, client):
+    await _birth_cluster(app, "c1", slug="c1-slug")
+    await _set_kubeconfig(app, "c1")
+    response = await client.get("/api/clusters/c1/kubeconfig")
+    assert response.status_code == 401
+
+
+async def test_kubeconfig_before_provisioning_finishes_is_404(app, client, auth_headers):
+    await _birth_cluster(app, "c1", slug="c1-slug")  # still PROVISIONING -- no kubeconfig yet
+    response = await client.get("/api/clusters/c1/kubeconfig", headers=auth_headers)
+    assert response.status_code == 404
+
+
+async def test_kubeconfig_unknown_cluster_is_404(client, auth_headers):
+    response = await client.get("/api/clusters/nope/kubeconfig", headers=auth_headers)
+    assert response.status_code == 404
+
+
+# ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
 

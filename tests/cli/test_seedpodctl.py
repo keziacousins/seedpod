@@ -14,6 +14,8 @@ contains no ``seedpod.data``/``seedpod.app.services``/``seedpod.services.crypto`
 
 from __future__ import annotations
 
+import argparse
+import stat
 import subprocess
 import sys
 
@@ -21,7 +23,9 @@ import httpx
 import pytest
 
 from seedpod.ctl import cli
-from seedpod.ctl.client import AuthenticationError, SeedpodClient
+from seedpod.ctl.client import AuthenticationError, PermissionDeniedError, SeedpodClient
+from tests.api.test_clusters import _birth_cluster, _set_kubeconfig
+from tests.conformance.kubectl_harness import FAKE_KUBECONFIG
 
 
 def _client_for(app, *, api_key: str | None = None) -> SeedpodClient:
@@ -171,6 +175,64 @@ async def test_secrets_create_then_list_and_reveal_round_trip(app, auth_headers)
         assert revealed["value"] == "hunter2"
     finally:
         await client.aclose()
+
+
+# ---------------------------------------------------------------------------
+# clusters kubeconfig (DR-0053)
+# ---------------------------------------------------------------------------
+
+
+async def _kubeconfig_client(app, *, environment: str = "all") -> SeedpodClient:
+    await _birth_cluster(app, "c1", slug="c1-slug")
+    await _set_kubeconfig(app, "c1")
+    _, plaintext = await app.services.api_keys.create_api_key(
+        username="deploy-vm", environment=environment, permissions=["kubeconfig:read"]
+    )
+    return _client_for(app, api_key=plaintext)
+
+
+async def test_clusters_kubeconfig_prints_the_file_not_json(app, capsys):
+    client = await _kubeconfig_client(app)
+    try:
+        result = await cli._clusters_kubeconfig(client, argparse.Namespace(cluster_id="c1-slug", output=None))
+    finally:
+        await client.aclose()
+    assert result is None  # nothing for _run to print as JSON
+    assert capsys.readouterr().out.rstrip("\n") == FAKE_KUBECONFIG.rstrip("\n")
+
+
+async def test_clusters_kubeconfig_output_replaces_the_file_with_mode_0600(app, tmp_path, capsys):
+    target = tmp_path / "kube" / "config"
+    target.parent.mkdir()
+    target.write_text("old contents")
+    target.chmod(0o644)
+    client = await _kubeconfig_client(app)
+    try:
+        await cli._clusters_kubeconfig(client, argparse.Namespace(cluster_id="c1", output=target))
+    finally:
+        await client.aclose()
+    assert target.read_text() == FAKE_KUBECONFIG
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert list(target.parent.iterdir()) == [target]  # no temporary file left behind
+    assert capsys.readouterr().out == ""
+
+
+async def test_clusters_kubeconfig_out_of_environment_is_permission_denied(app, tmp_path):
+    target = tmp_path / "config"
+    client = await _kubeconfig_client(app, environment="staging")  # the cluster is ephemeral
+    try:
+        with pytest.raises(PermissionDeniedError):
+            await cli._clusters_kubeconfig(client, argparse.Namespace(cluster_id="c1", output=target))
+    finally:
+        await client.aclose()
+    assert not target.exists()
+
+
+def test_clusters_kubeconfig_parses_id_and_output(tmp_path):
+    args = cli.build_parser().parse_args(["clusters", "kubeconfig", "c1-slug", "-o", str(tmp_path / "k")])
+    assert args.func is cli._clusters_kubeconfig
+    assert args.cluster_id == "c1-slug"
+    assert args.output == tmp_path / "k"
 
 
 # ---------------------------------------------------------------------------

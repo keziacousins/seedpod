@@ -3,7 +3,8 @@
 Command groups mirror the API surface one-for-one (``keys``, ``secrets``,
 ``clusters``, ``deployments``, ``deploy``, ``snapshots``, ``presets``,
 ``workflows``, ``timers``, ``health``, ``config``) -- each subcommand is one
-client call, printed as JSON.
+client call, printed as JSON. One exception: ``clusters kubeconfig`` prints the
+file itself (DR-0053).
 
 Argparse (stdlib), NOT ``click`` (v1's archived ``seedpodctl`` used click --
 this round's brief re-does the CLI layer in argparse rather than adding a new
@@ -223,6 +224,33 @@ async def _clusters_destroy(client: SeedpodClient, args: argparse.Namespace) -> 
     )
 
 
+async def _clusters_kubeconfig(client: SeedpodClient, args: argparse.Namespace) -> Any:
+    """DR-0053. Prints the kubeconfig itself, not the JSON around it, so ``> file``
+    works. ``--output`` replaces the file in one rename, and the file is mode 0600
+    from the start: a shell redirect makes it 0644 on most systems."""
+    body = await client.cluster_kubeconfig(args.cluster_id)
+    kubeconfig = body["kubeconfig"]
+    if args.output is None:
+        sys.stdout.write(kubeconfig if kubeconfig.endswith("\n") else kubeconfig + "\n")
+        return None
+    _write_private_file(args.output, kubeconfig)
+    print(f"wrote kubeconfig for cluster {body['slug']} ({body['cluster_id']}) to {args.output}", file=sys.stderr)
+    return None
+
+
+def _write_private_file(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 async def _clusters_pods(client: SeedpodClient, args: argparse.Namespace) -> Any:
     return await client.cluster_pods(args.cluster_id, namespace=args.namespace)
 
@@ -273,6 +301,11 @@ def _add_clusters(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("--force", action="store_true")
     p.add_argument("--snapshot-before-destroy", action="store_true")
     p.set_defaults(func=_clusters_destroy)
+
+    p = actions.add_parser("kubeconfig", help="print a cluster's kubeconfig (needs kubeconfig:read)")
+    p.add_argument("cluster_id", help="cluster id or slug")
+    p.add_argument("-o", "--output", type=Path, help="write to this file (mode 0600) and replace it")
+    p.set_defaults(func=_clusters_kubeconfig)
 
     p = actions.add_parser("pods", help="list a cluster's pods")
     p.add_argument("cluster_id")
