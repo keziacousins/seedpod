@@ -30,6 +30,7 @@ precedent ``ClusterRepository.set_health_failures``/``update_cost`` already set.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from datetime import timedelta
 
@@ -56,6 +57,8 @@ from seedpod.runtime.dispatcher import Dispatcher
 from seedpod.services.crypto import CryptoService
 
 __all__ = ["ClusterService", "ClusterNotFound", "ClusterHasNoKubeconfig"]
+
+_log = logging.getLogger(__name__)
 
 
 class ClusterNotFound(LookupError):
@@ -337,6 +340,18 @@ class ClusterService:
         if row.encrypted_kubeconfig is None or row.kubeconfig_key_class is None:
             raise ClusterHasNoKubeconfig(cluster_id)
         return self._crypto.decrypt(row.encrypted_kubeconfig, row.kubeconfig_key_class)
+
+    async def kubeconfig(self, id_or_slug: str, *, actor: str) -> tuple[ClusterRow, str]:
+        """DR-0053: the decrypted kubeconfig, for ``GET /api/clusters/{id}/kubeconfig``.
+        No database row records the read, so the log line is the only trace of who
+        took a copy. Takes an id or a slug, like ``get``: a caller that fetches after
+        each deploy knows the slug before it knows the id."""
+        row = await self.get(id_or_slug)
+        if row.encrypted_kubeconfig is None or row.kubeconfig_key_class is None:
+            raise ClusterHasNoKubeconfig(row.id)
+        kubeconfig = self._crypto.decrypt(row.encrypted_kubeconfig, row.kubeconfig_key_class)
+        _log.info("kubeconfig for cluster %s (%s) read by %s", row.id, row.slug, actor)
+        return row, kubeconfig
 
     async def _execute_kubectl(self, cmd) -> object:
         result = None

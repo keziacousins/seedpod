@@ -74,6 +74,9 @@ adapts to the clean v2 contract -- no compatibility shims"):
   names): reads use ``clusters:read``, destroy uses ``clusters:delete``, extend
   uses the dedicated ``clusters:extend``, and rehabilitate -- a state UPDATE, not
   a destroy/extend -- uses ``clusters:update``.
+- ``GET /api/clusters/{id}/kubeconfig`` (DR-0053, new in v2) uses ``kubeconfig:read``,
+  a category of its own: a kubeconfig is admin access to the cluster, so no
+  ``clusters:*`` key gets it without asking.
 """
 
 from __future__ import annotations
@@ -409,6 +412,24 @@ async def rehabilitate_cluster(
         # determine the cluster's state, and it has left the record as it was.
         raise _http_error_for_provider_error(exc) from exc
     return {"cluster_id": row.id, "status": row.status}
+
+
+@router.get("/clusters/{cluster_id}/kubeconfig")
+async def get_kubeconfig(
+    cluster_id: str, request: Request, api_key=Depends(require_permission("kubeconfig:read"))  # noqa: B008
+) -> dict[str, Any]:
+    """DR-0053. ``kubeconfig:read`` only: ``clusters:read`` does not admit it, and
+    neither does ``clusters:*``. JSON, like ``GET /api/secrets/.../reveal``; the
+    file itself is ``.kubeconfig``."""
+    app = get_app(request)
+    try:
+        row, kubeconfig = await app.services.clusters.kubeconfig(cluster_id, actor=f"api:{api_key.username}")
+    except LookupError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ProviderError as exc:
+        # ClusterHasNoKubeconfig (NOT_FOUND) -> 404: still provisioning, or failed first.
+        raise _http_error_for_provider_error(exc) from exc
+    return {"cluster_id": row.id, "slug": row.slug, "status": row.status, "kubeconfig": kubeconfig}
 
 
 # ---------------------------------------------------------------------------
