@@ -271,17 +271,15 @@ export function ApiKeyDetail({ keyId }) {
           </div>
         </div>
         <div style="display: flex; flex-wrap: wrap; gap: 0.5rem;">
-          {Object.keys(apiKey.permissions).length > 0 ? (
-            Object.keys(apiKey.permissions)
-              .filter((perm) => apiKey.permissions[perm])
-              .map((perm) => (
-                <span
-                  key={perm}
-                  style="background: var(--gray-light); padding: 0.5rem 0.75rem; border-radius: 4px; font-family: monospace; font-size: 0.875rem; color: var(--text);"
-                >
-                  {perm}
-                </span>
-              ))
+          {apiKey.permissions.length > 0 ? (
+            apiKey.permissions.map((perm) => (
+              <span
+                key={perm}
+                style="background: var(--gray-light); padding: 0.5rem 0.75rem; border-radius: 4px; font-family: monospace; font-size: 0.875rem; color: var(--text);"
+              >
+                {perm}
+              </span>
+            ))
           ) : (
             <span className="text-muted">No permissions assigned</span>
           )}
