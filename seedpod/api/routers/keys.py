@@ -27,6 +27,8 @@ auth.py`` (``create_api_key`` :73, ``list_api_keys`` :143, ``get_api_key`` :185,
 - ``permissions`` are NOT mutable via ``PATCH`` (v1's own module docstring:
   "Permissions are immutable. To change permissions, create a new key and
   revoke the old one.") -- carried forward verbatim, not a v2 narrowing.
+- DR-0054: every route here also needs an ``'all'``-scoped key, and ``POST`` refuses
+  an environment name that secrets and deployments would not accept.
 """
 
 from __future__ import annotations
@@ -40,6 +42,8 @@ from pydantic import BaseModel, Field
 from seedpod.api.auth import require_permission
 from seedpod.api.deps import get_app
 from seedpod.app.services.api_key_service import ApiKeyNotFound
+from seedpod.core.environment_scope import ALL_ENVIRONMENTS
+from seedpod.core.errors import PermanentError
 from seedpod.data.repositories import ApiKeyRow
 
 __all__ = ["router"]
@@ -83,7 +87,7 @@ async def list_keys(
     active_only: bool = False,
     username: str | None = None,
     environment: str | None = None,
-    _api_key=Depends(require_permission("*")),  # noqa: B008
+    _api_key=Depends(require_permission("*", all_environments=True)),  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
     rows = await app.services.api_keys.list(username=username, environment=environment, active_only=active_only)
@@ -93,7 +97,7 @@ async def list_keys(
 
 @router.get("/{key_id}")
 async def get_key(
-    key_id: int, request: Request, _api_key=Depends(require_permission("*"))  # noqa: B008
+    key_id: int, request: Request, _api_key=Depends(require_permission("*", all_environments=True))  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
     try:
@@ -105,9 +109,19 @@ async def get_key(
 
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_key(
-    body: CreateApiKeyRequest, request: Request, api_key=Depends(require_permission("*"))  # noqa: B008
+    body: CreateApiKeyRequest, request: Request, api_key=Depends(require_permission("*", all_environments=True))  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
+    if body.environment is not None and body.environment != ALL_ENVIRONMENTS:
+        # DR-0054: a misspelt environment ("prod") would make a key that matches
+        # nothing. The names are the ones secrets and deployments already accept.
+        try:
+            app.crypto.key_class_for_environment(body.environment)
+        except PermanentError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"unknown environment {body.environment!r}; use 'all' or a known environment",
+            ) from exc
     row, plaintext = await app.services.api_keys.create_api_key(
         username=body.username, environment=body.environment, permissions=body.permissions,
         expires_hours=body.expires_hours, description=body.description, created_by=api_key.username,
@@ -117,7 +131,7 @@ async def create_key(
 
 @router.patch("/{key_id}")
 async def update_key(
-    key_id: int, body: UpdateApiKeyRequest, request: Request, _api_key=Depends(require_permission("*"))  # noqa: B008
+    key_id: int, body: UpdateApiKeyRequest, request: Request, _api_key=Depends(require_permission("*", all_environments=True))  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
     try:
@@ -129,7 +143,7 @@ async def update_key(
 
 @router.delete("/{key_id}")
 async def revoke_key(
-    key_id: int, request: Request, _api_key=Depends(require_permission("*"))  # noqa: B008
+    key_id: int, request: Request, _api_key=Depends(require_permission("*", all_environments=True))  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
     revoked = await app.services.api_keys.revoke(key_id)

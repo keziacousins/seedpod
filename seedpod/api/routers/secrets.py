@@ -26,6 +26,9 @@ secrets.py`` (``list_secrets`` :64, ``create_secret`` :103, ``reveal_secret`` :1
   existing finer-grained ``secrets:read``/``secrets:create``/``secrets:delete``
   (``seedpod/api/permissions.py`` already carries all three -- no catalog gap to
   fill, see that module's own docstring).
+- DR-0054: every route checks the key's environment against the secret's. Before
+  it, ``?environment=`` or a path segment let a ``staging`` key reveal a
+  ``production`` secret.
 """
 
 from __future__ import annotations
@@ -38,6 +41,7 @@ from pydantic import BaseModel, Field
 from seedpod.api.auth import require_permission
 from seedpod.api.deps import get_app
 from seedpod.app.services.secret_service import SecretNotFound
+from seedpod.core.environment_scope import check_environment
 from seedpod.core.errors import PermanentError
 from seedpod.data.repositories import ApiKeyRow, SecretMetadataRow
 
@@ -77,6 +81,7 @@ async def list_secrets(
 ) -> dict[str, Any]:
     app = get_app(request)
     env = environment or _default_environment(api_key)
+    check_environment(api_key.environment, env, subject="this secret list")  # DR-0054
     try:
         rows = await app.services.secrets.list_for_environment(env)
     except PermanentError as exc:
@@ -91,6 +96,7 @@ async def create_secret(
     api_key=Depends(require_permission("secrets:create")),  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
+    check_environment(api_key.environment, body.environment, subject=f"secret {body.key_name}")  # DR-0054
     try:
         await app.services.secrets.upsert(
             body.environment, body.key_name, body.value, actor=f"api:{api_key.username}"
@@ -108,6 +114,7 @@ async def reveal_secret(
     api_key=Depends(require_permission("secrets:read")),  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
+    check_environment(api_key.environment, environment, subject=f"secret {key_name}")  # DR-0054
     try:
         value = await app.services.secrets.reveal(environment, key_name, actor=f"api:{api_key.username}")
     except PermanentError as exc:
@@ -125,6 +132,7 @@ async def delete_secret(
     api_key=Depends(require_permission("secrets:delete")),  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
+    check_environment(api_key.environment, environment, subject=f"secret {key_name}")  # DR-0054
     try:
         deleted = await app.services.secrets.delete(environment, key_name, actor=f"api:{api_key.username}")
     except PermanentError as exc:

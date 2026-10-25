@@ -69,6 +69,7 @@ from typing import Any
 from seedpod.app.services.deployment_service import DeploymentResponse, DeploymentService
 from seedpod.app.services.profiles import load_deployment_profile
 from seedpod.core.clock import Clock
+from seedpod.core.environment_scope import check_environment
 from seedpod.core.errors import ErrorCode, PermanentError
 from seedpod.data.repositories import PresetRepository, PresetRow
 from seedpod.data.uow import UnitOfWork
@@ -165,9 +166,12 @@ class PresetService:
         default_provider: str | None = None,  # DR-0046
         naming_strategy: Mapping[str, Any] | None,
         created_by: str,
+        key_environment: str,
     ) -> PresetRow:
         _, raw_profile = load_deployment_profile(self._config_dir, profile_name)  # PermanentError(NOT_FOUND) propagates
         environment = _profile_environment(raw_profile)
+        # DR-0054: the profile chooses the environment, so it is checked here.
+        check_environment(key_environment, environment, subject=f"a preset of profile {profile_name}")
         now = self._clock.now()
         preset_id = self._id_gen()
         row = PresetRow(
@@ -196,7 +200,10 @@ class PresetService:
         default_ttl_hours: int | None = None,
         default_provider: str | None = None,  # DR-0046
         naming_strategy: Mapping[str, Any] | None = None,
+        key_environment: str,
     ) -> PresetRow:
+        """DR-0054: the key's environment must admit the preset's environment now,
+        and the new one too when ``profile_name`` changes it."""
         sets: dict[str, Any] = {}
         if name is not None:
             sets["name"] = name
@@ -206,6 +213,7 @@ class PresetService:
             sets["profile_name"] = profile_name
             _, raw_profile = load_deployment_profile(self._config_dir, profile_name)
             sets["environment"] = _profile_environment(raw_profile)
+            check_environment(key_environment, sets["environment"], subject=f"a preset of profile {profile_name}")
         if service_overrides is not None:
             sets["service_overrides"] = dict(service_overrides)
         if default_branch is not None:
@@ -218,8 +226,10 @@ class PresetService:
             sets["naming_strategy"] = dict(naming_strategy)
 
         async with self._uow() as tx:
-            if self._presets.get(tx, preset_id) is None:
+            current = self._presets.get(tx, preset_id)
+            if current is None:
                 raise PresetNotFound(preset_id)
+            check_environment(key_environment, current.environment, subject=f"preset {current.name}")
             if name is not None:
                 existing = self._presets.get_by_name(tx, name)
                 if existing is not None and existing.id != preset_id:
@@ -250,8 +260,11 @@ class PresetService:
         cluster_name: str | None = None,  # noqa: ARG002 -- see module docstring's cluster-naming scope note
         data_initialization: Mapping[str, Any] | None = None,
         actor: str,
+        key_environment: str,
     ) -> DeploymentResponse:
         preset = await self.get(preset_id)
+        # DR-0054: before record_usage, so a refused deploy does not count as a use.
+        check_environment(key_environment, preset.environment, subject=f"preset {preset.name}")
         _, raw_profile = load_deployment_profile(self._config_dir, preset.profile_name)
 
         discovery_branch = branch or preset.default_branch or "main"
@@ -288,4 +301,5 @@ class PresetService:
             reason=reason,
             data_initialization=data_initialization,
             actor=actor,
+            key_environment=key_environment,
         )

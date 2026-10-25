@@ -19,6 +19,7 @@ from fastapi import APIRouter, Depends, Request
 
 from seedpod.api.auth import require_permission
 from seedpod.api.deps import get_app
+from seedpod.core.environment_scope import ALL_ENVIRONMENTS, environment_admits
 from seedpod.data.repositories import WorkflowRunRow
 
 __all__ = ["router"]
@@ -48,9 +49,13 @@ def _serialize(row: WorkflowRunRow) -> dict[str, Any]:
 
 @router.get("/workflows")
 async def list_workflows(
-    request: Request, _api_key=Depends(require_permission("workflows:read"))  # noqa: B008
+    request: Request, api_key=Depends(require_permission("workflows:read"))  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
     async with app.uow() as t:
         rows = app.repos.workflow_runs.list_all(t)
+        if api_key.environment != ALL_ENVIRONMENTS:
+            # DR-0054: a run has its cluster's environment.
+            environments = {c.id: c.environment for c in app.repos.clusters.list_all(t)}
+            rows = [r for r in rows if environment_admits(api_key.environment, environments.get(r.cluster_id, ""))]
     return {"workflows": [_serialize(r) for r in rows]}

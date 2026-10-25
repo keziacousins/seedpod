@@ -44,6 +44,7 @@ def deployment_service(
 
 async def test_feature_branch_creates_ephemeral_queued_deployment(deployment_service):
     result = await deployment_service.version_update(
+        key_environment="all",
         repo="exampleco-core", branch="feature/payment-system", image="ghcr.io/x/exampleco-core:abc",
         commit="abc123", actor="api:test-user",
     )
@@ -56,6 +57,7 @@ async def test_feature_branch_creates_ephemeral_queued_deployment(deployment_ser
 
 async def test_main_branch_creates_staging_queued_deployment(deployment_service):
     result = await deployment_service.version_update(
+        key_environment="all",
         repo="exampleco-core", branch="main", image="ghcr.io/x/exampleco-core:main-def",
         commit="def456", actor="api:test-user",
     )
@@ -66,6 +68,7 @@ async def test_main_branch_creates_staging_queued_deployment(deployment_service)
 
 async def test_unmatched_branch_is_no_action(deployment_service):
     result = await deployment_service.version_update(
+        key_environment="all",
         repo="exampleco-core", branch="experimental/unknown", image="ghcr.io/x/exampleco-core:x",
         commit="x", actor="api:test-user",
     )
@@ -77,6 +80,7 @@ async def test_unmatched_branch_is_no_action(deployment_service):
 
 async def test_disabled_rule_is_no_action(deployment_service):
     result = await deployment_service.version_update(
+        key_environment="all",
         repo="exampleco-core", branch="disabled/whatever", image="ghcr.io/x/exampleco-core:x",
         commit="x", actor="api:test-user",
     )
@@ -87,6 +91,7 @@ async def test_disabled_rule_is_no_action(deployment_service):
 
 async def test_births_land_full_rows_via_dispatcher(deployment_service, repos, uow):
     result = await deployment_service.version_update(
+        key_environment="all",
         repo="exampleco-core", branch="feature/payment-system", image="ghcr.io/x/exampleco-core:abc",
         commit="abc123", actor="api:test-user",
     )
@@ -124,6 +129,7 @@ async def test_deployed_by_is_the_same_actor_the_state_audit_records(deployment_
     of thing; this test is what stops that drifting back in.
     """
     result = await deployment_service.version_update(
+        key_environment="all",
         repo="exampleco-core", branch="feature/payment-system", image="ghcr.io/x/exampleco-core:abc",
         commit="abc123", actor="api:someone-else",
     )
@@ -142,6 +148,7 @@ async def test_deployed_by_survives_every_later_transition(deployment_service, r
     never overwritten by a subsequent state change. Written once, true forever --
     which is why DR-0032 needs no ``core/`` or machine-table change at all."""
     result = await deployment_service.version_update(
+        key_environment="all",
         repo="exampleco-core", branch="feature/payment-system", image="ghcr.io/x/exampleco-core:abc",
         commit="abc123", actor="api:test-user",
     )
@@ -195,6 +202,7 @@ services:
 """
     )
     result = await deployment_service.version_update(
+        key_environment="all",
         repo="exampleco-core", branch="feature/payment-system", image="ghcr.io/x/exampleco-core:abc",
         commit="abc123", actor="api:test-user",
     )
@@ -216,6 +224,7 @@ services:
 
 async def test_reuses_existing_active_cluster_for_same_repo_branch_environment(deployment_service, repos, uow, dispatcher, clock):
     first = await deployment_service.version_update(
+        key_environment="all",
         repo="exampleco-core", branch="feature/payment-system", image="ghcr.io/x/exampleco-core:abc",
         commit="abc123", actor="api:test-user",
     )
@@ -226,6 +235,7 @@ async def test_reuses_existing_active_cluster_for_same_repo_branch_environment(d
     )
 
     second = await deployment_service.version_update(
+        key_environment="all",
         repo="exampleco-core", branch="feature/payment-system", image="ghcr.io/x/exampleco-core:def",
         commit="def456", actor="api:test-user",
     )
@@ -260,6 +270,7 @@ async def test_redeploy_onto_the_original_active_cluster_actually_starts(
     "both" part.
     """
     first = await deployment_service.version_update(
+        key_environment="all",
         repo="exampleco-core", branch="feature/payment-system", image="ghcr.io/x/exampleco-core:abc",
         commit="abc123", actor="api:test-user",
     )
@@ -290,6 +301,7 @@ async def test_missing_profile_aborts_before_any_cluster_is_created(deployment_s
     empty_config_dir.mkdir()
     deployment_service._config_dir = empty_config_dir  # test-profile.yml unreachable here
     result = await deployment_service.version_update(
+        key_environment="all",
         repo="exampleco-core", branch="feature/missing-profile", image="ghcr.io/x/exampleco-core:x",
         commit="x", actor="api:test-user",
     )
@@ -310,6 +322,7 @@ async def test_missing_profile_still_rejects_deployment_when_cluster_already_exi
     infrastructure is provisioned, matching v1's redeploy-target case (the
     cluster_id was already resolved before the profile fetch)."""
     first = await deployment_service.version_update(
+        key_environment="all",
         repo="exampleco-core", branch="feature/payment-system", image="ghcr.io/x/exampleco-core:abc",
         commit="abc123", actor="api:test-user",
     )
@@ -322,6 +335,7 @@ async def test_missing_profile_still_rejects_deployment_when_cluster_already_exi
     empty_config_dir.mkdir()
     deployment_service._config_dir = empty_config_dir  # test-profile.yml unreachable here
     result = await deployment_service.version_update(
+        key_environment="all",
         repo="exampleco-core", branch="feature/payment-system", image="ghcr.io/x/exampleco-core:def",
         commit="def456", actor="api:test-user",
     )
@@ -391,6 +405,7 @@ services:
         default_provider="fake", default_profile="needs-registry",
     )
     result = await service.version_update(
+        key_environment="all",
         repo="exampleco-core", branch="feature/needs-registry", image="ghcr.io/x/exampleco-core:x",
         commit="x", actor="api:test-user",
     )
@@ -436,6 +451,7 @@ async def test_manifest_resolution_never_runs_inside_an_open_uow(
         deployment_audits=deployment_audits_repo, secrets=secrets_repo, default_provider="fake",
     )
     result = await service.version_update(
+        key_environment="all",
         repo="exampleco-core", branch="feature/dr0008", image="ghcr.io/x/exampleco-core:x",
         commit="x", actor="api:test-user",
     )
@@ -445,6 +461,7 @@ async def test_manifest_resolution_never_runs_inside_an_open_uow(
 
 async def test_deployment_preview_mirrors_without_persisting(deployment_service, repos, uow):
     preview = await deployment_service.deployment_preview(
+        key_environment="all",
         deployment_profile_name="test-profile",
         triggering_repo="exampleco-core",
         triggering_branch="feature/preview-test",
@@ -476,6 +493,7 @@ async def test_real_secrets_are_loaded_and_threaded_into_resolve(
         )
 
     result = await deployment_service.version_update(
+        key_environment="all",
         repo="exampleco-core", branch="feature/secrets-test", image="ghcr.io/x/exampleco-core:secrets123",
         commit="secrets123", actor="api:test-user",
     )
@@ -524,6 +542,7 @@ async def test_unknown_environment_fails_secret_loading_loudly_not_as_zero_secre
         deployment_audits=deployment_audits_repo, secrets=secrets_repo, default_provider="fake",
     )
     result = await service.version_update(
+        key_environment="all",
         repo="exampleco-core", branch="feature/weird-env", image="ghcr.io/x/exampleco-core:x",
         commit="x", actor="api:test-user",
     )
@@ -582,6 +601,7 @@ async def test_deployment_preview_secret_bearing_profile_succeeds_via_redaction(
     )
 
     preview = await service.deployment_preview(
+        key_environment="all",
         deployment_profile_name="exampleco-web-2",
         triggering_repo="exampleco-web-2",
         triggering_branch="feature/dr-0026-preview",
@@ -608,6 +628,7 @@ async def test_deployment_preview_missing_secret_raises_not_silently_lenient(
 
     with pytest.raises(PermanentError, match="tailscale_auth_key"):
         await service.deployment_preview(
+            key_environment="all",
             deployment_profile_name="exampleco-web-2",
             triggering_repo="exampleco-web-2",
             triggering_branch="feature/dr-0026-preview-missing",
@@ -659,6 +680,7 @@ async def test_deployment_preview_renders_a_provider_host_profile_via_synthetic_
     )
 
     preview = await service.deployment_preview(
+        key_environment="all",
         deployment_profile_name="hostful",
         triggering_repo="app",
         triggering_branch="staging",
@@ -730,6 +752,7 @@ services:
     )
 
     result = await service.deploy_direct(
+        key_environment="all",
         profile_name="divergent-env-profile", environment="staging",
         repo="exampleco-core", branch="feature/dr-0027", image="ghcr.io/x/exampleco-core:dr0027",
         commit="dr0027", actor="api:test-user",
@@ -764,6 +787,7 @@ async def test_deployment_preview_environment_override_is_exact(
     )
 
     preview = await service.deployment_preview(
+        key_environment="all",
         deployment_profile_name="exampleco-web-2",
         triggering_repo="exampleco-web-2",
         triggering_branch="feature/dr-0027-override",
@@ -795,6 +819,7 @@ async def test_deployment_preview_without_override_falls_back_to_profile_environ
 
     with pytest.raises(PermanentError, match="tailscale_auth_key"):
         await service.deployment_preview(
+            key_environment="all",
             deployment_profile_name="exampleco-web-2",
             triggering_repo="exampleco-web-2",
             triggering_branch="feature/dr-0027-no-override",
@@ -842,13 +867,14 @@ async def test_preset_deploy_data_initialization_reaches_the_stored_audit_end_to
     preset_service = PresetService(PresetRepository(), deployment_service, uow, clock, id_gen, config_dir)
 
     preset = await preset_service.create(
+        key_environment="all",
         name="restore-preset", description=None, profile_name="test-profile",
         service_overrides={"exampleco-core": {"tag": "v1"}}, default_branch="main", default_ttl_hours=None,
         naming_strategy=None, created_by="api:test-user",
     )
 
     result = await preset_service.deploy(
-        preset.id, data_initialization={"restore_from_snapshot": "snap-abc123"}, actor="api:test-user",
+        preset.id, key_environment="all", data_initialization={"restore_from_snapshot": "snap-abc123"}, actor="api:test-user",
     )
     assert result.status == "queued"
 
@@ -931,6 +957,7 @@ async def test_provider_host_profile_defers_at_decision_time_then_rehydrates_at_
             secrets_repo.upsert(tx, environment="ephemeral", key_name=key, value=f"{key}-value", key_class="DEV", clock=clock)
 
     result = await service.deploy_direct(
+        key_environment="all",
         profile_name="exampleco-dev-stack-nodns", environment="ephemeral", repo="exampleco-api",
         branch="feature/dr-0025-e2", image="ghcr.io/exampleco/exampleco-core:e2test", commit="e2test",
         image_overrides=_NODNS_REQUIRED_IMAGE_OVERRIDES, actor="api:test-user",

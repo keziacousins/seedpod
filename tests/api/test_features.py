@@ -56,6 +56,7 @@ async def _birth_active_snapshot_cluster(
     app, *, actor: str = "api:test-user", profile_name: str = "snapshot-stack", branch: str = "main"
 ) -> tuple[str, str]:
     result = await app.services.deployments.deploy_direct(
+        key_environment="all",
         profile_name=profile_name, environment="ephemeral", repo="snap-test", branch=branch,
         image="ghcr.io/x/web:main", commit="abc123", ttl_hours=None, actor=actor,
     )

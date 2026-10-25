@@ -20,5 +20,5 @@ router = APIRouter(tags=["permissions"])
 
 
 @router.get("/permissions")
-async def list_permissions(_api_key=Depends(require_permission("*"))) -> dict[str, Any]:  # noqa: B008
+async def list_permissions(_api_key=Depends(require_permission("*", all_environments=True))) -> dict[str, Any]:  # noqa: B008
     return {"permissions": AVAILABLE_PERMISSIONS, "categories": PERMISSION_CATEGORIES}

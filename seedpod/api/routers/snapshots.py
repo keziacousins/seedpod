@@ -47,8 +47,9 @@ from seedpod.app.services.snapshot_service import (
     SnapshotIncompatible,
     SnapshotNotFound,
 )
+from seedpod.core.environment_scope import ALL_ENVIRONMENTS, check_environment, environment_admits
 from seedpod.core.errors import InfrastructureUnreachableError
-from seedpod.data.repositories import SnapshotRow, WorkflowRunRow
+from seedpod.data.repositories import ApiKeyRow, ClusterRow, SnapshotRow, WorkflowRunRow
 
 __all__ = ["router"]
 
@@ -102,37 +103,70 @@ def _serialize_history(row: WorkflowRunRow) -> dict[str, Any]:
     }
 
 
+async def _cluster_environments(app: Any) -> dict[str, str]:
+    """DR-0054: a snapshot has no environment of its own; it has its source
+    cluster's. Cluster rows are never deleted (destroy is a status), so every
+    ``source_cluster_id`` is in this map."""
+    return {c.id: c.environment for c in await app.services.clusters.list(show_destroyed=True)}
+
+
+async def _snapshot_in_scope(app: Any, api_key: ApiKeyRow, snapshot_id: str) -> SnapshotRow:
+    """DR-0054: 404 if the snapshot is not there, 403 (``EnvironmentNotAdmitted``) if
+    the key's environment does not admit its source cluster's."""
+    try:
+        row = await app.services.snapshots.get(snapshot_id)
+    except SnapshotNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    source = await app.services.clusters.get(row.source_cluster_id)
+    check_environment(api_key.environment, source.environment, subject=f"snapshot {row.id}")
+    return row
+
+
+async def _cluster_in_scope(app: Any, api_key: ApiKeyRow, cluster_id: str) -> ClusterRow:
+    try:
+        cluster = await app.services.clusters.get(cluster_id)
+    except ClusterNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    check_environment(api_key.environment, cluster.environment, subject=f"cluster {cluster.id}")
+    return cluster
+
+
 @router.get("")
 async def list_snapshots(
     request: Request,
     branch: str | None = None,
     profile: str | None = None,
-    _api_key=Depends(require_permission("snapshots:read")),  # noqa: B008
+    api_key=Depends(require_permission("snapshots:read")),  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
     rows = await app.services.snapshots.list(branch=branch, profile=profile)
+    if api_key.environment != ALL_ENVIRONMENTS:  # DR-0054; an 'all' key skips the cluster read
+        environments = await _cluster_environments(app)
+        rows = [r for r in rows if environment_admits(api_key.environment, environments.get(r.source_cluster_id, ""))]
     return {"snapshots": [_serialize(r) for r in rows]}
 
 
 @router.get("/clusters/{cluster_id}/restore-history")
 async def restore_history(
-    cluster_id: str, request: Request, _api_key=Depends(require_permission("snapshots:read"))  # noqa: B008
+    cluster_id: str, request: Request, api_key=Depends(require_permission("snapshots:read"))  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
+    try:
+        cluster = await app.services.clusters.get(cluster_id)
+    except ClusterNotFound:
+        cluster = None  # unchanged: an unknown cluster has an empty history, not a 404
+    if cluster is not None:
+        check_environment(api_key.environment, cluster.environment, subject=f"cluster {cluster.id}")
     rows = await app.services.snapshots.restore_history(cluster_id)
     return {"restore_history": [_serialize_history(r) for r in rows]}
 
 
 @router.get("/{snapshot_id}")
 async def get_snapshot(
-    snapshot_id: str, request: Request, _api_key=Depends(require_permission("snapshots:read"))  # noqa: B008
+    snapshot_id: str, request: Request, api_key=Depends(require_permission("snapshots:read"))  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
-    try:
-        row = await app.services.snapshots.get(snapshot_id)
-    except SnapshotNotFound as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    return _serialize(row, detail=True)
+    return _serialize(await _snapshot_in_scope(app, api_key, snapshot_id), detail=True)
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -140,10 +174,7 @@ async def create_snapshot(
     body: CreateSnapshotRequest, request: Request, api_key=Depends(require_permission("snapshots:create"))  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
-    try:
-        cluster = await app.services.clusters.get(body.cluster_id)
-    except ClusterNotFound as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    cluster = await _cluster_in_scope(app, api_key, body.cluster_id)
     if cluster.status != "active":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -164,10 +195,11 @@ async def restore_snapshot(
     api_key=Depends(require_permission("snapshots:create")),  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
-    try:
-        cluster = await app.services.clusters.get(body.cluster_id)
-    except ClusterNotFound as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    # DR-0054: both ends. The key must admit the cluster that gets the data and the
+    # cluster the data came from -- or a staging key could pour production data
+    # into a staging cluster.
+    cluster = await _cluster_in_scope(app, api_key, body.cluster_id)
+    await _snapshot_in_scope(app, api_key, snapshot_id)
     try:
         result = await app.services.snapshots.restore(
             snapshot_id, cluster_id=body.cluster_id, services=body.services,
@@ -215,9 +247,10 @@ async def restore_snapshot(
 
 @router.delete("/{snapshot_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_snapshot(
-    snapshot_id: str, request: Request, _api_key=Depends(require_permission("snapshots:delete"))  # noqa: B008
+    snapshot_id: str, request: Request, api_key=Depends(require_permission("snapshots:delete"))  # noqa: B008
 ) -> None:
     app = get_app(request)
+    await _snapshot_in_scope(app, api_key, snapshot_id)
     try:
         await app.services.snapshots.delete(snapshot_id)
     except SnapshotNotFound as exc:
