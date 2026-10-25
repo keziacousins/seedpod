@@ -154,6 +154,7 @@ from seedpod.app.services.profiles import load_deployment_profile
 from seedpod.core.clock import Clock
 from seedpod.core.cluster_spec import allocate_cluster_cidrs
 from seedpod.core.deploy_wave import DEFERRED_MANIFEST_RENDERING_KEY
+from seedpod.core.environment_scope import check_environment
 from seedpod.core.errors import ErrorCode, PermanentError
 from seedpod.core.events import (
     CancelRequested,
@@ -377,7 +378,11 @@ class DeploymentService:
         commit: str,
         tag: str | None = None,
         actor: str,
+        key_environment: str,
     ) -> DeploymentResponse:
+        """``key_environment`` (DR-0054) is the calling key's environment. It has no
+        default, so a caller cannot forget it. The rules choose the environment, so
+        it is checked in ``_deploy``, after the rules and before any write."""
         decision = self._rules.evaluate(repo, branch, tag)
         if decision.action == "no_action":
             return DeploymentResponse(
@@ -394,6 +399,7 @@ class DeploymentService:
         return await self._deploy(
             profile_name=profile_name, environment=environment, repo=repo, branch=branch, image=image,
             commit=commit, ttl_hours=ttl_hours, actor=actor, reason=decision.reason,
+            key_environment=key_environment,
         )
 
     async def deploy_direct(
@@ -411,6 +417,7 @@ class DeploymentService:
         reason: str = "",
         data_initialization: Mapping[str, Any] | None = None,
         actor: str,
+        key_environment: str,
     ) -> DeploymentResponse:
         """The preset-deploy entrypoint (Round 6, api-features): the SAME
         birth/manifest-resolution/audit/``Dispatcher.apply()`` pipeline
@@ -438,7 +445,7 @@ class DeploymentService:
             profile_name=profile_name, environment=environment, repo=repo, branch=branch, image=image,
             commit=commit, ttl_hours=ttl_hours, actor=actor, reason=reason,
             provider_override=provider_override, image_overrides=image_overrides,
-            data_initialization=data_initialization,
+            data_initialization=data_initialization, key_environment=key_environment,
         )
 
     async def _deploy(
@@ -453,6 +460,7 @@ class DeploymentService:
         ttl_hours: float | None,
         actor: str,
         reason: str,
+        key_environment: str,
         provider_override: str | None = None,
         image_overrides: Mapping[str, str] | None = None,
         data_initialization: Mapping[str, Any] | None = None,
@@ -476,7 +484,12 @@ class DeploymentService:
         deferred resolve is still ``resolution_error is None``, taking the
         SAME success path below as any other deploy, audit row and all) and
         only what `resolved_config`/`resolved.rendered_manifests` actually
-        CONTAIN differs for this one case."""
+        CONTAIN differs for this one case.
+
+        **DR-0054.** The first thing this method does is check ``key_environment``
+        against ``environment``. Both entrypoints come through here, and nothing has
+        been read or written yet, so a refused deploy leaves no row behind."""
+        check_environment(key_environment, environment, subject=f"a deployment of {repo}@{branch}")
         now = self._clock.now()
 
         async with self._uow() as tx:
@@ -668,6 +681,7 @@ class DeploymentService:
         triggering_image: str,
         commit_sha: str | None = None,
         environment: str | None = None,
+        key_environment: str,
     ) -> DeploymentPreviewResponse:
         """Mirrors ``version_update``'s manifest-resolution half without
         PERSISTING anything (unchanged contract: no ``Dispatcher.apply()``, no
@@ -727,6 +741,8 @@ class DeploymentService:
         # DR-0027: exact when supplied, else the profile's own environment_type
         # (an explicit approximation -- this method's own docstring above).
         preview_environment = environment if environment is not None else raw_profile.get("environment_type", "ephemeral")
+        # DR-0054: a preview lists the secret names of its environment.
+        check_environment(key_environment, preview_environment, subject="this preview")
         preview_cluster_slug = _cluster_slug_for(preview_cluster_id, repo=triggering_repo, branch=triggering_branch)
         resolved_config = _build_resolved_config(
             preview_cluster_id, preview_environment, raw_profile, config_overrides={},
@@ -838,11 +854,15 @@ class DeploymentService:
             message=f"redeployed from {deployment_id}", environment=original.environment,
         )
 
-    async def retrigger(self, deployment_id: str, *, actor: str) -> DeploymentResponse:
+    async def retrigger(self, deployment_id: str, *, actor: str, key_environment: str) -> DeploymentResponse:
         """Re-run the FULL version-update decision (fresh manifest resolution)
         for the original deployment's triggering repo/branch/image, per ui-
-        contract's ``result.new_deployment_id``."""
+        contract's ``result.new_deployment_id``.
+
+        DR-0054: two environment checks. The original deployment's, here; and the
+        new one's, in ``_deploy``. The rules run again, so the two can differ."""
         original = await self.get(deployment_id)
+        check_environment(key_environment, original.environment, subject=f"deployment {original.id}")
         if original.spec_ref is None:
             raise DeploymentNotFound(f"deployment {deployment_id} has no audit trail to retrigger from")
         async with self._uow() as tx:
@@ -853,6 +873,7 @@ class DeploymentService:
             image=audit.triggering_image,
             commit=audit.commit_sha or "",
             actor=actor,
+            key_environment=key_environment,
         )
 
 

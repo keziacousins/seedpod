@@ -29,6 +29,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from seedpod.api.deps import get_app
 from seedpod.api.permissions import has_permission
+from seedpod.core.environment_scope import ALL_ENVIRONMENTS
 from seedpod.data.repositories import ApiKeyRow
 
 __all__ = ["get_current_api_key", "require_permission"]
@@ -62,15 +63,26 @@ async def get_current_api_key(
     return key
 
 
-def require_permission(scope: str):
+def require_permission(scope: str, *, all_environments: bool = False):
     """Dependency factory: 401 (via ``get_current_api_key``) for a missing/invalid
-    key, 403 for a valid key that lacks ``scope`` (``permissions.has_permission``)."""
+    key, 403 for a valid key that lacks ``scope`` (``permissions.has_permission``).
+
+    ``all_environments=True`` (DR-0054) also refuses a key scoped to one
+    environment, for an action whose effect reaches every environment: key
+    management (a scoped ``*`` key could otherwise make an ``'all'`` key) and rule
+    or profile changes. Everything else checks the environment of the resource it
+    touches (``seedpod/core/environment_scope.py``)."""
 
     async def _dependency(api_key: ApiKeyRow = Depends(get_current_api_key)) -> ApiKeyRow:  # noqa: B008
         if not has_permission(api_key.permissions, scope):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=f"Insufficient permissions for operation: {scope}",
+            )
+        if all_environments and api_key.environment != ALL_ENVIRONMENTS:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"operation affects every environment; key is scoped to {api_key.environment!r}",
             )
         return api_key
 

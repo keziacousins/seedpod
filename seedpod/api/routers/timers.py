@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, Request
 
 from seedpod.api.auth import require_permission
 from seedpod.api.deps import get_app
+from seedpod.core.environment_scope import ALL_ENVIRONMENTS, environment_admits
 from seedpod.data.repositories import TimerRow
 
 __all__ = ["router"]
@@ -35,9 +36,18 @@ def _serialize(row: TimerRow) -> dict[str, Any]:
 
 @router.get("/timers")
 async def list_timers(
-    request: Request, _api_key=Depends(require_permission("workflows:read"))  # noqa: B008
+    request: Request, api_key=Depends(require_permission("workflows:read"))  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
     async with app.uow() as t:
         rows = app.repos.timers.list_all(t)
+        if api_key.environment != ALL_ENVIRONMENTS:
+            # DR-0054: every timer belongs to a cluster and has its environment. A timer
+            # on any other aggregate type is hidden from a scoped key, not shown.
+            environments = {c.id: c.environment for c in app.repos.clusters.list_all(t)}
+            rows = [
+                r for r in rows
+                if r.aggregate_type == "cluster"
+                and environment_admits(api_key.environment, environments.get(r.aggregate_id, ""))
+            ]
     return {"timers": [_serialize(r) for r in rows]}

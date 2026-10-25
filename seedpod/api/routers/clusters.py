@@ -76,8 +76,10 @@ adapts to the clean v2 contract -- no compatibility shims"):
   a destroy/extend -- uses ``clusters:update``.
 - ``GET /api/clusters/{id}/kubeconfig`` (DR-0053, new in v2) uses ``kubeconfig:read``,
   a category of its own: a kubeconfig is admin access to the cluster, so no
-  ``clusters:*`` key gets it without asking. It is also the one route here that
-  checks the key's environment against the cluster's.
+  ``clusters:*`` key gets it without asking.
+- DR-0054: every route here checks the key's environment against the cluster's
+  (``_cluster_in_scope``), and ``GET /api/clusters`` lists only the clusters the
+  key's environment admits.
 """
 
 from __future__ import annotations
@@ -90,13 +92,14 @@ from pydantic import BaseModel, Field
 
 from seedpod.api.auth import require_permission
 from seedpod.api.deps import get_app
-from seedpod.api.permissions import environment_admits
 from seedpod.app.services.cluster_service import ClusterNotFound, ClusterNotRehabilitatable
 from seedpod.core.cluster_access import access_hostname
+from seedpod.core.environment_scope import check_environment, environment_admits
 from seedpod.core.errors import ErrorCode, ProviderError
 from seedpod.core.machine import InvalidTransition
 from seedpod.core.records import ClusterState
 from seedpod.data.repositories import (
+    ApiKeyRow,
     ClusterRow,
     ClusterStateAuditRow,
     DeploymentAuditRepository,
@@ -159,6 +162,19 @@ async def _provider_read(coro: Any) -> Any:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ProviderError as exc:
         raise _http_error_for_provider_error(exc) from exc
+
+
+async def _cluster_in_scope(app: Any, api_key: ApiKeyRow, cluster_id: str) -> ClusterRow:
+    """DR-0054: every per-cluster route looks the cluster up here first. 404 if it is
+    not there, 403 (``EnvironmentNotAdmitted``) if the key's environment does not
+    admit the cluster's. The route then passes ``row.id`` on, so the cluster it acts
+    on is the one that was checked, even when the caller gave a slug."""
+    try:
+        row = await app.services.clusters.get(cluster_id)
+    except ClusterNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    check_environment(api_key.environment, row.environment, subject=f"cluster {row.id}")
+    return row
 
 
 # ---------------------------------------------------------------------------
@@ -319,10 +335,11 @@ async def list_clusters(
     request: Request,
     show_destroyed: bool = False,
     status: str | None = None,  # noqa: A002 -- ui-contract's `?status=active`, not the fastapi module
-    _api_key=Depends(require_permission("clusters:read")),  # noqa: B008
+    api_key=Depends(require_permission("clusters:read")),  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
     rows = await app.services.clusters.list(show_destroyed=show_destroyed, status=status)
+    rows = [r for r in rows if environment_admits(api_key.environment, r.environment)]  # DR-0054
     resolved = await _resolved_hostnames(app, rows)
     now = app.clock.now()
     return {"clusters": [_serialize_cluster(r, now=now, resolved_hostname=resolved.get(r.id)) for r in rows]}
@@ -330,13 +347,10 @@ async def list_clusters(
 
 @router.get("/clusters/{cluster_id}")
 async def get_cluster(
-    cluster_id: str, request: Request, _api_key=Depends(require_permission("clusters:read"))  # noqa: B008
+    cluster_id: str, request: Request, api_key=Depends(require_permission("clusters:read"))  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
-    try:
-        row = await app.services.clusters.get(cluster_id)
-    except ClusterNotFound as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    row = await _cluster_in_scope(app, api_key, cluster_id)
     resolved = await _resolved_hostnames(app, [row])
     return _serialize_cluster(row, now=app.clock.now(), resolved_hostname=resolved.get(row.id))
 
@@ -350,6 +364,7 @@ async def destroy_cluster(
     api_key=Depends(require_permission("clusters:delete")),  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
+    cluster_id = (await _cluster_in_scope(app, api_key, cluster_id)).id
     try:
         row = await app.services.clusters.destroy(
             cluster_id,
@@ -384,6 +399,7 @@ async def extend_cluster(
     api_key=Depends(require_permission("clusters:extend")),  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
+    cluster_id = (await _cluster_in_scope(app, api_key, cluster_id)).id
     try:
         row = await app.services.clusters.extend(cluster_id, ttl_hours=body.ttl_hours, actor=f"api:{api_key.username}")
     except ClusterNotFound as exc:
@@ -402,6 +418,7 @@ async def rehabilitate_cluster(
     cluster_id: str, request: Request, api_key=Depends(require_permission("clusters:update"))  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
+    cluster_id = (await _cluster_in_scope(app, api_key, cluster_id)).id
     try:
         row = await app.services.clusters.rehabilitate(cluster_id, actor=f"api:{api_key.username}")
     except LookupError as exc:
@@ -422,20 +439,11 @@ async def get_kubeconfig(
 ) -> dict[str, Any]:
     """DR-0053. ``kubeconfig:read`` only: ``clusters:read`` does not admit it, and
     neither does ``clusters:*``. The key's environment must also admit the
-    cluster's (``environment_admits``): a key scoped to ``staging`` gets 403 for a
+    cluster's (``_cluster_in_scope``): a key scoped to ``staging`` gets 403 for a
     ``production`` cluster. JSON, like ``GET /api/secrets/.../reveal``; the file
     itself is ``.kubeconfig``."""
     app = get_app(request)
-    try:
-        row = await app.services.clusters.get(cluster_id)
-    except ClusterNotFound as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    if not environment_admits(api_key.environment, row.environment):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"key is scoped to environment {api_key.environment!r}; "
-            f"cluster {row.id} is in {row.environment!r}",
-        )
+    row = await _cluster_in_scope(app, api_key, cluster_id)
     try:
         kubeconfig = app.services.clusters.kubeconfig(row, actor=f"api:{api_key.username}")
     except ProviderError as exc:
@@ -454,9 +462,10 @@ async def list_pods(
     cluster_id: str,
     request: Request,
     namespace: str | None = None,
-    _api_key=Depends(require_permission("clusters:read")),  # noqa: B008
+    api_key=Depends(require_permission("clusters:read")),  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
+    cluster_id = (await _cluster_in_scope(app, api_key, cluster_id)).id
     pods = await _provider_read(app.services.clusters.pods(cluster_id, namespace=namespace))
     return {"pods": [_serialize_pod(p) for p in pods]}
 
@@ -467,9 +476,10 @@ async def get_pod(
     namespace: str,
     pod_name: str,
     request: Request,
-    _api_key=Depends(require_permission("clusters:read")),  # noqa: B008
+    api_key=Depends(require_permission("clusters:read")),  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
+    cluster_id = (await _cluster_in_scope(app, api_key, cluster_id)).id
     result: PodDetailsResult = await _provider_read(
         app.services.clusters.pod_details(cluster_id, namespace, pod_name)
     )
@@ -491,9 +501,10 @@ async def get_pod_logs(
     container: str | None = None,
     tail_lines: int = 100,
     previous: bool = False,
-    _api_key=Depends(require_permission("clusters:read")),  # noqa: B008
+    api_key=Depends(require_permission("clusters:read")),  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
+    cluster_id = (await _cluster_in_scope(app, api_key, cluster_id)).id
     logs = await _provider_read(
         app.services.clusters.pod_logs(
             cluster_id, namespace, pod_name, container=container, tail_lines=tail_lines, previous=previous
@@ -508,9 +519,10 @@ async def list_cluster_events(
     request: Request,
     namespace: str | None = None,
     limit: int = 200,
-    _api_key=Depends(require_permission("clusters:read")),  # noqa: B008
+    api_key=Depends(require_permission("clusters:read")),  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
+    cluster_id = (await _cluster_in_scope(app, api_key, cluster_id)).id
     events = await _provider_read(app.services.clusters.events(cluster_id, namespace=namespace, limit=limit))
     return {"events": [_serialize_event(e) for e in events]}
 
@@ -522,13 +534,10 @@ async def list_cluster_events(
 
 @router.get("/clusters/{cluster_id}/deployments")
 async def list_cluster_deployments(
-    cluster_id: str, request: Request, _api_key=Depends(require_permission("clusters:read"))  # noqa: B008
+    cluster_id: str, request: Request, api_key=Depends(require_permission("clusters:read"))  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
-    try:
-        await app.services.clusters.get(cluster_id)
-    except ClusterNotFound as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    cluster_id = (await _cluster_in_scope(app, api_key, cluster_id)).id
     async with app.uow() as tx:
         rows = app.repos.deployments.list_for_cluster(tx, cluster_id)
     return {"deployments": [_serialize_cluster_deployment(r) for r in rows]}
@@ -539,13 +548,10 @@ async def cluster_audit(
     cluster_id: str,
     request: Request,
     limit: int = 50,
-    _api_key=Depends(require_permission("clusters:read")),  # noqa: B008
+    api_key=Depends(require_permission("clusters:read")),  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
-    try:
-        await app.services.clusters.get(cluster_id)
-    except ClusterNotFound as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    cluster_id = (await _cluster_in_scope(app, api_key, cluster_id)).id
     async with app.uow() as tx:
         rows = app.repos.cluster_state_audits.list_for_cluster(tx, cluster_id, limit=limit)
     return {"audit": [_serialize_audit(r) for r in rows]}

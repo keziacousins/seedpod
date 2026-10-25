@@ -54,8 +54,9 @@ belt-and-braces nicety on top of it, not a substitute for it."""
 
 from __future__ import annotations
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from seedpod.api.routers import (
     clusters,
@@ -76,6 +77,7 @@ from seedpod.api.routers import (
 )
 from seedpod.app.app import Services
 from seedpod.app.config import AppConfig
+from seedpod.core.environment_scope import EnvironmentNotAdmitted
 from seedpod.runtime.sse import SSEHub
 
 __all__ = ["create_api"]
@@ -84,6 +86,13 @@ __all__ = ["create_api"]
 def create_api(*, services: Services, hub: SSEHub, config: AppConfig) -> FastAPI:
     del services, hub  # construction-time signature parity only -- module docstring
     api = FastAPI(title="Seedpod")
+
+    # DR-0054: a key scoped to one environment asked for a resource in another. A
+    # service raises this at the point it learns the environment (some are chosen by
+    # rules, not by the request), so the mapping lives here, once, not per router.
+    @api.exception_handler(EnvironmentNotAdmitted)
+    async def _environment_not_admitted(_request: Request, exc: EnvironmentNotAdmitted) -> JSONResponse:
+        return JSONResponse(status_code=status.HTTP_403_FORBIDDEN, content={"detail": str(exc)})
 
     api.add_middleware(
         CORSMiddleware,

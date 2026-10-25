@@ -73,9 +73,15 @@ from seedpod.app.services.deployment_service import (
     DeploymentPreviewResponse,
     DeploymentResponse,
 )
+from seedpod.core.environment_scope import check_environment, environment_admits
 from seedpod.core.errors import ErrorCode, ProviderError
 from seedpod.core.machine import InvalidTransition, StaleVersion
-from seedpod.data.repositories import DeploymentAuditRepository, DeploymentAuditRow, DeploymentRow
+from seedpod.data.repositories import (
+    ApiKeyRow,
+    DeploymentAuditRepository,
+    DeploymentAuditRow,
+    DeploymentRow,
+)
 from seedpod.services.rules import RuleValidationError
 
 __all__ = ["router"]
@@ -130,6 +136,17 @@ def _http_error_for_provider_error(exc: ProviderError) -> HTTPException:
     if exc.code in (ErrorCode.AUTH,):
         return HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
     return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+
+async def _deployment_in_scope(app: Any, api_key: ApiKeyRow, deployment_id: str) -> DeploymentRow:
+    """DR-0054: 404 if the deployment is not there, 403 (``EnvironmentNotAdmitted``)
+    if the key's environment does not admit it."""
+    try:
+        row = await app.services.deployments.get(deployment_id)
+    except DeploymentNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    check_environment(api_key.environment, row.environment, subject=f"deployment {row.id}")
+    return row
 
 
 def _serialize_deployment_response(result: DeploymentResponse) -> dict[str, Any]:
@@ -228,12 +245,12 @@ async def version_update(
     app = get_app(request)
     result = await app.services.deployments.version_update(
         repo=body.repo, branch=body.branch, image=body.image, commit=body.commit,
-        tag=body.tag, actor=f"api:{api_key.username}",
+        tag=body.tag, actor=f"api:{api_key.username}", key_environment=api_key.environment,
     )
     return _serialize_deployment_response(result)
 
 
-async def _deployment_preview(body: DeploymentPreviewRequest, request: Request) -> dict[str, Any]:
+async def _deployment_preview(body: DeploymentPreviewRequest, request: Request, api_key: ApiKeyRow) -> dict[str, Any]:
     app = get_app(request)
     try:
         result = await app.services.deployments.deployment_preview(
@@ -243,6 +260,7 @@ async def _deployment_preview(body: DeploymentPreviewRequest, request: Request) 
             triggering_image=body.triggering_image,
             commit_sha=body.commit_sha,
             environment=body.environment,
+            key_environment=api_key.environment,
         )
     except ProviderError as exc:
         raise _http_error_for_provider_error(exc) from exc
@@ -253,19 +271,19 @@ async def _deployment_preview(body: DeploymentPreviewRequest, request: Request) 
 async def deployment_preview(
     body: DeploymentPreviewRequest,
     request: Request,
-    _api_key=Depends(require_permission("deployments:read")),  # noqa: B008
+    api_key=Depends(require_permission("deployments:read")),  # noqa: B008
 ) -> dict[str, Any]:
-    return await _deployment_preview(body, request)
+    return await _deployment_preview(body, request, api_key)
 
 
 @router.post("/version-update/preview")
 async def version_update_preview(
     body: DeploymentPreviewRequest,
     request: Request,
-    _api_key=Depends(require_permission("deployments:read")),  # noqa: B008
+    api_key=Depends(require_permission("deployments:read")),  # noqa: B008
 ) -> dict[str, Any]:
     """Alias of ``POST /api/deployment-preview`` -- module docstring."""
-    return await _deployment_preview(body, request)
+    return await _deployment_preview(body, request, api_key)
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +293,7 @@ async def version_update_preview(
 
 @router.post("/rules/{name}/disable")
 async def disable_rule(
-    name: str, request: Request, _api_key=Depends(require_permission("config:reload"))  # noqa: B008
+    name: str, request: Request, _api_key=Depends(require_permission("config:reload", all_environments=True))  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
     if not rules_admin.set_rule_enabled(app.rules, name, enabled=False):
@@ -285,7 +303,7 @@ async def disable_rule(
 
 @router.post("/rules/{name}/enable")
 async def enable_rule(
-    name: str, request: Request, _api_key=Depends(require_permission("config:reload"))  # noqa: B008
+    name: str, request: Request, _api_key=Depends(require_permission("config:reload", all_environments=True))  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
     if not rules_admin.set_rule_enabled(app.rules, name, enabled=True):
@@ -295,7 +313,7 @@ async def enable_rule(
 
 @router.post("/rules/reload")
 async def reload_rules(
-    request: Request, _api_key=Depends(require_permission("config:reload"))  # noqa: B008
+    request: Request, _api_key=Depends(require_permission("config:reload", all_environments=True))  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
     try:
@@ -307,7 +325,7 @@ async def reload_rules(
 
 @router.post("/deployment-profiles/reload")
 async def reload_deployment_profiles(
-    request: Request, _api_key=Depends(require_permission("config:reload"))  # noqa: B008
+    request: Request, _api_key=Depends(require_permission("config:reload", all_environments=True))  # noqa: B008
 ) -> dict[str, Any]:
     """``ManifestResolver``/``load_deployment_profile`` read every profile fresh
     from disk on every call (no in-process cache to invalidate -- ``seedpod/app/
@@ -331,22 +349,20 @@ async def list_deployments(
     request: Request,
     cluster_id: str | None = None,
     show_history: bool = False,
-    _api_key=Depends(require_permission("deployments:read")),  # noqa: B008
+    api_key=Depends(require_permission("deployments:read")),  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
     rows = await app.services.deployments.list(cluster_id=cluster_id, show_history=show_history)
+    rows = [r for r in rows if environment_admits(api_key.environment, r.environment)]  # DR-0054
     return {"deployments": [_serialize_deployment_summary(r) for r in rows]}
 
 
 @router.get("/deployments/{deployment_id}")
 async def get_deployment(
-    deployment_id: str, request: Request, _api_key=Depends(require_permission("deployments:read"))  # noqa: B008
+    deployment_id: str, request: Request, api_key=Depends(require_permission("deployments:read"))  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
-    try:
-        row = await app.services.deployments.get(deployment_id)
-    except DeploymentNotFound as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    row = await _deployment_in_scope(app, api_key, deployment_id)
 
     audits: list[DeploymentAuditRow] = []
     if row.spec_ref is not None:
@@ -368,6 +384,7 @@ async def redeploy_deployment(
     deployment_id: str, request: Request, api_key=Depends(require_permission("deployments:create"))  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
+    await _deployment_in_scope(app, api_key, deployment_id)  # redeploy copies the environment
     try:
         result = await app.services.deployments.redeploy(deployment_id, actor=f"api:{api_key.username}")
     except LookupError as exc:
@@ -383,7 +400,9 @@ async def retrigger_deployment(
 ) -> dict[str, Any]:
     app = get_app(request)
     try:
-        result = await app.services.deployments.retrigger(deployment_id, actor=f"api:{api_key.username}")
+        result = await app.services.deployments.retrigger(
+            deployment_id, actor=f"api:{api_key.username}", key_environment=api_key.environment
+        )
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except (InvalidTransition, StaleVersion) as exc:
@@ -407,6 +426,7 @@ async def cancel_deployment(
     reads no response fields and sends no body) -- a bodyless ``POST`` must not
     422."""
     app = get_app(request)
+    await _deployment_in_scope(app, api_key, deployment_id)
     reason = body.reason if body is not None else ""
     try:
         row = await app.services.deployments.cancel(

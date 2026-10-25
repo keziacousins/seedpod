@@ -46,6 +46,7 @@ def preset_service(
 
 async def _make_preset(service, *, default_provider=None, name="p1"):
     return await service.create(
+        key_environment="all",
         name=name,
         description=None,
         profile_name="infrastructure-only",
@@ -69,7 +70,7 @@ async def test_a_preset_pins_its_provider_and_beats_the_profile(preset_service, 
     correctness constraint. Resolved by making the choice visible (see the response
     test below) rather than by refusing on disagreement."""
     preset = await _make_preset(preset_service, default_provider="tart")
-    result = await preset_service.deploy(preset.id, actor="api:test")
+    result = await preset_service.deploy(preset.id, key_environment="all", actor="api:test")
 
     async with uow() as tx:
         cluster = repos.clusters.get(tx, result.cluster_id)
@@ -80,7 +81,7 @@ async def test_a_call_time_override_still_beats_the_preset(preset_service, repos
     """DR-0046 decision 2a precedence, rung 1 over rung 2. Nothing that worked before
     changes: the explicit flag is still the most specific thing anyone can say."""
     preset = await _make_preset(preset_service, default_provider="tart")
-    result = await preset_service.deploy(preset.id, provider_override="digitalocean", actor="api:test")
+    result = await preset_service.deploy(preset.id, key_environment="all", provider_override="digitalocean", actor="api:test")
 
     async with uow() as tx:
         cluster = repos.clusters.get(tx, result.cluster_id)
@@ -98,7 +99,7 @@ async def test_a_preset_with_no_provider_falls_through_to_the_profile(preset_ser
     pins a provider, so it is deliberately not re-asserted through this path rather
     than contrived into reach."""
     preset = await _make_preset(preset_service, default_provider=None)
-    result = await preset_service.deploy(preset.id, actor="api:test")
+    result = await preset_service.deploy(preset.id, key_environment="all", actor="api:test")
 
     async with uow() as tx:
         cluster = repos.clusters.get(tx, result.cluster_id)
@@ -114,11 +115,11 @@ async def test_the_deploy_response_names_the_provider_it_chose(preset_service):
     afterwards, or from the invoice. This is also what makes decision 2a's
     "preset beats profile" safe: the override is visible rather than silent."""
     preset = await _make_preset(preset_service, default_provider="tart")
-    result = await preset_service.deploy(preset.id, actor="api:test")
+    result = await preset_service.deploy(preset.id, key_environment="all", actor="api:test")
     assert result.provider == "tart"
 
     other = await _make_preset(preset_service, default_provider=None, name="p2")
-    assert (await preset_service.deploy(other.id, actor="api:test")).provider == "fake"
+    assert (await preset_service.deploy(other.id, key_environment="all", actor="api:test")).provider == "fake"
 
 
 async def test_the_provider_survives_a_round_trip_through_the_row(preset_service):
@@ -128,6 +129,6 @@ async def test_the_provider_survives_a_round_trip_through_the_row(preset_service
     preset = await _make_preset(preset_service, default_provider="tart")
     assert (await preset_service.get(preset.id)).default_provider == "tart"
 
-    updated = await preset_service.update(preset.id, default_provider="orbstack")
+    updated = await preset_service.update(preset.id, key_environment="all", default_provider="orbstack")
     assert updated.default_provider == "orbstack"
     assert (await preset_service.get(preset.id)).default_provider == "orbstack"

@@ -38,8 +38,9 @@ from seedpod.api.auth import require_permission
 from seedpod.api.deps import get_app
 from seedpod.app.services.deployment_service import DeploymentResponse
 from seedpod.app.services.preset_service import PresetNameExists, PresetNotFound
+from seedpod.core.environment_scope import check_environment, environment_admits
 from seedpod.core.errors import PermanentError
-from seedpod.data.repositories import PresetRow
+from seedpod.data.repositories import ApiKeyRow, PresetRow
 
 __all__ = ["router"]
 
@@ -147,27 +148,35 @@ def _serialize_deployment_response(result: DeploymentResponse) -> dict[str, Any]
     }
 
 
+async def _preset_in_scope(app: Any, api_key: ApiKeyRow, preset_id: str) -> PresetRow:
+    """DR-0054: 404 if the preset is not there, 403 (``EnvironmentNotAdmitted``) if
+    the key's environment does not admit the preset's."""
+    try:
+        row = await app.services.presets.get(preset_id)
+    except PresetNotFound as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    check_environment(api_key.environment, row.environment, subject=f"preset {row.name}")
+    return row
+
+
 @router.get("")
 async def list_presets(
     request: Request,
     profile: str | None = None,
-    _api_key=Depends(require_permission("deployments:read")),  # noqa: B008
+    api_key=Depends(require_permission("deployments:read")),  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
     rows = await app.services.presets.list(profile=profile)
+    rows = [r for r in rows if environment_admits(api_key.environment, r.environment)]  # DR-0054
     return {"presets": [_serialize(r) for r in rows]}
 
 
 @router.get("/{preset_id}")
 async def get_preset(
-    preset_id: str, request: Request, _api_key=Depends(require_permission("deployments:read"))  # noqa: B008
+    preset_id: str, request: Request, api_key=Depends(require_permission("deployments:read"))  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
-    try:
-        row = await app.services.presets.get(preset_id)
-    except PresetNotFound as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
-    return _serialize(row)
+    return _serialize(await _preset_in_scope(app, api_key, preset_id))
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -181,7 +190,7 @@ async def create_preset(
             service_overrides=body.service_overrides, default_branch=body.default_branch,
             default_ttl_hours=body.default_ttl_hours, default_provider=body.default_provider,
             naming_strategy=body.naming_strategy,
-            created_by=api_key.username,
+            created_by=api_key.username, key_environment=api_key.environment,
         )
     except PresetNameExists as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -193,7 +202,7 @@ async def create_preset(
 @router.put("/{preset_id}")
 async def update_preset(
     preset_id: str, body: PresetUpdateRequest, request: Request,
-    _api_key=Depends(require_permission("deployments:create")),  # noqa: B008
+    api_key=Depends(require_permission("deployments:create")),  # noqa: B008
 ) -> dict[str, Any]:
     app = get_app(request)
     try:
@@ -201,7 +210,7 @@ async def update_preset(
             preset_id, name=body.name, description=body.description, profile_name=body.profile_name,
             service_overrides=body.service_overrides, default_branch=body.default_branch,
             default_ttl_hours=body.default_ttl_hours, default_provider=body.default_provider,
-            naming_strategy=body.naming_strategy,
+            naming_strategy=body.naming_strategy, key_environment=api_key.environment,
         )
     except PresetNotFound as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
@@ -214,9 +223,10 @@ async def update_preset(
 
 @router.delete("/{preset_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_preset(
-    preset_id: str, request: Request, _api_key=Depends(require_permission("deployments:create"))  # noqa: B008
+    preset_id: str, request: Request, api_key=Depends(require_permission("deployments:create"))  # noqa: B008
 ) -> None:
     app = get_app(request)
+    await _preset_in_scope(app, api_key, preset_id)
     try:
         await app.services.presets.delete(preset_id)
     except PresetNotFound as exc:
@@ -238,7 +248,7 @@ async def deploy_preset(
             preset_id, branch=body.branch, service_overrides=body.service_overrides,
             provider_override=body.provider_override, ttl_hours=body.ttl_hours,
             cluster_name=body.cluster_name, data_initialization=data_init,
-            actor=f"api:{api_key.username}",
+            actor=f"api:{api_key.username}", key_environment=api_key.environment,
         )
     except PresetNotFound as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
