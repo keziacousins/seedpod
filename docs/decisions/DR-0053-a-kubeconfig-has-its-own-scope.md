@@ -32,8 +32,7 @@ JSON, `{cluster_id, slug, status, kubeconfig}`, like `GET /api/secrets/{env}/{ke
 deploy:
 
 ```sh
-curl -sf -H "Authorization: Bearer $KEY" "$SEEDPOD/api/clusters/$SLUG/kubeconfig" \
-  | jq -r .kubeconfig > ~/.kube/config
+seedpodctl clusters kubeconfig "$SLUG" -o ~/.kube/config
 ```
 
 A cluster with no kubeconfig yet (still provisioning, or failed first) is 404. An unknown cluster
@@ -45,13 +44,25 @@ category, so `clusters:kubeconfig` would go to every key that holds `clusters:*`
 would get admin access to clusters without anyone asking for it. With its own category, only
 `kubeconfig:read`, `kubeconfig:*` and `*` admit the route.
 
-**3. Each read writes one INFO log line** with the cluster id, the slug and the key's username.
+**3. The key's environment must admit the cluster's.** A key scoped to `'all'` can read any
+cluster's kubeconfig. A key scoped to an environment can read only the kubeconfig of a cluster in
+that same environment. Any other key gets 403, and the message names both environments. This
+holds for a key with `*` too: `*` grants every scope, not every environment. The rule is
+DR-0010's rule for SSE, applied to one REST route (`environment_admits` in
+`seedpod/api/permissions.py`).
+
+**4. `seedpodctl clusters kubeconfig <id-or-slug>` prints the file itself**, not the JSON
+around it. With `-o FILE` it writes the file with mode 0600 and replaces any old file in one
+rename. A shell redirect would make the file 0644 on most systems.
+
+**5. Each read writes one INFO log line** with the cluster id, the slug and the key's username.
 No database row records it. `cluster_state_audits` records state changes, and a read is not one.
 
 ## Consequences
 
 - To give an existing key this scope, make a new key and revoke the old one. Key permissions do
-  not change after a key is made (`seedpod/api/routers/keys.py`).
+  not change after a key is made (`seedpod/api/routers/keys.py`). The new key's environment
+  must be `'all'` or the environment of the clusters it will read.
 - The new scope shows in `GET /api/permissions`, so the SPA's key form offers it with no SPA
   change.
 - The server address in the kubeconfig is the one seedpod uses. Each provider rewrites it when it
@@ -59,8 +70,13 @@ No database row records it. `cluster_state_audits` records state changes, and a 
 
 ## Not decided here
 
-- **Environment-scoped keys.** The route does not compare the key's `environment` with the
-  cluster's. No other cluster route or secret reveal does that either. A key made for staging can
-  read a production kubeconfig if it holds `kubeconfig:read`.
+- **Environment scope on every other REST route.** DR-0010 says "REST responses are filtered by
+  the API key's environment scope", and DR-0013 says a non-production key "can neither watch nor
+  GET" a discovered cluster. v2 never built that filter. Only SSE (DR-0010) and this route check
+  a key's environment. On all other routes, a key scoped to `staging` can, for example, reveal a
+  production secret, read a production pod's logs and environment, destroy a production cluster,
+  or start a production deploy, if it holds the scope. This needs its own decision.
+- **Key environment values are not checked.** `POST /api/keys` accepts any string. A key made
+  with a typo, such as `prod`, matches no cluster, so this route refuses it. It is safe, but it
+  fails without a clear reason.
 - **A durable audit row.** If a read must be on record after the logs rotate, it needs a table.
-- **A `seedpodctl clusters kubeconfig` command.**

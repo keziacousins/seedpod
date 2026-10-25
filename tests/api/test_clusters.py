@@ -723,9 +723,9 @@ async def test_events_without_kubeconfig_is_404(app, client, auth_headers):
 # ---------------------------------------------------------------------------
 
 
-async def _headers_for(app, permissions: list[str]) -> dict[str, str]:
+async def _headers_for(app, permissions: list[str], *, environment: str = "all") -> dict[str, str]:
     _, plaintext = await app.services.api_keys.create_api_key(
-        username="deploy-vm", environment="all", permissions=permissions
+        username="deploy-vm", environment=environment, permissions=permissions
     )
     return {"Authorization": f"Bearer {plaintext}"}
 
@@ -755,6 +755,28 @@ async def test_kubeconfig_needs_its_own_scope(app, client):
     for permissions in (["kubeconfig:read"], ["kubeconfig:*"], ["*"]):
         response = await client.get("/api/clusters/c1/kubeconfig", headers=await _headers_for(app, permissions))
         assert response.status_code == 200, permissions
+
+
+async def test_kubeconfig_needs_a_key_whose_environment_admits_the_cluster(app, client):
+    """DR-0053: the key's environment must be ``'all'`` or the cluster's own."""
+    await _birth_cluster(app, "c1", slug="c1-slug", environment="ephemeral")
+    await _set_kubeconfig(app, "c1")
+    await _birth_cluster(app, "s1", slug="s1-slug", environment="staging")
+    await _set_kubeconfig(app, "s1", environment="staging")
+
+    ephemeral_key = await _headers_for(app, ["kubeconfig:read"], environment="ephemeral")
+    assert (await client.get("/api/clusters/c1/kubeconfig", headers=ephemeral_key)).status_code == 200
+    refused = await client.get("/api/clusters/s1-slug/kubeconfig", headers=ephemeral_key)
+    assert refused.status_code == 403
+    assert "'ephemeral'" in refused.json()["detail"] and "'staging'" in refused.json()["detail"]
+
+    staging_key = await _headers_for(app, ["kubeconfig:read"], environment="staging")
+    assert (await client.get("/api/clusters/s1/kubeconfig", headers=staging_key)).status_code == 200
+    assert (await client.get("/api/clusters/c1/kubeconfig", headers=staging_key)).status_code == 403
+
+    # The super-wildcard grants every scope, not every environment.
+    scoped_admin = await _headers_for(app, ["*"], environment="production")
+    assert (await client.get("/api/clusters/c1/kubeconfig", headers=scoped_admin)).status_code == 403
 
 
 async def test_kubeconfig_requires_auth(app, client):

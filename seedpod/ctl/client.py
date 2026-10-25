@@ -242,6 +242,9 @@ class SeedpodClient:
         params = {"force": force, "snapshot_before_destroy": snapshot_before_destroy}
         return await self._request("DELETE", f"/api/clusters/{cluster_id}", params=params)
 
+    async def cluster_kubeconfig(self, cluster_id: str) -> Any:
+        return await self._request("GET", f"/api/clusters/{cluster_id}/kubeconfig")
+
     async def cluster_pods(self, cluster_id: str, *, namespace: str | None = None) -> Any:
         return await self._request(
             "GET", f"/api/clusters/{cluster_id}/pods", params={"namespace": namespace}

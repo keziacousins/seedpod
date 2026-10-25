@@ -341,17 +341,17 @@ class ClusterService:
             raise ClusterHasNoKubeconfig(cluster_id)
         return self._crypto.decrypt(row.encrypted_kubeconfig, row.kubeconfig_key_class)
 
-    async def kubeconfig(self, id_or_slug: str, *, actor: str) -> tuple[ClusterRow, str]:
+    def kubeconfig(self, row: ClusterRow, *, actor: str) -> str:
         """DR-0053: the decrypted kubeconfig, for ``GET /api/clusters/{id}/kubeconfig``.
-        No database row records the read, so the log line is the only trace of who
-        took a copy. Takes an id or a slug, like ``get``: a caller that fetches after
-        each deploy knows the slug before it knows the id."""
-        row = await self.get(id_or_slug)
+        Takes the row the router already looked up and checked against the key's
+        environment, so the check and the decrypt are about the same cluster. No
+        database row records the read, so the log line is the only trace of who took
+        a copy."""
         if row.encrypted_kubeconfig is None or row.kubeconfig_key_class is None:
             raise ClusterHasNoKubeconfig(row.id)
         kubeconfig = self._crypto.decrypt(row.encrypted_kubeconfig, row.kubeconfig_key_class)
         _log.info("kubeconfig for cluster %s (%s) read by %s", row.id, row.slug, actor)
-        return row, kubeconfig
+        return kubeconfig
 
     async def _execute_kubectl(self, cmd) -> object:
         result = None

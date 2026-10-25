@@ -76,7 +76,8 @@ adapts to the clean v2 contract -- no compatibility shims"):
   a destroy/extend -- uses ``clusters:update``.
 - ``GET /api/clusters/{id}/kubeconfig`` (DR-0053, new in v2) uses ``kubeconfig:read``,
   a category of its own: a kubeconfig is admin access to the cluster, so no
-  ``clusters:*`` key gets it without asking.
+  ``clusters:*`` key gets it without asking. It is also the one route here that
+  checks the key's environment against the cluster's.
 """
 
 from __future__ import annotations
@@ -89,6 +90,7 @@ from pydantic import BaseModel, Field
 
 from seedpod.api.auth import require_permission
 from seedpod.api.deps import get_app
+from seedpod.api.permissions import environment_admits
 from seedpod.app.services.cluster_service import ClusterNotFound, ClusterNotRehabilitatable
 from seedpod.core.cluster_access import access_hostname
 from seedpod.core.errors import ErrorCode, ProviderError
@@ -419,13 +421,23 @@ async def get_kubeconfig(
     cluster_id: str, request: Request, api_key=Depends(require_permission("kubeconfig:read"))  # noqa: B008
 ) -> dict[str, Any]:
     """DR-0053. ``kubeconfig:read`` only: ``clusters:read`` does not admit it, and
-    neither does ``clusters:*``. JSON, like ``GET /api/secrets/.../reveal``; the
-    file itself is ``.kubeconfig``."""
+    neither does ``clusters:*``. The key's environment must also admit the
+    cluster's (``environment_admits``): a key scoped to ``staging`` gets 403 for a
+    ``production`` cluster. JSON, like ``GET /api/secrets/.../reveal``; the file
+    itself is ``.kubeconfig``."""
     app = get_app(request)
     try:
-        row, kubeconfig = await app.services.clusters.kubeconfig(cluster_id, actor=f"api:{api_key.username}")
-    except LookupError as exc:
+        row = await app.services.clusters.get(cluster_id)
+    except ClusterNotFound as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    if not environment_admits(api_key.environment, row.environment):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"key is scoped to environment {api_key.environment!r}; "
+            f"cluster {row.id} is in {row.environment!r}",
+        )
+    try:
+        kubeconfig = app.services.clusters.kubeconfig(row, actor=f"api:{api_key.username}")
     except ProviderError as exc:
         # ClusterHasNoKubeconfig (NOT_FOUND) -> 404: still provisioning, or failed first.
         raise _http_error_for_provider_error(exc) from exc
