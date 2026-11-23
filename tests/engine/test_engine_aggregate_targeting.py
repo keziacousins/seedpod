@@ -74,8 +74,7 @@ def test_a_deploy_run_with_no_deployment_is_an_error_not_a_cluster_target(engine
         _target(engine, "deploy-waves", cluster_id="c1")
 
 
-async def test_adopting_an_instance_run_fails_it_explicitly_without_touching_any_aggregate(tmp_path):
-    h = build_engine(tmp_path, {}, [], FrozenClock(NOW))
+async def _insert_instance_and_run(h, *, status: str, workflow: str = "provision-tart", finished_at=None):
     run_id, instance_id = str(uuid.uuid4()), str(uuid.uuid4())
     async with h.uow() as tx:
         tx.execute(
@@ -92,11 +91,21 @@ async def test_adopting_an_instance_run_fails_it_explicitly_without_touching_any
             {"id": instance_id, "now": NOW.isoformat()},
         )
         h.run_repo.insert(tx, WorkflowRunRow(
-            id=run_id, workflow="provision-tart", workflow_version=1, cluster_id=None,
-            instance_id=instance_id, deployment_id=None, dedupe_key=None, args={}, status="pending",
+            id=run_id, workflow=workflow, workflow_version=1, cluster_id=None,
+            instance_id=instance_id, deployment_id=None, dedupe_key=None, args={}, status=status,
             cancel_requested=False, failed_step=None, error=None, undo_incomplete=None,
-            initiated_by=None, created_at=NOW, started_at=None, finished_at=None,
+            initiated_by=None, created_at=NOW, started_at=None, finished_at=finished_at,
         ))
+    return run_id, instance_id
+
+
+async def test_an_instance_run_with_no_definition_fails_for_that_reason_and_reports_to_its_instance(tmp_path):
+    """The temporary guard that failed every instance run is gone. An instance run now takes the
+    same path as a cluster run, so one whose workflow is not defined fails for THAT reason. Unlike a
+    cluster run, it also reports the failure to its instance (from the workflow's name, since there
+    is no definition to read an outcome from): the instance is waiting on it."""
+    h = build_engine(tmp_path, {}, [], FrozenClock(NOW))
+    run_id, _ = await _insert_instance_and_run(h, status="pending")
 
     await h.engine.start(run_id)
     await h.engine.wait_for(run_id)
@@ -105,6 +114,60 @@ async def test_adopting_an_instance_run_fails_it_explicitly_without_touching_any
         run = h.run_repo.get(tx, run_id)
         steps = h.step_repo.list_for_run(tx, run_id)
     assert run.status == "failed" and run.finished_at == NOW
-    assert run.error["kind"] == "permanent" and instance_id in run.error["message"]
+    assert run.error["kind"] == "permanent" and "unknown workflow 'provision-tart'" in run.error["message"]
     assert steps == []
-    assert h.dispatcher.calls == []  # no event reached any aggregate
+    (call,) = h.dispatcher.calls  # exactly one event, to the instance, and nothing for a cluster
+    assert (call.aggregate, type(call.event).__name__) == ("instance", "InstanceProvisionFailed")
+    assert "unknown workflow 'provision-tart'" in call.event.reason
+    assert call.tx is not None  # in the transaction that marked the run failed
+
+
+@pytest.mark.parametrize("status", ["succeeded", "failed", "cancelled"])
+async def test_a_terminal_instance_run_is_never_rewritten_when_it_is_adopted_again(tmp_path, status):
+    """The old guard wrote `failed` over a `succeeded` instance run. Nothing that replaces it may touch
+    a run that is already terminal -- not the unknown-workflow failure, not the outcome event."""
+    h = build_engine(tmp_path, {}, [], FrozenClock(NOW))
+    finished = NOW.replace(hour=1)
+    run_id, _ = await _insert_instance_and_run(h, status=status, finished_at=finished)
+    async with h.uow() as tx:
+        h.run_repo.update(tx, run_id, error={"kind": "permanent", "step": None, "message": "original"})
+        before = h.run_repo.get(tx, run_id)
+
+    await h.engine.start(run_id)  # a replayed admission
+    await h.engine.wait_for(run_id)
+    await h.engine.resume_inflight()  # and the startup sweep, which only picks up live runs
+
+    async with h.uow() as tx:
+        after = h.run_repo.get(tx, run_id)
+    assert after == before
+    assert after.status == status and after.finished_at == finished
+    assert h.dispatcher.calls == []
+
+
+@pytest.mark.parametrize("status", ["succeeded", "failed", "cancelled"])
+async def test_a_terminal_cluster_run_with_no_definition_is_handled_exactly_as_before_dr_0055(tmp_path, status):
+    """The terminal-run early return is for INSTANCE runs. A cluster run takes the path it took at
+    HEAD, which includes a KNOWN quirk: adopting a finished run whose workflow has no definition
+    rewrites it to `failed`. This test pins "unchanged", not "right" -- the quirk is the owner's to
+    raise as its own issue, and the day it is fixed this assertion flips with it."""
+    h = build_engine(tmp_path, {}, [], FrozenClock(NOW))
+    async with h.uow() as tx:
+        tx.execute(
+            text(
+                "INSERT INTO clusters (id, name, slug, environment, status, provider, created_at, updated_at)"
+                " VALUES ('c1', 'c1', 'c1', 'e', 'active', 'tart', :now, :now)"
+            ),
+            {"now": NOW.isoformat()},
+        )
+        h.run_repo.insert(tx, WorkflowRunRow(
+            id="r1", workflow="no-such-workflow", workflow_version=1, cluster_id="c1", instance_id=None,
+            deployment_id=None, dedupe_key=None, args={}, status=status, cancel_requested=False,
+            failed_step=None, error=None, undo_incomplete=None, initiated_by=None, created_at=NOW,
+            started_at=NOW, finished_at=NOW,
+        ))
+    await h.engine.start("r1")
+    await h.engine.wait_for("r1")
+    async with h.uow() as tx:
+        run = h.run_repo.get(tx, "r1")
+    assert run.status == "failed"  # HEAD: rewritten, whatever it was
+    assert run.error["message"] == "unknown workflow 'no-such-workflow'"

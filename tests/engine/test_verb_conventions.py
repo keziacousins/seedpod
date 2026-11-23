@@ -67,6 +67,8 @@ from seedpod.data.repositories import (
     DeploymentAuditRepository,
     DeploymentRepository,
     DeploymentStateAuditRepository,
+    InstanceRepository,
+    InstanceStateAuditRepository,
     OutboxRepository,
     Repositories,
     SnapshotRepository,
@@ -145,6 +147,8 @@ def registry(tmp_path) -> StepRegistry:
         timers=TimerRepository(),
         outbox=OutboxRepository(),
         workflow_runs=WorkflowRunRepository(),
+        instances=InstanceRepository(),
+        instance_state_audits=InstanceStateAuditRepository(),
     )
     crypto = CryptoService(dev_key=Fernet.generate_key(), prod_key=Fernet.generate_key())
     clock = FrozenClock(_NOW)

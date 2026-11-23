@@ -14,7 +14,7 @@ package-layout change"):
   (``get_subprocess_manager``/``_subprocess_manager`` — the composition root now owns
   the one instance and injects it everywhere, matching this tree's DI discipline).
   Structurally satisfies ``seedpod/engine/step.py``'s ``SubprocessManagerLike``
-  Protocol (``register(process, *, cluster_id=None)`` / ``unregister(process)``) with
+  Protocol (``register(process, *, cluster_id=None, instance_id=None)`` / ``unregister(process)``) with
   the SAME method shapes — that Protocol and this class were designed as one seam, so
   a ``SubprocessManager`` instance is what the composition root hands
   ``StepServices.subprocess_manager``. It is deliberately NOT also a
@@ -111,49 +111,100 @@ class SubprocessManager:
 
     def __init__(self) -> None:
         self._active: set[asyncio.subprocess.Process] = set()
-        self._cluster_processes: dict[str, set[asyncio.subprocess.Process]] = defaultdict(set)
-        self._process_cluster: dict[asyncio.subprocess.Process, str] = {}
+        # Scope key is (kind, id), kind in {"cluster", "instance"} (DR-0055). One map for both,
+        # keyed on the pair, so a cluster and an instance with the same id string never share
+        # a bucket and terminating one can never kill the other's processes.
+        self._scoped: dict[tuple[str, str], set[asyncio.subprocess.Process]] = defaultdict(set)
+        self._process_scope: dict[asyncio.subprocess.Process, tuple[str, str]] = {}
+        # An INSTANCE run's processes, by run id (DR-0055). The engine's hard cancel ends one run and
+        # must kill only that run's processes: the instance's NEXT run (the destroy) has its own.
+        self._by_run: dict[str, set[asyncio.subprocess.Process]] = defaultdict(set)
+        self._process_run: dict[asyncio.subprocess.Process, str] = {}
         self._shutting_down = False
         # Serializes concurrent shutdown() calls, v1 parity (reference-code/seedpod/seedpod/
         # core/subprocess_manager.py:33 `self._lock`) -- dropped in an earlier draft without
         # comment; restored so two callers racing App.stop() can't double-sweep.
         self._shutdown_lock = asyncio.Lock()
 
-    def register(self, process: asyncio.subprocess.Process, *, cluster_id: str | None = None) -> None:
+    def register(
+        self,
+        process: asyncio.subprocess.Process,
+        *,
+        cluster_id: str | None = None,
+        instance_id: str | None = None,
+        run_id: str | None = None,
+    ) -> None:
         """Register an active subprocess for tracking, optionally associated with a
-        cluster. A no-op once ``shutdown()`` has started (v1 parity: nothing spawned
-        during shutdown gets tracked, since shutdown already swept everything it
-        knew about at the moment it started)."""
+        cluster OR an instance (not both). ``run_id`` (instance runs only) also files it under the
+        workflow run that spawned it, for ``terminate_for_run``. A no-op once ``shutdown()`` has started (v1
+        parity: nothing spawned during shutdown gets tracked, since shutdown already swept
+        everything it knew about at the moment it started)."""
+        if cluster_id is not None and instance_id is not None:
+            raise ValueError("a subprocess belongs to a cluster or an instance, not both")
+        if run_id is not None and instance_id is None:
+            raise ValueError("a run id scopes an instance's subprocess; a cluster's is scoped by cluster")
         if self._shutting_down:
             return
         self._active.add(process)
-        if cluster_id is not None:
-            self._cluster_processes[cluster_id].add(process)
-            self._process_cluster[process] = cluster_id
+        scope = ("cluster", cluster_id) if cluster_id is not None else (
+            ("instance", instance_id) if instance_id is not None else None
+        )
+        if scope is not None:
+            self._scoped[scope].add(process)
+            self._process_scope[process] = scope
+        if run_id is not None:
+            self._by_run[run_id].add(process)
+            self._process_run[process] = run_id
 
     def unregister(self, process: asyncio.subprocess.Process) -> None:
         """Remove a subprocess from tracking (called when the process completes
         normally, or from the owning caller's ``finally``)."""
         self._active.discard(process)
-        cluster_id = self._process_cluster.pop(process, None)
-        if cluster_id is not None:
-            bucket = self._cluster_processes.get(cluster_id)
+        scope = self._process_scope.pop(process, None)
+        if scope is not None:
+            bucket = self._scoped.get(scope)
             if bucket is not None:
                 bucket.discard(process)
                 if not bucket:
-                    del self._cluster_processes[cluster_id]
+                    del self._scoped[scope]
+        run_id = self._process_run.pop(process, None)
+        if run_id is not None:
+            run_bucket = self._by_run.get(run_id)
+            if run_bucket is not None:
+                run_bucket.discard(process)
+                if not run_bucket:
+                    del self._by_run[run_id]
 
     def active_count(self) -> int:
         return len(self._active)
 
     def cluster_process_count(self, cluster_id: str) -> int:
-        return len(self._cluster_processes.get(cluster_id, ()))
+        return len(self._scoped.get(("cluster", cluster_id), ()))
+
+    def instance_process_count(self, instance_id: str) -> int:
+        return len(self._scoped.get(("instance", instance_id), ()))
 
     async def terminate_for_cluster(self, cluster_id: str, *, timeout: float = 5.0) -> int:
         """Terminate every subprocess registered for ``cluster_id`` (targeted
         cancellation, e.g. a deployment cancel). Returns the number of processes
         that were live for this cluster at the start of the call."""
-        processes = list(self._cluster_processes.get(cluster_id, ()))
+        return await self._terminate_scope(("cluster", cluster_id), timeout)
+
+    async def terminate_for_instance(self, instance_id: str, *, timeout: float = 5.0) -> int:
+        """The instance twin of ``terminate_for_cluster``: only processes registered under
+        ``instance_id``, never a cluster's with the same id string."""
+        return await self._terminate_scope(("instance", instance_id), timeout)
+
+    async def terminate_for_run(self, run_id: str, *, timeout: float = 5.0) -> int:
+        """Terminate only the processes registered under this instance RUN. Never another run's,
+        even one of the same instance."""
+        processes = list(self._by_run.get(run_id, ()))
+        if processes:
+            await self._terminate_then_kill(processes, timeout)
+        return len(processes)
+
+    async def _terminate_scope(self, scope: tuple[str, str], timeout: float) -> int:
+        processes = list(self._scoped.get(scope, ()))
         if processes:
             await self._terminate_then_kill(processes, timeout)
         return len(processes)
@@ -170,8 +221,10 @@ class SubprocessManager:
             if processes:
                 await self._terminate_then_kill(processes, timeout)
             self._active.clear()
-            self._cluster_processes.clear()
-            self._process_cluster.clear()
+            self._scoped.clear()
+            self._process_scope.clear()
+            self._by_run.clear()
+            self._process_run.clear()
 
     async def _terminate_then_kill(self, processes: list[asyncio.subprocess.Process], timeout: float) -> None:
         """SIGTERM every live process, wait, SIGKILL survivors. v1 parity

@@ -56,7 +56,7 @@ from seedpod.core.effects import (
     ScheduleTimer,
 )
 from seedpod.core.events import EVENT_REGISTRY, DiscoveredInfo, Event
-from seedpod.core.records import ClusterRecord, DeploymentRecord
+from seedpod.core.records import ClusterRecord, DeploymentRecord, InstanceRecord
 
 __all__ = ["encode", "decode_event", "decode_effect", "canonical_json"]
 
@@ -75,7 +75,7 @@ _EFFECT_CLASSES: tuple[type, ...] = (
 )
 EFFECT_REGISTRY: dict[str, type] = {str(cls.kind): cls for cls in _EFFECT_CLASSES}
 
-_RECORD_CLASSES: tuple[type, ...] = (ClusterRecord, DeploymentRecord, DiscoveredInfo)
+_RECORD_CLASSES: tuple[type, ...] = (ClusterRecord, DeploymentRecord, InstanceRecord, DiscoveredInfo)
 _RECORD_REGISTRY: dict[str, type] = {cls.__name__: cls for cls in _RECORD_CLASSES}
 
 # every kind tag this codec can decode a nested dataclass field from, event or not

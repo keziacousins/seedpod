@@ -33,11 +33,13 @@ from seedpod.core.events import (
     HealthCheckFailed,
     InfraMissingObserved,
     InfraRunningObserved,
+    InstanceEvent,
     Observation,
 )
 from seedpod.core.machine import (
     CLUSTER_TABLE,
     DEPLOYMENT_TABLE,
+    INSTANCE_TABLE,
     InvalidTransition,
     TransitionResult,
     transition,
@@ -45,6 +47,7 @@ from seedpod.core.machine import (
 from seedpod.core.records import (
     ClusterState,
     DeploymentState,
+    InstanceStatus,
     Origin,
 )
 from tests.core.builders import (
@@ -52,11 +55,13 @@ from tests.core.builders import (
     AT,
     a_cluster,
     a_deployment,
+    an_instance,
     assert_an_event_covers_registry,
 )
 
 CLUSTER_EVENT_TYPES: tuple[type, ...] = typing.get_args(ClusterEvent)
 DEPLOYMENT_EVENT_TYPES: tuple[type, ...] = typing.get_args(DeploymentEvent)
+INSTANCE_EVENT_TYPES: tuple[type, ...] = typing.get_args(InstanceEvent)
 
 
 # ---------------------------------------------------------------------------
@@ -69,8 +74,8 @@ def test_an_event_covers_every_registered_kind():
 
 
 def test_event_type_unions_partition_an_event_exactly():
-    # Sanity: ClusterEvent/DeploymentEvent (which drive the totality loop below)
-    # partition AN_EVENT exactly -- the 18+9 = 27 registered kinds, no overlap,
+    # Sanity: ClusterEvent/DeploymentEvent/InstanceEvent (which drive the totality loop
+    # below) partition AN_EVENT exactly -- the 18+9+13 = 40 registered kinds, no overlap,
     # nothing left over.
     #
     # The DISJOINTNESS assertion below is the load-bearing one: every event kind
@@ -81,10 +86,14 @@ def test_event_type_unions_partition_an_event_exactly():
     # that one addition; the partition is intact.
     cluster = set(CLUSTER_EVENT_TYPES)
     deployment = set(DEPLOYMENT_EVENT_TYPES)
+    instance = set(INSTANCE_EVENT_TYPES)
     assert cluster & deployment == set()
-    assert cluster | deployment == set(AN_EVENT)
+    assert cluster & instance == set()
+    assert deployment & instance == set()
+    assert cluster | deployment | instance == set(AN_EVENT)
     assert len(cluster) == 18
     assert len(deployment) == 9
+    assert len(instance) == 13
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +159,34 @@ def test_deployment_totality_cell(state, event_type):
         _assert_ignore(record, result)
     else:
         _assert_non_ignore(record, result)
+
+
+@pytest.mark.parametrize("state", list(InstanceStatus))
+@pytest.mark.parametrize("event_type", INSTANCE_EVENT_TYPES)
+def test_instance_totality_cell(state, event_type):
+    assert (state, event_type) in INSTANCE_TABLE  # every cell exists -- no KeyError
+
+    record = an_instance(state=state)
+    event = AN_EVENT[event_type]
+
+    try:
+        result = transition(record, event)
+    except InvalidTransition:
+        assert issubclass(event_type, Command) or state is InstanceStatus.NEW, (
+            f"InvalidTransition escaped for non-Command {event_type.__name__} "
+            f"outside NEW (state={state.value})"
+        )
+        return
+
+    if result.effects == ():
+        _assert_ignore(record, result)
+    else:
+        _assert_non_ignore(record, result)
+
+
+def test_every_instance_state_and_event_type_pair_is_covered_by_the_loop():
+    expected = set(itertools.product(InstanceStatus, INSTANCE_EVENT_TYPES))
+    assert expected == set(INSTANCE_TABLE)
 
 
 def test_every_cluster_state_and_event_type_pair_is_covered_by_the_loop():

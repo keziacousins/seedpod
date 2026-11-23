@@ -21,7 +21,7 @@ afterwards: a SQL script cannot act on its result (`tests/data/test_migrate_0005
 **No migration ships a down, and the runner has no reverse path.** It compares `user_version` to
 each file's number and skips what is already applied; there is nothing to un-apply.
 
-`0002` to `0004` are additive (one `ADD COLUMN` each). `0005` is the first table rebuild (DR-0055).
+`0002` to `0004` are additive (one `ADD COLUMN` each). `0006` adds no column and rebuilds nothing (DR-0055): one new table, one trigger, and a swap of the instance slug index from partial to a full `UNIQUE` (an instance slug is never reused). `0005` is the first table rebuild (DR-0055).
 It rewrites `workflow_runs` to relax `cluster_id` NOT NULL. It rewrites `effects_outbox` to allow the
 `instance` aggregate. Its reverse SQL is in the file. The exposure is real the first time a migration **drops or rewrites** a column, because of what
 the database holds:

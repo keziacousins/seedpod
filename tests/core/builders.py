@@ -14,7 +14,7 @@ class-keyed ``AN_EVENT`` shape, so nothing that already imports it needs to chan
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from seedpod.core.events import (
     EVENT_REGISTRY,
@@ -41,6 +41,19 @@ from seedpod.core.events import (
     InfraAllocated,
     InfraMissingObserved,
     InfraRunningObserved,
+    InstanceCreateRequested,
+    InstanceDestroyFailed,
+    InstanceDestroyRequested,
+    InstanceDestroySucceeded,
+    InstanceExpired,
+    InstanceProvisioned,
+    InstanceProvisionFailed,
+    InstanceRenewRequested,
+    InstanceResourcesAllocated,
+    InstanceRunningObserved,
+    InstanceStoppedObserved,
+    InstanceTimerLost,
+    InstanceUnreachableObserved,
     ProvisionFailed,
     ProvisionSucceeded,
     RetryRequested,
@@ -53,10 +66,12 @@ from seedpod.core.records import (
     ClusterState,
     DeploymentRecord,
     DeploymentState,
+    InstanceRecord,
+    InstanceStatus,
     Origin,
 )
 
-__all__ = ["AT", "a_cluster", "a_deployment", "AN_EVENT", "assert_an_event_covers_registry"]
+__all__ = ["AT", "a_cluster", "a_deployment", "an_instance", "AN_EVENT", "assert_an_event_covers_registry"]
 
 # Fixed instant for every canonical event's `at` field -- aware UTC, never wall-clock
 # (core is pure; transition() must never be handed a naive datetime).
@@ -107,6 +122,30 @@ def a_deployment(state: DeploymentState = DeploymentState.ACTIVE, **over) -> Dep
     return DeploymentRecord(**fields)
 
 
+def an_instance(state: InstanceStatus = InstanceStatus.ACTIVE, **over) -> InstanceRecord:
+    """An InstanceRecord with sane defaults. ``expires_at`` is ONE HOUR BEFORE ``AT`` (the canonical
+    event time) and ``hard_expires_at`` is a day after it, so the canonical ``InstanceExpired`` is
+    due and every other canonical event is legal wherever the table allows it. A renewal test
+    that needs a live lease passes its own ``expires_at``."""
+    fields = {
+        "id": "instance-1",
+        "slug": "box",
+        "state": state,
+        "version": 3,
+        "provider": "tart",
+        "environment": "staging",
+        "lease_seconds": 3600,
+        "expires_at": AT - timedelta(hours=1),
+        "hard_expires_at": AT + timedelta(days=1),
+        "address": None,
+        "resource_ids": (),  # the codec's empty-mapping sentinel, so a record round-trips exactly
+        "failure_reason": None,
+        "destroyed_at": None,
+    }
+    fields.update(over)
+    return InstanceRecord(**fields)
+
+
 # One canonical instance per registered event kind. Keys are the classes themselves
 # (not strings) so tests can index directly: AN_EVENT[ProvisionSucceeded]. Actors are
 # chosen to be *legal* wherever the actor grammar constrains them (Observations get a
@@ -151,6 +190,24 @@ AN_EVENT: dict[type, Event] = {
     # forwards provenance so the cluster's audit row names who asked.
     DeploymentPending: DeploymentPending(at=AT, actor="api:alice", deployment_id="deployment-1"),
     RollbackFinished: RollbackFinished(at=AT, actor="engine:run:1", ok=True),
+    # DR-0055 instance events. Observations get a privileged actor, as above.
+    InstanceCreateRequested: InstanceCreateRequested(at=AT, actor="api:alice"),
+    InstanceRenewRequested: InstanceRenewRequested(at=AT, actor="api:alice"),
+    InstanceDestroyRequested: InstanceDestroyRequested(at=AT, actor="api:alice"),
+    InstanceResourcesAllocated: InstanceResourcesAllocated(
+        at=AT, actor="engine:run:1", resource_ids={"vm": "spi-box"}
+    ),
+    InstanceProvisioned: InstanceProvisioned(
+        at=AT, actor="engine:run:1", address="192.0.2.7", resource_ids={"vm": "spi-box"}
+    ),
+    InstanceProvisionFailed: InstanceProvisionFailed(at=AT, actor="engine:run:1", reason="boom"),
+    InstanceDestroySucceeded: InstanceDestroySucceeded(at=AT, actor="engine:run:1"),
+    InstanceDestroyFailed: InstanceDestroyFailed(at=AT, actor="engine:run:1", reason="boom"),
+    InstanceExpired: InstanceExpired(at=AT, actor="timer:expiry"),
+    InstanceStoppedObserved: InstanceStoppedObserved(at=AT, actor="reconciler"),
+    InstanceRunningObserved: InstanceRunningObserved(at=AT, actor="reconciler"),
+    InstanceUnreachableObserved: InstanceUnreachableObserved(at=AT, actor="reconciler"),
+    InstanceTimerLost: InstanceTimerLost(at=AT, actor="sweep:instance-liveness"),
 }
 
 

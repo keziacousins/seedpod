@@ -32,6 +32,8 @@ __all__ = [
     "ClusterRecord",
     "DeploymentState",
     "DeploymentRecord",
+    "InstanceStatus",
+    "InstanceRecord",
     "TERMINAL_STATES",
 ]
 
@@ -98,3 +100,50 @@ class DeploymentRecord:
 
 
 TERMINAL_STATES = ("destroyed", "failed")  # the only slug-releasing cluster states (Conflict 11)
+
+
+# ---------------------------------------------------------------------------
+# Instance (DR-0055): a bare VM with a lease. NOT a cluster -- no kubeconfig, no pod CIDRs.
+# ---------------------------------------------------------------------------
+
+
+class InstanceStatus(StrEnum):
+    """The instance lifecycle (DR-0055 decision 1). Named ``InstanceStatus`` because
+    ``providers.contract.InstanceState`` already means "what the provider reports about a
+    VM" (running, stopped, ...). This one is what SEEDPOD records, and it is the value of the
+    ``instances.status`` column. Wire values keep the hyphen, as ``ClusterState`` does."""
+
+    NEW = "new"  # pre-persistence; makes birth a real, audited transition
+    PROVISIONING = "provisioning"
+    ACTIVE = "active"
+    FAILED = "failed"
+    DESTROYING = "destroying"
+    DESTROYED = "destroyed"
+    DESTROY_FAILED = "destroy-failed"
+    ZOMBIE = "zombie"  # the record says destroyed, the provider says running
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class InstanceRecord:
+    """What the instance machine transitions. There is no ``kubeconfig_ref`` here, on
+    purpose: a VM is not a cluster, and a field that cannot exist cannot be required.
+
+    ``expires_at`` is the end of the lease, and ``hard_expires_at`` is fixed at creation. No
+    transition changes ``hard_expires_at``, and ``expires_at`` is never later than it. The
+    ``expiry`` timer usually fires at ``expires_at``, but a destroy retry arms it later. Every other column of the
+    ``instances`` row (template, size, owner, price, ...) is the repository's, not the
+    machine's."""
+
+    id: str
+    slug: str
+    state: InstanceStatus
+    version: int
+    provider: str
+    environment: str
+    lease_seconds: int
+    expires_at: datetime  # aware UTC; never None -- there is no instance without an expiry
+    hard_expires_at: datetime  # aware UTC; fixed at creation
+    address: str | None = None  # where SSH reaches the VM; set by InstanceProvisioned
+    resource_ids: Mapping[str, str] = ()  # provider resource ids; fed by InstanceResourcesAllocated
+    failure_reason: str | None = None
+    destroyed_at: datetime | None = None

@@ -38,6 +38,7 @@ from seedpod.providers.contract import Provider
 from seedpod.runtime.dispatcher import Dispatcher
 from seedpod.runtime.effect_executor import EffectExecutor
 from seedpod.runtime.health import HealthMonitor
+from seedpod.runtime.instance_liveness import InstanceLivenessSweep
 from seedpod.runtime.reconciliation import ReconciliationService
 from seedpod.runtime.sse import SSEHub
 from seedpod.runtime.subprocess_manager import SubprocessManager
@@ -149,6 +150,7 @@ class App:
     timers: TimerService
     engine: WorkflowEngine
     executor: EffectExecutor
+    instance_liveness: InstanceLivenessSweep  # DR-0055: correctness, like the executor and timers
     services: Services
     api: FastAPI
     http_transport: httpx.AsyncClient  # DR-0015: shared outbound-HTTP seam for GHCR/DNS
@@ -202,6 +204,10 @@ class App:
             # deterministic and call `flush_last_used()` directly), but note the
             # DELIBERATE asymmetry in `stop()`: the final flush is unconditional.
             await self.services.api_keys.start()
+        # DR-0055. Correctness, not a convenience, so it is NOT behind `background_tasks`: it is the
+        # backstop that keeps an instance's way to destruction working without a restart. Started
+        # after `resume_inflight()` (above) so its first pass finds the startup adoption already done.
+        await self.instance_liveness.start()
 
     def _verify_ssh_identities(self) -> None:
         """Thin bind of ``verify_ssh_identities`` to this App's own enabled providers.
@@ -231,6 +237,9 @@ class App:
         (An earlier revision of this docstring recorded that no ``engine.stop()``
         existed and flagged it as a DR-worthy follow-up. DR-0024 is that DR.)
         """
+        # First: its pass adopts runs and applies events, and the engine, timers and executor it
+        # leans on must still be there while it runs.
+        await self.instance_liveness.stop()
         if self.config.background_tasks:
             await self.services.health.stop()
             await self.services.reconciliation.stop()

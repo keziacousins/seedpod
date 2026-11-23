@@ -49,7 +49,7 @@ from seedpod.core.records import (
 from seedpod.data.database import Database
 from seedpod.data.repositories import OutboxRow
 from seedpod.data.uow import UnitOfWork
-from seedpod.runtime.dispatcher import outbox_row
+from seedpod.runtime.dispatcher import UnknownAggregateError, outbox_row
 from tests.runtime.conftest import NOW, FakePokeable, make_cluster_row, make_deployment_row
 
 LATER = NOW + timedelta(minutes=5)
@@ -580,14 +580,14 @@ async def test_birth_persist_without_record_row_raises(uow, repos, dispatcher):
 
 
 def _row_counts(db) -> dict[str, int]:
-    tables = ("clusters", "deployments", "cluster_state_audits", "deployment_state_audits",
-              "effects_outbox", "timers")
+    tables = ("clusters", "deployments", "instances", "cluster_state_audits", "deployment_state_audits",
+              "instance_state_audits", "effects_outbox", "timers")
     with db.engine.begin() as conn:
         return {t: conn.exec_driver_sql(f"SELECT COUNT(*) FROM {t}").scalar() for t in tables}
 
 
-@pytest.mark.parametrize("aggregate", ["instance", "run", "Cluster", "clusters", "deployments", ""])
-async def test_unknown_or_unsupported_aggregate_raises_and_writes_nothing(db, uow, repos, dispatcher, aggregate):
+@pytest.mark.parametrize("aggregate", ["run", "Cluster", "clusters", "deployments", "instances", "Instance", ""])
+async def test_unknown_aggregate_raises_and_writes_nothing(db, uow, repos, dispatcher, aggregate):
     async with uow() as tx:
         repos.clusters.insert(tx, make_cluster_row("c1", "demo", status="active"))
         repos.deployments.insert(tx, make_deployment_row("c1", "c1", status="active"))  # same id on purpose
@@ -605,27 +605,27 @@ async def test_unknown_or_unsupported_aggregate_raises_and_writes_nothing(db, uo
         assert repos.deployments.get(tx, "c1").version == 0
 
 
-async def test_unsupported_aggregate_with_a_birth_row_writes_nothing(db, dispatcher):
+async def test_unknown_aggregate_with_a_birth_row_writes_nothing(db, dispatcher):
     before = _row_counts(db)
     with pytest.raises(ValueError, match="aggregate"):
         await dispatcher.apply(
-            "instance", "i1", CreateRequested(at=NOW, actor="api:test"),
+            "run", "i1", CreateRequested(at=NOW, actor="api:test"),
             record=make_cluster_row("i1", "box", status="new"),
         )
     assert _row_counts(db) == before
 
 
-async def test_instance_is_named_as_not_yet_supported(dispatcher):
-    with pytest.raises(ValueError, match="'instance' aggregate yet"):
-        await dispatcher.apply("instance", "i1", InfraMissingObserved(at=NOW, actor="reconciler"))
+async def test_unknown_aggregate_error_is_the_named_subclass_of_value_error(dispatcher):
+    with pytest.raises(UnknownAggregateError):
+        await dispatcher.apply("run", "x", InfraMissingObserved(at=NOW, actor="reconciler"))
 
 
-async def test_unsupported_aggregate_inside_a_chained_tx_does_not_touch_the_callers_work(uow, repos, dispatcher):
+async def test_unknown_aggregate_inside_a_chained_tx_does_not_touch_the_callers_work(uow, repos, dispatcher):
     """With ``tx=``, the rejection must not poison or write into the caller's transaction."""
     async with uow() as tx:
         repos.clusters.insert(tx, make_cluster_row("c1", "demo", status="active"))
         with pytest.raises(ValueError, match="aggregate"):
-            await dispatcher.apply("instance", "i1", InfraMissingObserved(at=NOW, actor="reconciler"), tx=tx)
+            await dispatcher.apply("run", "i1", InfraMissingObserved(at=NOW, actor="reconciler"), tx=tx)
         await dispatcher.apply("cluster", "c1", InfraMissingObserved(at=NOW, actor="reconciler"), tx=tx)
     async with uow() as tx:
         assert repos.clusters.get(tx, "c1").version == 1

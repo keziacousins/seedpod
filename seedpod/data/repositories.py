@@ -58,6 +58,7 @@ docs/design/seam-d-foundation.md Decision 6's "two changes" note).
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -77,9 +78,13 @@ from seedpod.core.records import (
     ClusterState,
     DeploymentRecord,
     DeploymentState,
+    InstanceRecord,
+    InstanceStatus,
     Origin,
 )
 from seedpod.services.crypto import CryptoService
+
+_log = logging.getLogger(__name__)
 
 __all__ = [
     "WorkflowRunRow",
@@ -93,6 +98,10 @@ __all__ = [
     "ClusterRepository",
     "DeploymentRow",
     "DeploymentRepository",
+    "InstanceRow",
+    "InstanceRepository",
+    "InstanceStateAuditRow",
+    "InstanceStateAuditRepository",
     "ClusterStateAuditRow",
     "ClusterStateAuditRepository",
     "DeploymentStateAuditRow",
@@ -1562,6 +1571,211 @@ class DeploymentRepository:
 
 
 # ---------------------------------------------------------------------------
+# instances (DR-0055; table created by 0005_instances.sql)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class InstanceRow:
+    """One ``instances`` row, shaped exactly like 0005_instances.sql -- a strict superset of
+    what ``InstanceRecord`` (the pure DTO the machine transitions) carries. Used for births
+    (``insert``) and every row-level read; ``InstanceRepository.load`` narrows a row to the
+    record. The columns the machine does not own (template, size, owner, price, vcpu, memory,
+    known_hosts) are written once at birth and never by ``persist``."""
+
+    id: str
+    slug: str
+    provider: str
+    environment: str
+    template: str
+    size: str
+    status: str  # InstanceStatus value; the table's CHECK holds the same set
+    version: int
+    owner_key_id: int
+    resource_ids: Mapping[str, str]
+    address: str | None
+    known_hosts: str | None
+    lease_seconds: int
+    expires_at: datetime
+    hard_expires_at: datetime
+    hourly_price: float
+    vcpu: int
+    memory_mb: int
+    failure_reason: str | None
+    created_at: datetime
+    updated_at: datetime
+    destroyed_at: datetime | None
+
+
+def _instance_params(row: InstanceRow) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "slug": row.slug,
+        "provider": row.provider,
+        "environment": row.environment,
+        "template": row.template,
+        "size": row.size,
+        "status": row.status,
+        "version": row.version,
+        "owner_key_id": row.owner_key_id,
+        "resource_ids": _dump_nn(row.resource_ids, kind="map"),
+        "address": row.address,
+        "known_hosts": row.known_hosts,
+        "lease_seconds": row.lease_seconds,
+        "expires_at": _iso(row.expires_at),
+        "hard_expires_at": _iso(row.hard_expires_at),
+        "hourly_price": row.hourly_price,
+        "vcpu": row.vcpu,
+        "memory_mb": row.memory_mb,
+        "failure_reason": row.failure_reason,
+        "created_at": _iso(row.created_at),
+        "updated_at": _iso(row.updated_at),
+        "destroyed_at": _iso_or_none(row.destroyed_at),
+    }
+
+
+def _instance_from_mapping(m: Mapping[str, Any]) -> InstanceRow:
+    return InstanceRow(
+        id=m["id"],
+        slug=m["slug"],
+        provider=m["provider"],
+        environment=m["environment"],
+        template=m["template"],
+        size=m["size"],
+        status=m["status"],
+        version=m["version"],
+        owner_key_id=m["owner_key_id"],
+        resource_ids=_load(m["resource_ids"]) or {},
+        address=m["address"],
+        known_hosts=m["known_hosts"],
+        lease_seconds=m["lease_seconds"],
+        expires_at=_parse(m["expires_at"]),
+        hard_expires_at=_parse(m["hard_expires_at"]),
+        hourly_price=m["hourly_price"],
+        vcpu=m["vcpu"],
+        memory_mb=m["memory_mb"],
+        failure_reason=m["failure_reason"],
+        created_at=_parse(m["created_at"]),
+        updated_at=_parse(m["updated_at"]),
+        destroyed_at=_parse_or_none(m["destroyed_at"]),
+    )
+
+
+def _instance_record_from_row(row: InstanceRow) -> InstanceRecord:
+    """Narrow a full ``InstanceRow`` to the pure ``InstanceRecord`` -- the inverse of what
+    ``InstanceRepository.persist`` writes back."""
+    return InstanceRecord(
+        id=row.id,
+        slug=row.slug,
+        state=InstanceStatus(row.status),
+        version=row.version,
+        provider=row.provider,
+        environment=row.environment,
+        lease_seconds=row.lease_seconds,
+        expires_at=row.expires_at,
+        hard_expires_at=row.hard_expires_at,
+        address=row.address,
+        resource_ids=row.resource_ids,
+        failure_reason=row.failure_reason,
+        destroyed_at=row.destroyed_at,
+    )
+
+
+class InstanceRepository:
+    """``instances``: session-in, DTO-out, never commits. The same split as
+    ``ClusterRepository``: ``insert`` is the birth, ``persist`` is the compare-and-swap UPDATE
+    over the columns ``InstanceRecord`` carries, ``load`` is the Dispatcher's read side."""
+
+    def get(self, session: Session, instance_id: str) -> InstanceRow | None:
+        row = session.execute(
+            text("SELECT * FROM instances WHERE id = :id"), {"id": instance_id}
+        ).mappings().first()
+        return _instance_from_mapping(row) if row is not None else None
+
+    def get_by_slug(self, session: Session, slug: str) -> InstanceRow | None:
+        """The instance that holds ``slug``, in any status. A slug is never reused, not even
+        after ``destroyed`` (``ux_instances_slug``, 0006), so there is at most one."""
+        row = session.execute(
+            text("SELECT * FROM instances WHERE slug = :slug"),
+            {"slug": slug},
+        ).mappings().first()
+        return _instance_from_mapping(row) if row is not None else None
+
+    def load(self, session: Session, instance_id: str) -> InstanceRecord | None:
+        row = self.get(session, instance_id)
+        return _instance_record_from_row(row) if row is not None else None
+
+    def insert(self, session: Session, row: InstanceRow) -> None:
+        """Birth INSERT. No CAS, no audit write: the Dispatcher writes the birth audit row in
+        the same transaction."""
+        session.execute(
+            text(
+                """
+                INSERT INTO instances
+                    (id, slug, provider, environment, template, size, status, version,
+                     owner_key_id, resource_ids, address, known_hosts, lease_seconds,
+                     expires_at, hard_expires_at, hourly_price, vcpu, memory_mb,
+                     failure_reason, created_at, updated_at, destroyed_at)
+                VALUES
+                    (:id, :slug, :provider, :environment, :template, :size, :status, :version,
+                     :owner_key_id, :resource_ids, :address, :known_hosts, :lease_seconds,
+                     :expires_at, :hard_expires_at, :hourly_price, :vcpu, :memory_mb,
+                     :failure_reason, :created_at, :updated_at, :destroyed_at)
+                """
+            ),
+            _instance_params(row),
+        )
+
+    def persist(
+        self, session: Session, record: InstanceRecord, expected_version: int, *, clock: Clock
+    ) -> None:
+        """CAS UPDATE over exactly the columns the machine owns. ``hard_expires_at``,
+        ``lease_seconds``, ``slug``, ``provider`` and ``environment`` are deliberately NOT
+        in the SET list: they are fixed at creation. ``rowcount == 0`` means another writer
+        won the race since ``expected_version`` was read -- raises ``StaleVersion``."""
+        result = session.execute(
+            text(
+                """
+                UPDATE instances SET
+                    status = :status, resource_ids = :resource_ids, address = :address,
+                    expires_at = :expires_at, failure_reason = :failure_reason,
+                    destroyed_at = :destroyed_at, updated_at = :updated_at,
+                    version = version + 1
+                WHERE id = :id AND version = :expected_version
+                """
+            ),
+            {
+                "id": record.id,
+                "status": record.state.value,
+                "resource_ids": _dump_nn(record.resource_ids, kind="map"),
+                "address": record.address,
+                "expires_at": _iso(record.expires_at),
+                "failure_reason": record.failure_reason,
+                "destroyed_at": _iso_or_none(record.destroyed_at),
+                "updated_at": _iso(clock.now()),
+                "expected_version": expected_version,
+            },
+        )
+        if result.rowcount == 0:
+            raise StaleVersion(
+                f"instance {record.id}: CAS UPDATE matched no row at version {expected_version}"
+            )
+
+    def list_all(self, session: Session) -> list[InstanceRow]:
+        rows = session.execute(text("SELECT * FROM instances ORDER BY created_at")).mappings().all()
+        return [_instance_from_mapping(r) for r in rows]
+
+    def list_live_ids(self, session: Session) -> list[str]:
+        """The id of every instance whose status column is not ``destroyed``, oldest first. Reads the
+        two columns it needs and decodes NOTHING, so a row that cannot be decoded is still listed:
+        the caller loads each id on its own and isolates the failure to that one instance."""
+        rows = session.execute(
+            text("SELECT id FROM instances WHERE status != 'destroyed' ORDER BY created_at, id")
+        ).all()
+        return [r[0] for r in rows]
+
+
+# ---------------------------------------------------------------------------
 # cluster_state_audits / deployment_state_audits
 # ---------------------------------------------------------------------------
 
@@ -1746,6 +1960,82 @@ class DeploymentStateAuditRepository:
             {"deployment_id": deployment_id, "limit": limit},
         ).mappings().all()
         return [_dsa_from_mapping(r) for r in rows]
+
+
+@dataclass(frozen=True, slots=True)
+class InstanceStateAuditRow:
+    id: int | None
+    instance_id: str
+    from_state: str
+    to_state: str
+    event: str
+    actor: str
+    reason: str | None
+    context: Mapping[str, Any] | None
+    created_at: datetime
+
+
+def _isa_from_mapping(m: Mapping[str, Any]) -> InstanceStateAuditRow:
+    return InstanceStateAuditRow(
+        id=m["id"],
+        instance_id=m["instance_id"],
+        from_state=m["from_state"],
+        to_state=m["to_state"],
+        event=m["event"],
+        actor=m["actor"],
+        reason=m["reason"],
+        context=_load(m["context"]),
+        created_at=_parse(m["created_at"]),
+    )
+
+
+class InstanceStateAuditRepository:
+    """``instance_state_audits`` (0006) -- the instance twin of ``ClusterStateAuditRepository``,
+    with the same discipline: ``actor`` is ``event.actor``, ``created_at`` is ``event.at`` and
+    never ``Clock.now()``, ``reason`` is the event's own ``reason`` field when its class has
+    one, and ``context`` is the whole tagged event (DR-0007)."""
+
+    def add(
+        self,
+        session: Session,
+        *,
+        instance_id: str,
+        from_state: str,
+        to_state: str,
+        event: Event,
+        actor: str,
+        at: datetime,
+    ) -> None:
+        session.execute(
+            text(
+                """
+                INSERT INTO instance_state_audits
+                    (instance_id, from_state, to_state, event, actor, reason, context, created_at)
+                VALUES
+                    (:instance_id, :from_state, :to_state, :event, :actor, :reason, :context, :created_at)
+                """
+            ),
+            {
+                "instance_id": instance_id,
+                "from_state": from_state,
+                "to_state": to_state,
+                "event": type(event).__name__,
+                "actor": actor,
+                "reason": getattr(event, "reason", None),
+                "context": canonical_json(event),
+                "created_at": _iso(at),
+            },
+        )
+
+    def list_for_instance(self, session: Session, instance_id: str, limit: int = 50) -> list[InstanceStateAuditRow]:
+        rows = session.execute(
+            text(
+                "SELECT * FROM instance_state_audits WHERE instance_id = :instance_id "
+                "ORDER BY created_at DESC, id DESC LIMIT :limit"
+            ),
+            {"instance_id": instance_id, "limit": limit},
+        ).mappings().all()
+        return [_isa_from_mapping(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -2087,6 +2377,35 @@ class TimerRepository:
         )
         return result.rowcount > 0
 
+    def postpone(
+        self,
+        session: Session,
+        aggregate_type: str,
+        aggregate_id: str,
+        timer_key: str,
+        fire_at_text: str,
+        new_fire_at: datetime,
+    ) -> bool:
+        """Move one timer's ``fire_at`` later, keeping its event and everything else, under the
+        same exact-TEXT condition as ``consume`` (so a concurrent re-arm or cancel is not
+        overwritten). For a timer this build cannot fire (an aggregate type it has no machine
+        for): a newer build may own it, so it is kept, not deleted. Returns False when the row
+        was no longer the one scanned."""
+        result = session.execute(
+            text(
+                "UPDATE timers SET fire_at = :new_fire_at WHERE aggregate_type = :aggregate_type "
+                "AND aggregate_id = :aggregate_id AND timer_key = :timer_key AND fire_at = :fire_at_text"
+            ),
+            {
+                "aggregate_type": aggregate_type,
+                "aggregate_id": aggregate_id,
+                "timer_key": timer_key,
+                "fire_at_text": fire_at_text,
+                "new_fire_at": _iso(new_fire_at),
+            },
+        )
+        return result.rowcount > 0
+
     def get(self, session: Session, aggregate_type: str, aggregate_id: str, timer_key: str) -> TimerRow | None:
         row = session.execute(
             text(
@@ -2097,14 +2416,45 @@ class TimerRepository:
         ).mappings().first()
         return _timer_from_mapping(row) if row is not None else None
 
+    def get_raw(
+        self, session: Session, aggregate_type: str, aggregate_id: str, timer_key: str
+    ) -> tuple[Any, Any] | None:
+        """``(fire_at, event)`` of one timer exactly as stored, parsing NOTHING, or ``None`` if it is
+        not armed. For a caller that must judge a row that may be corrupt (``get`` and ``due`` raise
+        on a ``fire_at`` they cannot parse)."""
+        row = session.execute(
+            text(
+                "SELECT fire_at, event FROM timers WHERE aggregate_type = :aggregate_type "
+                "AND aggregate_id = :aggregate_id AND timer_key = :timer_key"
+            ),
+            {"aggregate_type": aggregate_type, "aggregate_id": aggregate_id, "timer_key": timer_key},
+        ).first()
+        return (row[0], row[1]) if row is not None else None
+
     def due(self, session: Session, now: datetime) -> list[TimerRow]:
         """Every timer whose ``fire_at`` has passed, ordered by ``fire_at`` -- the
-        (later-work) ``TimerService``'s poll query."""
+        (later-work) ``TimerService``'s poll query.
+
+        DR-0055: an INSTANCE timer with an unreadable ``fire_at`` is skipped and logged, so it
+        cannot stop every other timer. The liveness sweep replaces it. A corrupt cluster or
+        deployment timer still raises, as it always has."""
         rows = session.execute(
             text("SELECT * FROM timers WHERE fire_at <= :now ORDER BY fire_at"),
             {"now": _iso(now)},
         ).mappings().all()
-        return [_timer_from_mapping(r) for r in rows]
+        timers: list[TimerRow] = []
+        for row in rows:
+            try:
+                timers.append(_timer_from_mapping(row))
+            except (ValueError, TypeError):
+                if row["aggregate_type"] != "instance":
+                    raise
+                _log.error(
+                    "skipping instance timer with an unreadable fire_at: %s/%s",
+                    row["aggregate_id"],
+                    row["timer_key"],
+                )
+        return timers
 
     def next_fire_at(self, session: Session) -> datetime | None:
         """The earliest ``fire_at`` across every armed timer -- lets the (later-work)
@@ -2155,6 +2505,8 @@ class Repositories:
     timers: TimerRepository
     outbox: OutboxRepository
     workflow_runs: WorkflowRunRepository
+    instances: InstanceRepository  # DR-0055
+    instance_state_audits: InstanceStateAuditRepository  # DR-0055, 0006
 
 
 # ---------------------------------------------------------------------------

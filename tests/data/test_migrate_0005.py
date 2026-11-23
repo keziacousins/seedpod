@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import shutil
 import sqlite3
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -28,6 +29,17 @@ RUN_COLUMNS = (
     "cancel_requested, failed_step, error, undo_incomplete, initiated_by, created_at, "
     "started_at, finished_at"
 )
+
+
+# 0005 as it left the schema. Later migrations (0006 adds a trigger and a table) must not change what
+# these tests say about 0005, so they migrate through this directory and stop at 0005.
+_THROUGH_0005 = tempfile.TemporaryDirectory(prefix="seedpod-migrations-through-0005-")
+for _f in sorted(MIGRATIONS_DIR.glob("000[1-5]_*.sql")):
+    shutil.copy(_f, Path(_THROUGH_0005.name) / _f.name)
+
+
+def migrate_0005(engine) -> None:
+    migrate(engine, migrations_dir=Path(_THROUGH_0005.name))
 
 
 def _v4_dir(tmp_path: Path, name: str = "migrations-v4") -> Path:
@@ -215,7 +227,7 @@ def _instance_run(conn, run_id, instance_id, status="pending"):
 
 def test_populated_v4_database_keeps_every_run_and_step(v4):
     before = _snapshot(v4)
-    migrate(v4.engine)
+    migrate_0005(v4.engine)
 
     runs, steps = _snapshot(v4)
     assert runs == before[0]  # same 5 rows, every original column unchanged
@@ -230,7 +242,7 @@ def test_populated_v4_database_keeps_every_run_and_step(v4):
 
 
 def test_foreign_key_check_is_empty_and_foreign_keys_are_back_on(v4):
-    migrate(v4.engine)
+    migrate_0005(v4.engine)
     with v4.engine.begin() as conn:
         assert conn.exec_driver_sql("PRAGMA foreign_key_check").fetchall() == []
         assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
@@ -240,7 +252,7 @@ def test_foreign_key_check_is_empty_and_foreign_keys_are_back_on(v4):
 
 
 def test_no_leftover_table_or_index_and_nothing_else_is_on_workflow_runs(v4):
-    migrate(v4.engine)
+    migrate_0005(v4.engine)
     with v4.engine.begin() as conn:
         names = {
             r[0]: (r[1], r[2])
@@ -259,7 +271,7 @@ def test_no_leftover_table_or_index_and_nothing_else_is_on_workflow_runs(v4):
 
 
 def test_check_requires_exactly_one_aggregate(v4):
-    migrate(v4.engine)
+    migrate_0005(v4.engine)
     with v4.engine.begin() as conn:
         _insert_instance(conn, "i1", "box-1")
     base = (
@@ -277,7 +289,7 @@ def test_check_requires_exactly_one_aggregate(v4):
 
 
 def test_one_active_run_per_cluster_still_holds(v4):
-    migrate(v4.engine)
+    migrate_0005(v4.engine)
     # c1 already has r4 'running'
     for status in ACTIVE:
         with pytest.raises(IntegrityError), v4.engine.begin() as conn:
@@ -289,7 +301,7 @@ def test_one_active_run_per_cluster_still_holds(v4):
 
 
 def test_one_active_run_per_instance(v4):
-    migrate(v4.engine)
+    migrate_0005(v4.engine)
     with v4.engine.begin() as conn:
         _insert_instance(conn, "i1", "box-1")
         _insert_instance(conn, "i2", "box-2")
@@ -308,7 +320,7 @@ def test_one_active_run_per_instance(v4):
 
 
 def test_dedupe_key_is_still_unique(v4):
-    migrate(v4.engine)
+    migrate_0005(v4.engine)
     with pytest.raises(IntegrityError), v4.engine.begin() as conn:
         _run(conn, "r-dup", "c2", "succeeded", dedupe_key="run/a")
 
@@ -319,7 +331,7 @@ def test_dedupe_key_is_still_unique(v4):
 
 
 def test_instances_columns(v4):
-    migrate(v4.engine)
+    migrate_0005(v4.engine)
     with v4.engine.begin() as conn:
         cols = {r[1]: r for r in conn.exec_driver_sql("PRAGMA table_info(instances)").fetchall()}
     assert set(cols) == {
@@ -332,7 +344,7 @@ def test_instances_columns(v4):
 
 
 def test_instance_status_check(v4):
-    migrate(v4.engine)
+    migrate_0005(v4.engine)
     states = ("new", "provisioning", "active", "failed", "destroying", "destroyed",
               "destroy-failed", "zombie")
     with v4.engine.begin() as conn:
@@ -344,7 +356,7 @@ def test_instance_status_check(v4):
 
 
 def test_instance_slug_is_unique_until_destroyed(v4):
-    migrate(v4.engine)
+    migrate_0005(v4.engine)
     with v4.engine.begin() as conn:
         _insert_instance(conn, "i1", "box", status="provisioning")
     for status in ("new", "provisioning", "active", "failed", "destroying", "destroy-failed", "zombie"):
@@ -358,7 +370,7 @@ def test_instance_slug_is_unique_until_destroyed(v4):
 
 
 def test_instance_owner_must_exist_but_a_revoked_key_is_fine(v4):
-    migrate(v4.engine)
+    migrate_0005(v4.engine)
     with pytest.raises(IntegrityError), v4.engine.begin() as conn:
         _insert_instance(conn, "i1", "box-1", owner=999)
     with v4.engine.begin() as conn:
@@ -370,7 +382,7 @@ def test_instance_owner_must_exist_but_a_revoked_key_is_fine(v4):
 
 
 def test_instance_price_and_sizes_have_no_default(v4):
-    migrate(v4.engine)
+    migrate_0005(v4.engine)
     with pytest.raises(IntegrityError), v4.engine.begin() as conn:
         conn.exec_driver_sql(
             "INSERT INTO instances (id, slug, provider, environment, template, size, status,"
@@ -440,7 +452,7 @@ def test_failed_migration_restores_foreign_keys_on_the_shared_connection(v4, tmp
 def test_migration_can_be_retried_after_a_failure(v4, tmp_path):
     with pytest.raises(sqlite3.OperationalError):
         migrate(v4.engine, migrations_dir=_failing_dir(tmp_path))
-    migrate(v4.engine)
+    migrate_0005(v4.engine)
     with v4.engine.begin() as conn:
         assert conn.exec_driver_sql("PRAGMA user_version").scalar() == 5
         assert conn.exec_driver_sql("PRAGMA foreign_key_check").fetchall() == []
@@ -456,7 +468,7 @@ def test_outbox_rows_and_seq_values_are_preserved(v4):
     before = _outbox(v4)
     assert [r[0] for r in before] == [1, 2, 3, 4, 5]
     assert {r[9] for r in before} == {"pending", "done", "dead"}
-    migrate(v4.engine)
+    migrate_0005(v4.engine)
     assert _outbox(v4) == before  # every column, including attempts, available_at, last_error
     dead = [r for r in _outbox(v4) if r[9] == "dead"][0]
     assert dead[10] == 8 and dead[14] == "gave up"
@@ -464,7 +476,7 @@ def test_outbox_rows_and_seq_values_are_preserved(v4):
 
 def test_seq_is_never_reused_when_the_top_row_was_deleted_before_the_migration(v4):
     """The fixture deleted seq 6, so MAX(seq) is 5 but AUTOINCREMENT's mark is 6."""
-    migrate(v4.engine)
+    migrate_0005(v4.engine)
     assert _outbox_sequence(v4) == [("effects_outbox", 6)]
     with v4.engine.begin() as conn:
         assert _insert_outbox(conn, "after-1") == 7
@@ -478,7 +490,7 @@ def test_seq_mark_survives_an_empty_outbox(tmp_path):
         _seed_outbox(conn, delete_top=False)
         conn.execute(text("DELETE FROM effects_outbox"))
         assert conn.execute(text("SELECT COUNT(*) FROM effects_outbox")).scalar() == 0
-    migrate(db.engine)
+    migrate_0005(db.engine)
     assert _outbox_sequence(db) == [("effects_outbox", 6)]
     with db.engine.begin() as conn:
         assert _insert_outbox(conn, "first-after") == 7
@@ -487,7 +499,7 @@ def test_seq_mark_survives_an_empty_outbox(tmp_path):
 def test_a_never_used_outbox_starts_at_one(tmp_path):
     db = Database(f"sqlite:///{tmp_path / 't.db'}")
     migrate(db.engine, migrations_dir=_v4_dir(tmp_path))
-    migrate(db.engine)
+    migrate_0005(db.engine)
     assert _outbox_sequence(db) in ([], [("effects_outbox", 0)])  # never used: no mark, or a zero one
     with db.engine.begin() as conn:
         assert _insert_outbox(conn, "first") == 1
@@ -498,14 +510,14 @@ def test_seq_mark_is_unchanged_when_nothing_was_deleted(tmp_path):
     migrate(db.engine, migrations_dir=_v4_dir(tmp_path))
     with db.engine.begin() as conn:
         _seed_outbox(conn, delete_top=False)
-    migrate(db.engine)
+    migrate_0005(db.engine)
     assert _outbox_sequence(db) == [("effects_outbox", 6)]
     with db.engine.begin() as conn:
         assert _insert_outbox(conn, "next") == 7
 
 
 def test_outbox_accepts_instance_and_still_rejects_an_unknown_aggregate_type(v4):
-    migrate(v4.engine)
+    migrate_0005(v4.engine)
     with v4.engine.begin() as conn:
         for n, agg in enumerate(("cluster", "deployment", "run", "instance")):
             _insert_outbox(conn, f"ok-{n}", agg)
@@ -515,7 +527,7 @@ def test_outbox_accepts_instance_and_still_rejects_an_unknown_aggregate_type(v4)
 
 
 def test_the_other_outbox_constraints_are_unchanged(v4):
-    migrate(v4.engine)
+    migrate_0005(v4.engine)
     for over in ({"kind": "bogus"}, {"lane": "bogus"}, {"status": "bogus"}):
         with pytest.raises(IntegrityError), v4.engine.begin() as conn:
             _insert_outbox(conn, "bad", **over)
@@ -533,7 +545,7 @@ def test_the_other_outbox_constraints_are_unchanged(v4):
 
 
 def test_outbox_indexes_are_recreated_and_nothing_else_hangs_off_it(v4):
-    migrate(v4.engine)
+    migrate_0005(v4.engine)
     with v4.engine.begin() as conn:
         master = conn.exec_driver_sql(
             "SELECT type, name, tbl_name, sql FROM sqlite_master"

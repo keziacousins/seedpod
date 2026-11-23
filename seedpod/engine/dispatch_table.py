@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from seedpod.core.effects import RunWorkflow
-    from seedpod.core.records import ClusterRecord
+    from seedpod.core.records import ClusterRecord, InstanceRecord
 
 __all__ = ["WorkflowDispatch"]
 
@@ -36,9 +36,29 @@ class WorkflowDispatch:
     destroy_by_provider: Mapping[str, str]  # {'digitalocean':'destroy-cloud', 'tart':'destroy-cloud',
     #  'kind':'destroy-shared', 'orbstack':'destroy-shared'}
 
+    def resolve_instance(self, eff: RunWorkflow, instance: InstanceRecord) -> tuple[str, dict]:
+        """The instance verbs (DR-0055): ``provision`` -> ``provision-instance-{provider}``,
+        ``destroy`` -> ``destroy-instance`` (one workflow for every provider: the provider is
+        read from the instance row at run time, as the cluster destroy does, DR-0022 ruling 2).
+        Both get ``{"instance_id": ...}`` and nothing else. The args are an allowlist for the
+        same reason ``resolve``'s destroy arm is one, and nothing resolvable is smuggled in.
+        Any other verb, or an effect aimed at another aggregate, raises: an instance never
+        deploys, and its id is never read as a cluster's."""
+        if eff.aggregate_type != "instance":
+            raise ValueError(f"cannot resolve {eff.workflow!r} for aggregate type {eff.aggregate_type!r} as an instance")
+        if eff.aggregate_id != instance.id:
+            raise ValueError(f"effect names instance {eff.aggregate_id!r}, record is {instance.id!r}")
+        match eff.workflow:
+            case "provision":
+                return (f"provision-instance-{instance.provider}", {"instance_id": eff.aggregate_id})
+            case "destroy":
+                return ("destroy-instance", {"instance_id": eff.aggregate_id})
+            case _:
+                raise ValueError(f"unknown abstract workflow verb for an instance: {eff.workflow!r}")
+
     def resolve(self, eff: RunWorkflow, cluster: ClusterRecord) -> tuple[str, dict]:
-        # Every verb below is a CLUSTER verb (DR-0055 adds instance workflows in their own
-        # table). Refuse an effect aimed at anything else rather than read its id as a cluster's.
+        # Every verb below is a CLUSTER verb (instance workflows resolve in `resolve_instance`).
+        # Refuse an effect aimed at anything else rather than read its id as a cluster's.
         if eff.aggregate_type != "cluster":
             raise ValueError(f"cannot resolve {eff.workflow!r} for aggregate type {eff.aggregate_type!r}")
         match eff.workflow:

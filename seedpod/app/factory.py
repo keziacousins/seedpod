@@ -121,6 +121,8 @@ from seedpod.data.repositories import (
     DeploymentAuditRepository,
     DeploymentRepository,
     DeploymentStateAuditRepository,
+    InstanceRepository,
+    InstanceStateAuditRepository,
     OutboxRepository,
     PresetRepository,
     Repositories,
@@ -184,6 +186,7 @@ from seedpod.providers.tart import TartConfig, TartProvider
 from seedpod.runtime.dispatcher import Dispatcher
 from seedpod.runtime.effect_executor import EffectExecutor
 from seedpod.runtime.health import HealthMonitor
+from seedpod.runtime.instance_liveness import InstanceLivenessSweep
 from seedpod.runtime.reconciliation import ReconciliationService
 from seedpod.runtime.sse import SSEHub
 from seedpod.runtime.subprocess_manager import (
@@ -269,6 +272,8 @@ def build_app(
         timers=TimerRepository(),
         outbox=OutboxRepository(),
         workflow_runs=WorkflowRunRepository(),
+        instances=InstanceRepository(),
+        instance_state_audits=InstanceStateAuditRepository(),
     )
     uow = UnitOfWork(db)
     deployment_audits_repo = DeploymentAuditRepository(crypto)
@@ -404,9 +409,13 @@ def build_app(
         dispatch=dispatch,
         clock=clock,
         poll_interval=config.outbox_poll_interval,
+        dispatcher=dispatcher,
     )
     dispatcher.attach_executor(executor)  # sole late wire: .poke() latency hint only
     dispatcher.attach_timers(timers)  # ditto
+    # DR-0055: the level-triggered backstop for an instance's way to destruction. Reads the
+    # database and the engine's task table only; every change goes through the Dispatcher.
+    instance_liveness = InstanceLivenessSweep(uow, repos, dispatcher, engine, clock)
 
     # 9 -- thin application services (seedpod/app/services/) + the Round-5 runtime
     # services this component must wire (seam-d Decision 8 predates
@@ -463,6 +472,7 @@ def build_app(
         timers=timers,
         engine=engine,
         executor=executor,
+        instance_liveness=instance_liveness,
         services=services,
         api=api,
         http_transport=transport,

@@ -31,6 +31,8 @@ from tests.runtime.conftest import (
     FakeWorkflowDefinition,
     make_cluster_row,
     make_deployment_row,
+    make_instance_row,
+    make_owner_key,
     make_run_row,
 )
 
@@ -367,9 +369,9 @@ async def test_cw_before_rw_seq_ordering_rollback_waits_for_cancelled_deploy(uow
 
 
 # ---------------------------------------------------------------------------
-# DR-0055 decision 4: RunWorkflow/CancelWorkflow name their run's aggregate. Only a
-# cluster is admitted today; an instance effect must fail explicitly, never read as a
-# cluster, and never hold up the rows behind it.
+# DR-0055 decision 4: RunWorkflow/CancelWorkflow name their run's aggregate: a cluster or an
+# instance. An instance effect is admitted as an instance run, is never read as a cluster's, and
+# one that cannot be admitted never holds up the rows behind it.
 # ---------------------------------------------------------------------------
 
 
@@ -421,13 +423,68 @@ async def test_legacy_cancel_workflow_row_still_cancels_the_clusters_run(uow, re
         assert repos.outbox.get(t, legacy.effect_id).status == "done"
 
 
-async def test_instance_run_workflow_fails_explicitly_and_is_not_read_as_a_cluster(uow, repos, executor, engine):
-    # A cluster whose id equals the instance id: the old reading (`cluster_id`) would admit a run for it.
+async def _insert_instance(uow, repos, instance_id: str, slug: str = "box", **overrides):
+    """``provisioning`` unless the test says otherwise. An instance ``destroy`` row is admitted only
+    while the instance is ``destroying``, so the tests that admit one pass ``status="destroying"``."""
+    status = overrides.pop("status", "provisioning")
+    async with uow() as t:
+        owner = make_owner_key(t)
+        repos.instances.insert(t, make_instance_row(instance_id, slug, owner, status=status, **overrides))
+
+
+async def test_instance_run_workflow_is_admitted_as_an_instance_run_not_a_cluster_run(uow, repos, executor, engine):
+    # A cluster with the SAME id string: the old reading (`cluster_id`) would have admitted a run for it.
     async with uow() as t:
         repos.clusters.insert(t, make_cluster_row("same-id", "demo", status="provisioning"))
-    engine.definitions["provision-fake"] = FakeWorkflowDefinition(version=1)
+    await _insert_instance(uow, repos, "same-id")
+    engine.definitions["provision-instance-fake"] = FakeWorkflowDefinition(version=4)
     eff = RunWorkflow(workflow="provision", aggregate_type="instance", aggregate_id="same-id")
-    row = outbox_row(eff, "cluster", "x", 1, 0, now=NOW)
+    row = outbox_row(eff, "instance", "same-id", 1, 0, now=NOW)
+    async with uow() as t:
+        repos.outbox.insert(t, row)
+
+    await executor.drain_pending()
+
+    async with uow() as t:
+        runs = repos.workflow_runs.list_all(t)
+        after = repos.outbox.get(t, row.effect_id)
+        assert repos.workflow_runs.active_for_cluster(t, "same-id") is None  # the cluster got nothing
+        assert repos.workflow_runs.active_for_instance(t, "same-id").id == runs[0].id
+    assert len(runs) == 1
+    (run,) = runs
+    assert (run.cluster_id, run.instance_id, run.deployment_id) == (None, "same-id", None)
+    assert (run.workflow, run.workflow_version, run.status) == ("provision-instance-fake", 4, "pending")
+    assert dict(run.args) == {"instance_id": "same-id"}
+    assert run.dedupe_key == row.effect_id
+    assert after.status == "done" and engine.started == [run.id]
+
+
+async def test_instance_destroy_resolves_to_the_one_destroy_instance_workflow(uow, repos, executor, engine):
+    await _insert_instance(  # a provider not in destroy_by_provider's cluster table
+        uow, repos, "i1", provider="digitalocean", status="destroying"
+    )
+    engine.definitions["destroy-instance"] = FakeWorkflowDefinition(version=1)
+    eff = RunWorkflow(workflow="destroy", aggregate_type="instance", aggregate_id="i1")
+    row = outbox_row(eff, "instance", "i1", 2, 0, now=NOW)
+    async with uow() as t:
+        repos.outbox.insert(t, row)
+
+    await executor.drain_pending()
+
+    async with uow() as t:
+        (run,) = repos.workflow_runs.list_all(t)
+    assert (run.workflow, run.instance_id, run.cluster_id) == ("destroy-instance", "i1", None)
+    assert dict(run.args) == {"instance_id": "i1"}
+
+
+async def test_instance_run_for_a_missing_instance_fails_and_does_not_use_a_cluster_of_that_id(
+    uow, repos, executor, engine
+):
+    async with uow() as t:
+        repos.clusters.insert(t, make_cluster_row("same-id", "demo", status="provisioning"))
+    engine.definitions["provision-instance-fake"] = FakeWorkflowDefinition(version=1)
+    eff = RunWorkflow(workflow="provision", aggregate_type="instance", aggregate_id="same-id")
+    row = outbox_row(eff, "instance", "same-id", 1, 0, now=NOW)
     async with uow() as t:
         repos.outbox.insert(t, row)
 
@@ -436,19 +493,116 @@ async def test_instance_run_workflow_fails_explicitly_and_is_not_read_as_a_clust
     async with uow() as t:
         after = repos.outbox.get(t, row.effect_id)
         runs = repos.workflow_runs.list_all(t)
-    assert runs == []
-    assert engine.started == []
+    assert runs == [] and engine.started == []
     assert after.status == "pending" and after.attempts == 1
-    assert "instance" in after.last_error and "same-id" in after.last_error
+    assert "no instance" in after.last_error and "same-id" in after.last_error
     assert after.available_at > NOW
 
 
-async def test_instance_cancel_workflow_does_not_cancel_a_clusters_run(uow, repos, executor, engine):
+async def test_instance_run_naming_a_deployment_is_refused(uow, repos, executor, engine):
+    await _insert_instance(uow, repos, "i1")
+    engine.definitions["provision-instance-fake"] = FakeWorkflowDefinition(version=1)
+    eff = RunWorkflow(workflow="provision", aggregate_type="instance", aggregate_id="i1", deployment_id="d1")
+    row = outbox_row(eff, "instance", "i1", 1, 0, now=NOW)
+    async with uow() as t:
+        repos.outbox.insert(t, row)
+
+    await executor.drain_pending()
+
+    async with uow() as t:
+        assert repos.workflow_runs.list_all(t) == []
+        assert "deployment" in repos.outbox.get(t, row.effect_id).last_error
+
+
+async def test_instance_verb_that_does_not_exist_fails_the_row(uow, repos, executor, engine):
+    await _insert_instance(uow, repos, "i1")
+    engine.definitions["provision-instance-fake"] = FakeWorkflowDefinition(version=1)
+    eff = RunWorkflow(workflow="deploy", aggregate_type="instance", aggregate_id="i1")
+    row = outbox_row(eff, "instance", "i1", 1, 0, now=NOW)
+    async with uow() as t:
+        repos.outbox.insert(t, row)
+
+    await executor.drain_pending()
+
+    async with uow() as t:
+        assert repos.workflow_runs.list_all(t) == []
+        assert "unknown abstract workflow verb" in repos.outbox.get(t, row.effect_id).last_error
+
+
+async def test_instance_run_workflow_crash_replay_admits_exactly_once(uow, repos, dispatch, clock, hub):
+    """H7 for an instance: the run row landed, the process died before the outbox row was marked
+    done. A fresh executor and engine re-derive the SAME run from the dedupe key."""
+    await _insert_instance(uow, repos, "i1")
+    eff = RunWorkflow(workflow="provision", aggregate_type="instance", aggregate_id="i1")
+    row = outbox_row(eff, "instance", "i1", 1, 0, now=NOW)
+    async with uow() as t:
+        repos.outbox.insert(t, row)
+        assert repos.workflow_runs.insert_admitted(
+            t,
+            WorkflowRunRow(
+                id="run-1", workflow="provision-instance-fake", workflow_version=1, cluster_id=None,
+                instance_id="i1", deployment_id=None, dedupe_key=row.effect_id, args={"instance_id": "i1"},
+                status="pending", cancel_requested=False, failed_step=None, error=None, undo_incomplete=None,
+                initiated_by=None, created_at=NOW, started_at=None, finished_at=None,
+            ),
+        ) is True
+    engine2 = FakeEngine(uow, repos.workflow_runs, {"provision-instance-fake": FakeWorkflowDefinition(version=1)})
+    executor2 = EffectExecutor(uow, repos, hub, engine2, dispatch, clock, poll_interval=10.0)
+
+    await executor2.drain_pending()
+    await executor2.drain_pending()
+
+    async with uow() as t:
+        runs = repos.workflow_runs.list_all(t)
+        assert repos.outbox.get(t, row.effect_id).status == "done"
+    assert [r.id for r in runs] == ["run-1"]
+    assert engine2.started == ["run-1"]
+
+
+async def test_instance_cancel_workflow_cancels_the_instances_run_and_not_a_clusters_with_the_same_id(
+    uow, repos, executor, engine
+):
     async with uow() as t:
         repos.clusters.insert(t, make_cluster_row("same-id", "demo", status="active"))
         repos.workflow_runs.insert(t, make_run_row("cluster-run", "same-id", workflow="deploy-waves", status="running"))
-    eff = CancelWorkflow(workflow="destroy", aggregate_type="instance", aggregate_id="same-id")
-    row = outbox_row(eff, "cluster", "x", 1, 0, now=NOW)
+    await _insert_instance(uow, repos, "same-id")
+    async with uow() as t:
+        repos.workflow_runs.insert(
+            t,
+            make_run_row(
+                "instance-run", None, workflow="provision-instance-fake", status="running",
+                instance_id="same-id", dedupe_key="d-i",
+            ),
+        )
+    eff = CancelWorkflow(workflow="provision", aggregate_type="instance", aggregate_id="same-id")
+    row = outbox_row(eff, "instance", "same-id", 2, 0, now=NOW)
+    async with uow() as t:
+        repos.outbox.insert(t, row)
+
+    await executor.drain_pending()
+
+    assert engine.cancelled == ["instance-run"]
+    async with uow() as t:
+        assert repos.workflow_runs.get(t, "cluster-run").cancel_requested is False
+        assert repos.workflow_runs.get(t, "instance-run").cancel_requested is True
+        assert repos.outbox.get(t, row.effect_id).status == "done"
+
+
+async def test_cluster_cancel_workflow_does_not_cancel_an_instances_run_with_the_same_id(
+    uow, repos, executor, engine
+):
+    await _insert_instance(uow, repos, "same-id")
+    async with uow() as t:
+        repos.clusters.insert(t, make_cluster_row("same-id", "demo", status="active"))
+        repos.workflow_runs.insert(
+            t,
+            make_run_row(
+                "instance-run", None, workflow="provision-instance-fake", status="running",
+                instance_id="same-id", dedupe_key="d-i",
+            ),
+        )
+    eff = CancelWorkflow(workflow="deploy", aggregate_type="cluster", aggregate_id="same-id", deployment_id="d1")
+    row = outbox_row(eff, "cluster", "same-id", 2, 0, now=NOW)
     async with uow() as t:
         repos.outbox.insert(t, row)
 
@@ -456,9 +610,106 @@ async def test_instance_cancel_workflow_does_not_cancel_a_clusters_run(uow, repo
 
     assert engine.cancelled == []
     async with uow() as t:
-        assert repos.workflow_runs.get(t, "cluster-run").cancel_requested is False
-        after = repos.outbox.get(t, row.effect_id)
-    assert after.status == "pending" and after.attempts == 1
+        assert repos.workflow_runs.get(t, "instance-run").cancel_requested is False
+
+
+async def test_instance_cancel_with_no_active_run_is_a_harmless_no_op(uow, repos, executor, engine):
+    await _insert_instance(uow, repos, "i1")
+    eff = CancelWorkflow(workflow="provision", aggregate_type="instance", aggregate_id="i1")
+    row = outbox_row(eff, "instance", "i1", 2, 0, now=NOW)
+    async with uow() as t:
+        repos.outbox.insert(t, row)
+    await executor.drain_pending()
+    assert engine.cancelled == []
+    async with uow() as t:
+        assert repos.outbox.get(t, row.effect_id).status == "done"
+
+
+async def test_destroy_admitted_while_provision_is_active_cancels_it_waits_and_then_runs(
+    uow, repos, executor, engine, clock
+):
+    """DR-0055: an instance destroyed or expired while provisioning. The machine emits
+    CancelWorkflow(provision) then RunWorkflow(destroy), in that seq order. The destroy takes the
+    cluster's supersede branch (DR-0011 Clause 1): it never runs beside the provision and is never
+    dropped. It waits, attempts untouched, until the provision run is terminal."""
+    await _insert_instance(uow, repos, "i1", status="destroying")
+    async with uow() as t:
+        repos.workflow_runs.insert(
+            t,
+            make_run_row(
+                "prov", None, workflow="provision-instance-fake", status="running", instance_id="i1",
+                dedupe_key="d-prov",
+            ),
+        )
+    engine.definitions["destroy-instance"] = FakeWorkflowDefinition(version=1)
+    cancel = outbox_row(
+        CancelWorkflow(workflow="provision", aggregate_type="instance", aggregate_id="i1"), "instance", "i1", 2, 2, now=NOW
+    )
+    destroy = outbox_row(
+        RunWorkflow(workflow="destroy", aggregate_type="instance", aggregate_id="i1"), "instance", "i1", 2, 3, now=NOW
+    )
+    async with uow() as t:
+        repos.outbox.insert(t, cancel)
+        repos.outbox.insert(t, destroy)
+
+    await executor.drain_pending()
+
+    async with uow() as t:
+        assert repos.outbox.get(t, cancel.effect_id).status == "done"
+        waiting = repos.outbox.get(t, destroy.effect_id)
+        prov = repos.workflow_runs.get(t, "prov")
+        live = _active_runs(repos.workflow_runs, t)
+    assert "prov" in engine.cancelled
+    assert prov.cancel_requested is True
+    assert (waiting.status, waiting.attempts) == ("pending", 0)  # waiting is not failing
+    assert waiting.available_at == NOW + timedelta(seconds=2)
+    assert [r.id for r in live] == ["prov"]  # no destroy run beside it
+
+    # the provision run reaches terminal (compensation finished): the destroy is admitted
+    async with uow() as t:
+        repos.workflow_runs.update(t, "prov", status="cancelled", finished_at=clock.now())
+    clock.advance(timedelta(seconds=2))
+    await executor.drain_pending()
+
+    async with uow() as t:
+        assert repos.outbox.get(t, destroy.effect_id).status == "done"
+        (run,) = _active_runs(repos.workflow_runs, t)
+    assert (run.workflow, run.instance_id, run.cluster_id) == ("destroy-instance", "i1", None)
+    assert engine.started == [run.id]
+
+
+async def test_run_conflict_for_an_instance_notifies_under_its_own_key_and_environment(
+    uow, repos, executor, engine, hub
+):
+    await _insert_instance(uow, repos, "i1", environment="production")
+    async with uow() as t:
+        repos.workflow_runs.insert(
+            t,
+            make_run_row(
+                "live", None, workflow="provision-instance-fake", status="running", instance_id="i1",
+                dedupe_key="d-live",
+            ),
+        )
+    engine.definitions["provision-instance-fake"] = FakeWorkflowDefinition(version=1)
+    eff = RunWorkflow(workflow="provision", aggregate_type="instance", aggregate_id="i1")
+    row = outbox_row(eff, "instance", "i1", 3, 0, now=NOW)
+    async with uow() as t:
+        repos.outbox.insert(t, row)
+
+    await executor.drain_pending()
+
+    assert engine.cancelled == []  # a provision is not a supersede
+    async with uow() as t:
+        notify_row = repos.outbox.get(t, f"{row.effect_id}#run_conflict")
+        assert repos.outbox.get(t, row.effect_id).status == "done"
+    assert (notify_row.aggregate_type, notify_row.aggregate_id) == ("instance", "i1")
+    assert hub.calls == [
+        (
+            "run_conflict",
+            {"workflow": "provision", "instance_id": "i1", "deployment_id": None, "blocked_by_run_id": "live"},
+            "production",
+        )
+    ]
 
 
 async def test_unknown_aggregate_type_fails_the_same_way(uow, repos, executor, engine):
@@ -478,14 +729,17 @@ async def test_unknown_aggregate_type_fails_the_same_way(uow, repos, executor, e
     assert after.status == "pending" and "unknown aggregate type" in after.last_error
 
 
-async def test_an_instance_effect_does_not_wedge_the_outbox_for_other_effects(uow, repos, executor, engine, clock):
+async def test_an_instance_effect_that_cannot_be_admitted_does_not_wedge_the_outbox_for_other_effects(
+    uow, repos, executor, engine, clock
+):
     """The instance row is FIRST in seq order. The cluster rows behind it still drain, and
     the instance row ends up dead after the usual attempts, not pending forever."""
     async with uow() as t:
         repos.clusters.insert(t, make_cluster_row("c1", "demo", status="provisioning"))
-    engine.definitions["provision-fake"] = FakeWorkflowDefinition(version=1)
+    await _insert_instance(uow, repos, "i1")
+    engine.definitions["provision-fake"] = FakeWorkflowDefinition(version=1)  # no provision-instance-fake
     bad = outbox_row(
-        RunWorkflow(workflow="provision", aggregate_type="instance", aggregate_id="i1"), "cluster", "x", 1, 0, now=NOW
+        RunWorkflow(workflow="provision", aggregate_type="instance", aggregate_id="i1"), "instance", "i1", 1, 0, now=NOW
     )
     good = outbox_row(
         RunWorkflow(workflow="provision", aggregate_type="cluster", aggregate_id="c1"), "cluster", "c1", 1, 0, now=NOW
