@@ -257,8 +257,25 @@ def decode_event(d: dict) -> Event:
     return _dec_dataclass(d, cls)
 
 
+def _upgrade_legacy_effect(d: dict, cls: type) -> dict:
+    """DR-0055 decision 4: ``RunWorkflow``/``CancelWorkflow`` used to carry ``cluster_id``
+    and now carry ``aggregate_type`` + ``aggregate_id``. A pending ``effects_outbox`` row
+    written before the change still has the old shape, and the durable outbox replays it
+    after an upgrade, so decode must keep reading it. Every such row was a cluster's:
+    the old shape had no way to name anything else. Only the in-memory effect is
+    upgraded; the stored payload is never rewritten, and nothing compares payload text
+    (identity is ``effect_id``, which does not contain the payload)."""
+    is_legacy = "cluster_id" in d and "aggregate_type" not in d and "aggregate_id" not in d
+    if cls in (RunWorkflow, CancelWorkflow) and is_legacy:
+        upgraded = {k: v for k, v in d.items() if k != "cluster_id"}
+        upgraded["aggregate_type"] = "cluster"
+        upgraded["aggregate_id"] = d["cluster_id"]
+        return upgraded
+    return d
+
+
 def decode_effect(d: dict) -> Effect:
     cls = EFFECT_REGISTRY.get(d.get("kind"))
     if cls is None:
         raise ValueError(f"unknown effect kind {d.get('kind')!r}")
-    return _dec_dataclass(d, cls)
+    return _dec_dataclass(_upgrade_legacy_effect(d, cls), cls)

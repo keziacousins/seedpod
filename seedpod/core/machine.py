@@ -297,7 +297,7 @@ def _cluster_new_create_requested(record: ClusterRecord, event: CreateRequested)
         state=ClusterState.PROVISIONING,
         birth=True,
         notify_old_status="",  # preserves v1's UI-visible birth broadcast shape
-        extra_effects=(RunWorkflow(workflow="provision", cluster_id=record.id),),
+        extra_effects=(RunWorkflow(workflow="provision", aggregate_type="cluster", aggregate_id=record.id),),
     )
 
 
@@ -461,7 +461,7 @@ def _cluster_destroy_scheduled_destroy_due(record: ClusterRecord, event: Destroy
         state=ClusterState.DESTROYING,
         extra_effects=(
             RunWorkflow(
-                workflow="destroy", cluster_id=record.id,
+                workflow="destroy", aggregate_type="cluster", aggregate_id=record.id,
                 args={"trigger": event.trigger, "snapshot": event.snapshot},  # DR-0040, DR-0043
             ),
         ),
@@ -559,7 +559,7 @@ def _cluster_failed_retry_requested(record: ClusterRecord, event: RetryRequested
         event,
         state=ClusterState.PROVISIONING,
         failure_reason=None,
-        extra_effects=(RunWorkflow(workflow="provision", cluster_id=record.id),),
+        extra_effects=(RunWorkflow(workflow="provision", aggregate_type="cluster", aggregate_id=record.id),),
     )
 
 
@@ -846,7 +846,9 @@ def _deployment_pending_cluster_ready(record: DeploymentRecord, event: ClusterRe
         event,
         state=DeploymentState.DEPLOYING,
         extra_effects=(
-            RunWorkflow(workflow="deploy", cluster_id=record.cluster_id, deployment_id=record.id),
+            RunWorkflow(
+                workflow="deploy", aggregate_type="cluster", aggregate_id=record.cluster_id, deployment_id=record.id
+            ),
         ),
     )
 
@@ -884,8 +886,12 @@ def _deployment_deploying_cancel_requested(record: DeploymentRecord, event: Canc
     # Conflict 12: CancelWorkflow(deploy) THEN RunWorkflow(rollback, deployment_id=self.id), in that
     # order -- the drain-lane admitter processes them in seq order, so rollback waits for the
     # cancelled deploy run to reach terminal.
-    cancel_deploy = CancelWorkflow(workflow="deploy", cluster_id=record.cluster_id, deployment_id=record.id)
-    run_rollback = RunWorkflow(workflow="rollback", cluster_id=record.cluster_id, deployment_id=record.id)
+    cancel_deploy = CancelWorkflow(
+        workflow="deploy", aggregate_type="cluster", aggregate_id=record.cluster_id, deployment_id=record.id
+    )
+    run_rollback = RunWorkflow(
+        workflow="rollback", aggregate_type="cluster", aggregate_id=record.cluster_id, deployment_id=record.id
+    )
     return _deployment_result(
         record, event, state=DeploymentState.CANCELLED, extra_effects=(cancel_deploy, run_rollback)
     )
@@ -893,7 +899,9 @@ def _deployment_deploying_cancel_requested(record: DeploymentRecord, event: Canc
 
 def _deployment_deploying_cluster_gone(record: DeploymentRecord, event: ClusterGone) -> TransitionResult:
     # Conflict 12: CancelWorkflow(deploy) only -- no rollback on a dying cluster (v1 parity)
-    cancel_deploy = CancelWorkflow(workflow="deploy", cluster_id=record.cluster_id, deployment_id=record.id)
+    cancel_deploy = CancelWorkflow(
+        workflow="deploy", aggregate_type="cluster", aggregate_id=record.cluster_id, deployment_id=record.id
+    )
     return _deployment_result(record, event, state=DeploymentState.DESTROYED, extra_effects=(cancel_deploy,))
 
 

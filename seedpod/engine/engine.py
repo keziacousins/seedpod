@@ -529,6 +529,26 @@ class WorkflowEngine:
                 self._ordinal_counters[run_id] = len(existing_notify_rows)
         if row is None:
             return
+        if row.cluster_id is None:
+            # An instance run (DR-0055). Its steps and events live in later phases; nothing
+            # below can run it, and handing it to a step as ``ctx.cluster_id = None`` would
+            # let a cluster step look up cluster "None". Fail it here, terminal and explicit.
+            # (Not through `_fail_unexpected`: that signals the run's aggregate, and the
+            # Dispatcher does not accept an instance yet.)
+            async with self._uow() as tx:
+                self._run_repo.update(
+                    tx,
+                    run_id,
+                    status="failed",
+                    error={
+                        "kind": "permanent",
+                        "step": None,
+                        "message": f"run {run_id} belongs to instance {row.instance_id!r}; "
+                        "the engine does not run instance workflows yet",
+                    },
+                    finished_at=self._clock.now(),
+                )
+            return
         wf = self._definitions.get(row.workflow)
         if wf is None:
             async with self._uow() as tx:
@@ -1088,9 +1108,17 @@ class WorkflowEngine:
         if cancel_task in done:
             raise StepCancelled("cancelled during engine-owned wait")
 
+    @staticmethod
+    def _cluster_id_of(state: _RunState) -> str:
+        """The cluster a cluster-bound run belongs to. `_run` fails an instance run before
+        any step, so a None here is a bug, not a state."""
+        if state.row.cluster_id is None:
+            raise ValueError(f"run {state.run_id} has no cluster_id (instance run)")
+        return state.row.cluster_id
+
     def _make_ctx(self, state: _RunState, step_path: str, attempt: int, token: CancelToken) -> StepContext:
         return StepContext(
-            run_id=UUID(state.run_id), cluster_id=state.row.cluster_id, workflow=state.wf.workflow,
+            run_id=UUID(state.run_id), cluster_id=self._cluster_id_of(state), workflow=state.wf.workflow,
             step_path=step_path, attempt=attempt, cancel=token, services=self._step_services,
             note_sink=self._note_sink, progress_sink=self._progress_sink,
         )
@@ -1234,14 +1262,25 @@ class WorkflowEngine:
 
     def _target_for(self, state: _RunState) -> tuple[str, str]:
         """Conflict 8's targeting rule: deploy/rollback events -> ('deployment',
-        run.deployment_id); provision/destroy -> ('cluster', run.cluster_id).
+        run.deployment_id); every other run -> the aggregate it belongs to (DR-0055 decision 4):
+        ('cluster', run.cluster_id) or ('instance', run.instance_id).
         ``workflow_runs.workflow`` is the CONCRETE definition name (Conflict 13);
         every deploy/rollback definition is named with a 'deploy' prefix
         (deploy-waves, deploy-rollback), so the prefix check is exact and total
-        over the closed set of definitions this engine will ever be handed."""
+        over the closed set of definitions this engine will ever be handed.
+
+        A run with neither id, or a deploy run with no ``deployment_id``, raises rather than
+        guessing a target (the table's CHECK makes the first impossible for a stored row)."""
+        row = state.row
         if state.wf.workflow.startswith("deploy"):
-            return ("deployment", state.row.deployment_id)
-        return ("cluster", state.row.cluster_id)
+            if row.deployment_id is None:
+                raise ValueError(f"run {state.run_id}: workflow {state.wf.workflow!r} has no deployment_id")
+            return ("deployment", row.deployment_id)
+        if row.instance_id is not None:
+            return ("instance", row.instance_id)
+        if row.cluster_id is not None:
+            return ("cluster", row.cluster_id)
+        raise ValueError(f"run {state.run_id} has neither cluster_id nor instance_id")
 
     def _build_event(self, event_name: str, payload_def: Mapping[str, Any], scope: Mapping[str, Any], state: _RunState) -> Event:
         """Step-level ``emit:`` events only -- no auto-attach (see

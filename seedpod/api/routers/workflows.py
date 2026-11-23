@@ -56,6 +56,8 @@ async def list_workflows(
         rows = app.repos.workflow_runs.list_all(t)
         if api_key.environment != ALL_ENVIRONMENTS:
             # DR-0054: a run has its cluster's environment.
+            # A run with no cluster (an instance run, DR-0055) maps to "" here, which no key
+            # admits: it stays hidden from a scoped key until DR-0054 is extended to instances.
             environments = {c.id: c.environment for c in app.repos.clusters.list_all(t)}
             rows = [r for r in rows if environment_admits(api_key.environment, environments.get(r.cluster_id, ""))]
     return {"workflows": [_serialize(r) for r in rows]}

@@ -63,7 +63,8 @@ class Notify:
 class RunWorkflow:
     kind: ClassVar[str] = EffectKind.RUN_WORKFLOW
     workflow: str  # "provision" | "deploy" | "rollback" | "destroy" — closed abstract-verb set (Conflict 13)
-    cluster_id: str
+    aggregate_type: str  # "cluster" | "instance" — the aggregate the RUN belongs to (DR-0055 decision 4)
+    aggregate_id: str  # a deploy/rollback run is still "cluster": it holds its cluster's one-active-run slot
     deployment_id: str | None = None
     args: Mapping[str, Any] = ()  # typed per workflow in Pillar 2; refs only, never secrets
 
@@ -72,7 +73,8 @@ class RunWorkflow:
 class CancelWorkflow:
     kind: ClassVar[str] = EffectKind.CANCEL_WORKFLOW
     workflow: str
-    cluster_id: str
+    aggregate_type: str  # "cluster" | "instance", as RunWorkflow
+    aggregate_id: str
     deployment_id: str | None = None
     reason: str = ""
 

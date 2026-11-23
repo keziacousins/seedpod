@@ -117,8 +117,8 @@ _A_CLUSTER_RECORD = ClusterRecord(
             "done",
         ),
         (Notify(topic="t", payload={}, environment=None), "drain", "pending"),
-        (RunWorkflow(workflow="provision", cluster_id="c1"), "drain", "pending"),
-        (CancelWorkflow(workflow="deploy", cluster_id="c1"), "drain", "pending"),
+        (RunWorkflow(workflow="provision", aggregate_type="cluster", aggregate_id="c1"), "drain", "pending"),
+        (CancelWorkflow(workflow="deploy", aggregate_type="cluster", aggregate_id="c1"), "drain", "pending"),
     ],
 )
 def test_lane_and_status_per_effect_kind(eff, expected_lane, expected_status):
@@ -571,3 +571,61 @@ async def test_birth_persist_without_record_row_raises(uow, repos, dispatcher):
 
     with pytest.raises(ValueError, match="no record= row"):
         await dispatcher.apply("cluster", "c1", CreateRequested(at=NOW, actor="api:test"))
+
+
+# ---------------------------------------------------------------------------
+# DR-0055 decision 4: the Dispatcher selects its aggregate explicitly. It used to
+# treat every name that was not "cluster" as a deployment.
+# ---------------------------------------------------------------------------
+
+
+def _row_counts(db) -> dict[str, int]:
+    tables = ("clusters", "deployments", "cluster_state_audits", "deployment_state_audits",
+              "effects_outbox", "timers")
+    with db.engine.begin() as conn:
+        return {t: conn.exec_driver_sql(f"SELECT COUNT(*) FROM {t}").scalar() for t in tables}
+
+
+@pytest.mark.parametrize("aggregate", ["instance", "run", "Cluster", "clusters", "deployments", ""])
+async def test_unknown_or_unsupported_aggregate_raises_and_writes_nothing(db, uow, repos, dispatcher, aggregate):
+    async with uow() as tx:
+        repos.clusters.insert(tx, make_cluster_row("c1", "demo", status="active"))
+        repos.deployments.insert(tx, make_deployment_row("c1", "c1", status="active"))  # same id on purpose
+    before = _row_counts(db)
+    fake = FakePokeable()
+    dispatcher.attach_executor(fake)
+
+    with pytest.raises(ValueError, match="aggregate"):
+        await dispatcher.apply(aggregate, "c1", InfraMissingObserved(at=NOW, actor="reconciler"))
+
+    assert _row_counts(db) == before
+    assert fake.count == 0
+    async with uow() as tx:
+        assert repos.clusters.get(tx, "c1").version == 0
+        assert repos.deployments.get(tx, "c1").version == 0
+
+
+async def test_unsupported_aggregate_with_a_birth_row_writes_nothing(db, dispatcher):
+    before = _row_counts(db)
+    with pytest.raises(ValueError, match="aggregate"):
+        await dispatcher.apply(
+            "instance", "i1", CreateRequested(at=NOW, actor="api:test"),
+            record=make_cluster_row("i1", "box", status="new"),
+        )
+    assert _row_counts(db) == before
+
+
+async def test_instance_is_named_as_not_yet_supported(dispatcher):
+    with pytest.raises(ValueError, match="'instance' aggregate yet"):
+        await dispatcher.apply("instance", "i1", InfraMissingObserved(at=NOW, actor="reconciler"))
+
+
+async def test_unsupported_aggregate_inside_a_chained_tx_does_not_touch_the_callers_work(uow, repos, dispatcher):
+    """With ``tx=``, the rejection must not poison or write into the caller's transaction."""
+    async with uow() as tx:
+        repos.clusters.insert(tx, make_cluster_row("c1", "demo", status="active"))
+        with pytest.raises(ValueError, match="aggregate"):
+            await dispatcher.apply("instance", "i1", InfraMissingObserved(at=NOW, actor="reconciler"), tx=tx)
+        await dispatcher.apply("cluster", "c1", InfraMissingObserved(at=NOW, actor="reconciler"), tx=tx)
+    async with uow() as tx:
+        assert repos.clusters.get(tx, "c1").version == 1

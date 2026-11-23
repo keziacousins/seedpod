@@ -66,6 +66,10 @@ inside ``EffectExecutor``").**
         called AFTER ``executor.start()``) is the backstop for any run whose
         hand-off never landed.
 
+   **Aggregate (DR-0055).** Both effects name their run's aggregate (``aggregate_type`` +
+   ``aggregate_id``). Only ``"cluster"`` is admitted; ``_cluster_id_of`` raises for an
+   ``"instance"`` (or anything else) before any read or write.
+
    ``CancelWorkflow`` admission: ``UPDATE workflow_runs SET cancel_requested=1
    WHERE cluster_id=? AND status IN (pending,running,blocked,compensating);
    trip the in-memory token; mark row done`` -- implemented by looking up
@@ -162,6 +166,22 @@ _DEFAULT_POLL_INTERVAL = 1.0  # seconds -- same reasoning as TimerService's defa
 _STOP_GRACE_SECONDS = 5.0
 _DEFAULT_RETENTION_DAYS = 7  # DR-0002
 _HOUSEKEEPING_INTERVAL = timedelta(hours=1)  # DR-0002: "hourly"
+
+
+def _cluster_id_of(eff: RunWorkflow | CancelWorkflow) -> str:
+    """The cluster a ``RunWorkflow``/``CancelWorkflow`` targets. DR-0055 gave these effects an
+    ``aggregate_type``; only ``"cluster"`` is admitted today. An instance effect raises here,
+    BEFORE any cluster lookup or run insert, so it can never be read as a cluster. The raise
+    lands in ``_process_row``'s drain-failure path: backoff, then ``dead``, with the row's
+    ``next available_at`` in the future, so it cannot starve the rows behind it."""
+    if eff.aggregate_type == "cluster":
+        return eff.aggregate_id
+    if eff.aggregate_type == "instance":
+        raise ValueError(
+            f"{eff.kind} for instance {eff.aggregate_id!r}: the run-admitter does not run "
+            "instance workflows yet (DR-0055)"
+        )
+    raise ValueError(f"{eff.kind}: unknown aggregate type {eff.aggregate_type!r}")
 
 
 class HubLike(Protocol):
@@ -386,12 +406,13 @@ class EffectExecutor:
     # -------------------------------------------------------------------------
 
     async def _drain_run_workflow(self, row: OutboxRow, eff: RunWorkflow) -> None:
+        cluster_id = _cluster_id_of(eff)
         new_run_id = str(uuid4())
         try:
             async with self._uow() as t:
-                cluster = self._repos.clusters.load(t, eff.cluster_id)
+                cluster = self._repos.clusters.load(t, cluster_id)
                 if cluster is None:
-                    raise LookupError(f"RunWorkflow admission: no cluster {eff.cluster_id!r} to resolve provider")
+                    raise LookupError(f"RunWorkflow admission: no cluster {cluster_id!r} to resolve provider")
                 concrete_name, args = self._dispatch.resolve(eff, cluster)
                 definitions = self._engine.definitions
                 if concrete_name not in definitions:
@@ -400,7 +421,7 @@ class EffectExecutor:
                     id=new_run_id,
                     workflow=concrete_name,
                     workflow_version=definitions[concrete_name].version,
-                    cluster_id=eff.cluster_id,
+                    cluster_id=cluster_id,
                     deployment_id=eff.deployment_id,
                     dedupe_key=row.effect_id,
                     args=dict(args),
@@ -475,8 +496,9 @@ class EffectExecutor:
            (``_drain_notify`` above) on a later pass -- one Notify delivery
            path, one audit trail (Conflict 1's "every effect is a row").
         """
+        cluster_id = _cluster_id_of(eff)
         async with self._uow() as t:
-            active = self._run_repo.active_for_cluster(t, eff.cluster_id)
+            active = self._run_repo.active_for_cluster(t, cluster_id)
 
         if eff.workflow == "destroy" and active is not None:
             await self._engine.cancel(active.id)
@@ -494,7 +516,7 @@ class EffectExecutor:
             topic="run_conflict",
             payload={
                 "workflow": eff.workflow,
-                "cluster_id": eff.cluster_id,
+                "cluster_id": cluster_id,
                 "deployment_id": eff.deployment_id,
                 "blocked_by_run_id": active.id if active is not None else None,
             },
@@ -504,7 +526,7 @@ class EffectExecutor:
             seq=None,
             effect_id=f"{row.effect_id}#run_conflict",
             aggregate_type="cluster",
-            aggregate_id=eff.cluster_id,
+            aggregate_id=cluster_id,
             to_version=0,
             ordinal=0,
             kind="notify",
@@ -526,8 +548,9 @@ class EffectExecutor:
     # -------------------------------------------------------------------------
 
     async def _drain_cancel_workflow(self, row: OutboxRow, eff: CancelWorkflow) -> None:
+        cluster_id = _cluster_id_of(eff)
         async with self._uow() as t:
-            active = self._run_repo.active_for_cluster(t, eff.cluster_id)
+            active = self._run_repo.active_for_cluster(t, cluster_id)
         if active is not None:
             await self._engine.cancel(active.id)
         async with self._uow() as t:

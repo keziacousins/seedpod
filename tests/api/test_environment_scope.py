@@ -301,6 +301,35 @@ async def test_workflow_and_timer_lists_show_only_the_key_environment(app, clien
     assert {t["aggregate_id"] for t in staging_timers} == {"s1"}
 
 
+async def test_a_run_with_no_cluster_lists_as_null_for_all_and_is_hidden_from_a_scoped_key(app, client):
+    """DR-0055 groundwork: ``workflow_runs.cluster_id`` can be NULL (an instance run). The list
+    must not crash on it, and a scoped key must not see it until DR-0054 covers instances."""
+    now = app.clock.now()
+    async with app.uow() as t:
+        t.execute(text("INSERT INTO api_keys (key_hash, username, created_at) VALUES ('owner', 'o', :n)"), {"n": now.isoformat()})
+        owner = t.execute(text("SELECT MAX(id) FROM api_keys")).scalar()
+        t.execute(
+            text(
+                "INSERT INTO instances (id, slug, provider, environment, template, size, status, owner_key_id,"
+                " lease_seconds, expires_at, hard_expires_at, hourly_price, vcpu, memory_mb, created_at, updated_at)"
+                " VALUES ('i1', 'box', 'tart', 'staging', 't', 's', 'active', :o, 60, :n, :n, 0, 1, 1, :n, :n)"
+            ),
+            {"o": owner, "n": now.isoformat()},
+        )
+        app.repos.workflow_runs.insert(t, WorkflowRunRow(
+            id="run-i1", workflow="provision-instance-tart", workflow_version=1, cluster_id=None,
+            instance_id="i1", deployment_id=None, dedupe_key="dedupe-i1", args={}, status="succeeded",
+            cancel_requested=False, failed_step=None, error=None, undo_incomplete=None,
+            initiated_by="api:test", created_at=now, started_at=now, finished_at=now,
+        ))
+    admin = await _key(app, environment="all")
+    staging = await _key(app, environment="staging")
+
+    rows = (await client.get("/api/workflows", headers=admin)).json()["workflows"]
+    assert [(r["id"], r["cluster_id"]) for r in rows] == [("run-i1", None)]
+    assert (await client.get("/api/workflows", headers=staging)).json()["workflows"] == []
+
+
 # ---------------------------------------------------------------------------
 # Changes that reach every environment
 # ---------------------------------------------------------------------------

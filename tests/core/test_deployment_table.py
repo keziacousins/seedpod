@@ -93,7 +93,7 @@ def test_pending_cluster_ready_starts_deploying():
     assert result.effects == (
         _persist(new, old.version),
         _dn(new, "pending"),
-        ef.RunWorkflow(workflow="deploy", cluster_id=new.cluster_id, deployment_id=new.id),
+        ef.RunWorkflow(workflow="deploy", aggregate_type="cluster", aggregate_id=new.cluster_id, deployment_id=new.id),
     )
 
 
@@ -166,8 +166,8 @@ def test_deploying_cancel_requested_cancel_then_rollback_in_order():
     assert result.effects == (
         _persist(new, old.version),
         _dn(new, "deploying"),
-        ef.CancelWorkflow(workflow="deploy", cluster_id=new.cluster_id, deployment_id=new.id),
-        ef.RunWorkflow(workflow="rollback", cluster_id=new.cluster_id, deployment_id=new.id),
+        ef.CancelWorkflow(workflow="deploy", aggregate_type="cluster", aggregate_id=new.cluster_id, deployment_id=new.id),
+        ef.RunWorkflow(workflow="rollback", aggregate_type="cluster", aggregate_id=new.cluster_id, deployment_id=new.id),
     )
 
 
@@ -181,7 +181,7 @@ def test_deploying_cluster_gone_cancel_only_no_rollback():
     assert result.effects == (
         _persist(new, old.version),
         _dn(new, "deploying"),
-        ef.CancelWorkflow(workflow="deploy", cluster_id=new.cluster_id, deployment_id=new.id),
+        ef.CancelWorkflow(workflow="deploy", aggregate_type="cluster", aggregate_id=new.cluster_id, deployment_id=new.id),
     )
 
 

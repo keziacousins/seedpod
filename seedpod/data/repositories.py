@@ -59,7 +59,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Final, Literal
 
@@ -199,12 +199,15 @@ def _dump_nn(value: Mapping[str, Any] | Sequence[Any], *, kind: Literal["map", "
 
 @dataclass(frozen=True, slots=True)
 class WorkflowRunRow:
-    """One ``workflow_runs`` row (session-in/DTO-out; mirrors 0001_initial.sql exactly)."""
+    """One ``workflow_runs`` row (session-in/DTO-out; mirrors the table as 0005_instances.sql
+    left it). A run belongs to exactly one aggregate: ``cluster_id`` for a cluster or
+    deployment run, ``instance_id`` for an instance run (DR-0055 decision 4). The table's
+    CHECK enforces that; ``__post_init__`` says so before a statement is sent."""
 
     id: str
     workflow: str  # CONCRETE definition name (Conflict 13), not the abstract verb
     workflow_version: int
-    cluster_id: str
+    cluster_id: str | None
     deployment_id: str | None
     dedupe_key: str | None
     args: Mapping[str, Any]
@@ -217,6 +220,14 @@ class WorkflowRunRow:
     created_at: datetime
     started_at: datetime | None
     finished_at: datetime | None
+    instance_id: str | None = field(default=None, kw_only=True)
+
+    def __post_init__(self) -> None:
+        if (self.cluster_id is None) == (self.instance_id is None):
+            raise ValueError(
+                f"workflow run {self.id!r} needs exactly one of cluster_id and instance_id "
+                f"(got cluster_id={self.cluster_id!r}, instance_id={self.instance_id!r})"
+            )
 
 
 def _run_params(row: WorkflowRunRow) -> dict[str, Any]:
@@ -225,6 +236,7 @@ def _run_params(row: WorkflowRunRow) -> dict[str, Any]:
         "workflow": row.workflow,
         "workflow_version": row.workflow_version,
         "cluster_id": row.cluster_id,
+        "instance_id": row.instance_id,
         "deployment_id": row.deployment_id,
         "dedupe_key": row.dedupe_key,
         "args": _dump(row.args) or "{}",
@@ -246,6 +258,7 @@ def _run_from_mapping(m: Mapping[str, Any]) -> WorkflowRunRow:
         workflow=m["workflow"],
         workflow_version=m["workflow_version"],
         cluster_id=m["cluster_id"],
+        instance_id=m["instance_id"],
         deployment_id=m["deployment_id"],
         dedupe_key=m["dedupe_key"],
         args=_load(m["args"]) or {},
@@ -275,11 +288,11 @@ class WorkflowRunRepository:
             text(
                 """
                 INSERT INTO workflow_runs
-                    (id, workflow, workflow_version, cluster_id, deployment_id, dedupe_key,
+                    (id, workflow, workflow_version, cluster_id, instance_id, deployment_id, dedupe_key,
                      args, status, cancel_requested, failed_step, error, undo_incomplete,
                      initiated_by, created_at, started_at, finished_at)
                 VALUES
-                    (:id, :workflow, :workflow_version, :cluster_id, :deployment_id, :dedupe_key,
+                    (:id, :workflow, :workflow_version, :cluster_id, :instance_id, :deployment_id, :dedupe_key,
                      :args, :status, :cancel_requested, :failed_step, :error, :undo_incomplete,
                      :initiated_by, :created_at, :started_at, :finished_at)
                 """
@@ -303,11 +316,11 @@ class WorkflowRunRepository:
             text(
                 """
                 INSERT INTO workflow_runs
-                    (id, workflow, workflow_version, cluster_id, deployment_id, dedupe_key,
+                    (id, workflow, workflow_version, cluster_id, instance_id, deployment_id, dedupe_key,
                      args, status, cancel_requested, failed_step, error, undo_incomplete,
                      initiated_by, created_at, started_at, finished_at)
                 VALUES
-                    (:id, :workflow, :workflow_version, :cluster_id, :deployment_id, :dedupe_key,
+                    (:id, :workflow, :workflow_version, :cluster_id, :instance_id, :deployment_id, :dedupe_key,
                      :args, :status, :cancel_requested, :failed_step, :error, :undo_incomplete,
                      :initiated_by, :created_at, :started_at, :finished_at)
                 ON CONFLICT (dedupe_key) DO NOTHING
@@ -354,6 +367,18 @@ class WorkflowRunRepository:
                 "AND status IN :statuses"
             ).bindparams(bindparam("statuses", expanding=True)),
             {"cluster_id": cluster_id, "statuses": list(ACTIVE_RUN_STATUSES)},
+        ).mappings().first()
+        return _run_from_mapping(row) if row is not None else None
+
+    def active_for_instance(self, session: Session, instance_id: str) -> WorkflowRunRow | None:
+        """The instance twin of ``active_for_cluster``, held to one row by
+        ``ux_wr_one_active_instance`` (DR-0055 decision 4)."""
+        row = session.execute(
+            text(
+                "SELECT * FROM workflow_runs WHERE instance_id = :instance_id "
+                "AND status IN :statuses"
+            ).bindparams(bindparam("statuses", expanding=True)),
+            {"instance_id": instance_id, "statuses": list(ACTIVE_RUN_STATUSES)},
         ).mappings().first()
         return _run_from_mapping(row) if row is not None else None
 

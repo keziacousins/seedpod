@@ -17,6 +17,7 @@ hand-built fakes (``FakeEngine``) -- no Mock/patch anywhere (CLAUDE.md).
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import timedelta
 
 from seedpod.core.effects import CancelWorkflow, RunWorkflow
@@ -47,7 +48,7 @@ async def test_successful_admission_pins_workflow_version_and_hands_off_to_engin
     async with uow() as t:
         repos.clusters.insert(t, make_cluster_row("c1", "demo", status="provisioning"))
     engine.definitions["provision-fake"] = FakeWorkflowDefinition(version=3)
-    eff = RunWorkflow(workflow="provision", cluster_id="c1")
+    eff = RunWorkflow(workflow="provision", aggregate_type="cluster", aggregate_id="c1")
     row = outbox_row(eff, "cluster", "c1", 1, 0, now=NOW)
     async with uow() as t:
         repos.outbox.insert(t, row)
@@ -77,7 +78,7 @@ async def test_successful_admission_pins_workflow_version_and_hands_off_to_engin
 async def test_h7_crash_replay_drains_exactly_once(uow, repos, dispatch, clock, hub):
     async with uow() as t:
         repos.clusters.insert(t, make_cluster_row("c1", "demo", status="provisioning"))
-    eff = RunWorkflow(workflow="provision", cluster_id="c1")
+    eff = RunWorkflow(workflow="provision", aggregate_type="cluster", aggregate_id="c1")
     row = outbox_row(eff, "cluster", "c1", 1, 0, now=NOW)
     async with uow() as t:
         repos.outbox.insert(t, row)
@@ -128,7 +129,7 @@ async def test_destroy_supersede_wait_loop_retries_without_incrementing_attempts
         repos.clusters.insert(t, make_cluster_row("c1", "demo", status="destroy-scheduled"))
         repos.workflow_runs.insert(t, make_run_row("victim", "c1", workflow="provision-fake", status="running"))
     engine.definitions["destroy-cloud"] = FakeWorkflowDefinition(version=2)
-    eff = RunWorkflow(workflow="destroy", cluster_id="c1")
+    eff = RunWorkflow(workflow="destroy", aggregate_type="cluster", aggregate_id="c1")
     row = outbox_row(eff, "cluster", "c1", 2, 0, now=NOW)
     async with uow() as t:
         repos.outbox.insert(t, row)
@@ -191,7 +192,7 @@ async def test_run_conflict_for_non_destroy_marks_done_and_emits_durable_scoped_
             t, make_run_row("victim", "c1", workflow="deploy-waves", status="running", cancel_requested=False)
         )
     engine.definitions["deploy-waves"] = FakeWorkflowDefinition(version=1)
-    eff = RunWorkflow(workflow="deploy", cluster_id="c1", deployment_id="d1")
+    eff = RunWorkflow(workflow="deploy", aggregate_type="cluster", aggregate_id="c1", deployment_id="d1")
     row = outbox_row(eff, "cluster", "c1", 3, 0, now=NOW)
     async with uow() as t:
         repos.outbox.insert(t, row)
@@ -239,7 +240,7 @@ async def test_run_conflict_notify_insert_is_replay_idempotent(uow, repos, execu
             t, make_run_row("victim", "c1", workflow="deploy-waves", status="running", cancel_requested=False)
         )
         cluster = repos.clusters.load(t, "c1")
-    eff = RunWorkflow(workflow="deploy", cluster_id="c1", deployment_id="d1")
+    eff = RunWorkflow(workflow="deploy", aggregate_type="cluster", aggregate_id="c1", deployment_id="d1")
     row = outbox_row(eff, "cluster", "c1", 3, 0, now=NOW)
     async with uow() as t:
         repos.outbox.insert(t, row)
@@ -272,7 +273,7 @@ async def test_cancel_workflow_flips_active_run_and_marks_done(uow, repos, execu
     async with uow() as t:
         repos.clusters.insert(t, make_cluster_row("c1", "demo", status="active"))
         repos.workflow_runs.insert(t, make_run_row("victim", "c1", workflow="deploy-waves", status="running"))
-    eff = CancelWorkflow(workflow="deploy", cluster_id="c1", deployment_id="d1")
+    eff = CancelWorkflow(workflow="deploy", aggregate_type="cluster", aggregate_id="c1", deployment_id="d1")
     row = outbox_row(eff, "cluster", "c1", 4, 0, now=NOW)
     async with uow() as t:
         repos.outbox.insert(t, row)
@@ -290,7 +291,7 @@ async def test_cancel_workflow_flips_active_run_and_marks_done(uow, repos, execu
 async def test_cancel_workflow_with_no_active_run_is_a_harmless_no_op(uow, repos, executor, engine):
     async with uow() as t:
         repos.clusters.insert(t, make_cluster_row("c1", "demo", status="active"))
-    eff = CancelWorkflow(workflow="deploy", cluster_id="c1", deployment_id="d1")
+    eff = CancelWorkflow(workflow="deploy", aggregate_type="cluster", aggregate_id="c1", deployment_id="d1")
     row = outbox_row(eff, "cluster", "c1", 1, 0, now=NOW)
     async with uow() as t:
         repos.outbox.insert(t, row)
@@ -363,3 +364,148 @@ async def test_cw_before_rw_seq_ordering_rollback_waits_for_cancelled_deploy(uow
     assert rollback_runs[0].cluster_id == "c1"
     assert rw_row_after.status == "done"
     assert engine.started == [rollback_runs[0].id]
+
+
+# ---------------------------------------------------------------------------
+# DR-0055 decision 4: RunWorkflow/CancelWorkflow name their run's aggregate. Only a
+# cluster is admitted today; an instance effect must fail explicitly, never read as a
+# cluster, and never hold up the rows behind it.
+# ---------------------------------------------------------------------------
+
+
+async def test_legacy_cluster_id_outbox_row_is_admitted_like_a_new_one(uow, repos, executor, engine):
+    """A row written before the change (``cluster_id`` payload) still admits a run."""
+    async with uow() as t:
+        repos.clusters.insert(t, make_cluster_row("c1", "demo", status="provisioning"))
+    engine.definitions["provision-fake"] = FakeWorkflowDefinition(version=1)
+    new = outbox_row(
+        RunWorkflow(workflow="provision", aggregate_type="cluster", aggregate_id="c1"), "cluster", "c1", 1, 0, now=NOW
+    )
+    legacy = dataclasses.replace(
+        new,
+        payload='{"args": {}, "cluster_id": "c1", "deployment_id": null, "kind": "run_workflow", "workflow": "provision"}',
+    )
+    async with uow() as t:
+        repos.outbox.insert(t, legacy)
+
+    await executor.drain_pending()
+
+    async with uow() as t:
+        runs = _active_runs(repos.workflow_runs, t)
+        after = repos.outbox.get(t, legacy.effect_id)
+    assert [(r.cluster_id, r.instance_id) for r in runs] == [("c1", None)]
+    assert after.status == "done"
+    assert engine.started == [runs[0].id]
+
+
+async def test_legacy_cancel_workflow_row_still_cancels_the_clusters_run(uow, repos, executor, engine):
+    async with uow() as t:
+        repos.clusters.insert(t, make_cluster_row("c1", "demo", status="active"))
+        repos.workflow_runs.insert(t, make_run_row("victim", "c1", workflow="deploy-waves", status="running"))
+    new = outbox_row(
+        CancelWorkflow(workflow="deploy", aggregate_type="cluster", aggregate_id="c1", deployment_id="d1"),
+        "cluster", "c1", 2, 0, now=NOW,
+    )
+    legacy = dataclasses.replace(
+        new,
+        payload='{"cluster_id": "c1", "deployment_id": "d1", "kind": "cancel_workflow",'
+        ' "reason": "", "workflow": "deploy"}',
+    )
+    async with uow() as t:
+        repos.outbox.insert(t, legacy)
+
+    await executor.drain_pending()
+
+    assert engine.cancelled == ["victim"]
+    async with uow() as t:
+        assert repos.outbox.get(t, legacy.effect_id).status == "done"
+
+
+async def test_instance_run_workflow_fails_explicitly_and_is_not_read_as_a_cluster(uow, repos, executor, engine):
+    # A cluster whose id equals the instance id: the old reading (`cluster_id`) would admit a run for it.
+    async with uow() as t:
+        repos.clusters.insert(t, make_cluster_row("same-id", "demo", status="provisioning"))
+    engine.definitions["provision-fake"] = FakeWorkflowDefinition(version=1)
+    eff = RunWorkflow(workflow="provision", aggregate_type="instance", aggregate_id="same-id")
+    row = outbox_row(eff, "cluster", "x", 1, 0, now=NOW)
+    async with uow() as t:
+        repos.outbox.insert(t, row)
+
+    await executor.drain_pending()  # terminates: the failed row is rescheduled into the future
+
+    async with uow() as t:
+        after = repos.outbox.get(t, row.effect_id)
+        runs = repos.workflow_runs.list_all(t)
+    assert runs == []
+    assert engine.started == []
+    assert after.status == "pending" and after.attempts == 1
+    assert "instance" in after.last_error and "same-id" in after.last_error
+    assert after.available_at > NOW
+
+
+async def test_instance_cancel_workflow_does_not_cancel_a_clusters_run(uow, repos, executor, engine):
+    async with uow() as t:
+        repos.clusters.insert(t, make_cluster_row("same-id", "demo", status="active"))
+        repos.workflow_runs.insert(t, make_run_row("cluster-run", "same-id", workflow="deploy-waves", status="running"))
+    eff = CancelWorkflow(workflow="destroy", aggregate_type="instance", aggregate_id="same-id")
+    row = outbox_row(eff, "cluster", "x", 1, 0, now=NOW)
+    async with uow() as t:
+        repos.outbox.insert(t, row)
+
+    await executor.drain_pending()
+
+    assert engine.cancelled == []
+    async with uow() as t:
+        assert repos.workflow_runs.get(t, "cluster-run").cancel_requested is False
+        after = repos.outbox.get(t, row.effect_id)
+    assert after.status == "pending" and after.attempts == 1
+
+
+async def test_unknown_aggregate_type_fails_the_same_way(uow, repos, executor, engine):
+    async with uow() as t:
+        repos.clusters.insert(t, make_cluster_row("c1", "demo", status="provisioning"))
+    engine.definitions["provision-fake"] = FakeWorkflowDefinition(version=1)
+    eff = RunWorkflow(workflow="provision", aggregate_type="deployment", aggregate_id="c1")
+    row = outbox_row(eff, "cluster", "x", 1, 0, now=NOW)
+    async with uow() as t:
+        repos.outbox.insert(t, row)
+
+    await executor.drain_pending()
+
+    async with uow() as t:
+        after = repos.outbox.get(t, row.effect_id)
+        assert repos.workflow_runs.list_all(t) == []
+    assert after.status == "pending" and "unknown aggregate type" in after.last_error
+
+
+async def test_an_instance_effect_does_not_wedge_the_outbox_for_other_effects(uow, repos, executor, engine, clock):
+    """The instance row is FIRST in seq order. The cluster rows behind it still drain, and
+    the instance row ends up dead after the usual attempts, not pending forever."""
+    async with uow() as t:
+        repos.clusters.insert(t, make_cluster_row("c1", "demo", status="provisioning"))
+    engine.definitions["provision-fake"] = FakeWorkflowDefinition(version=1)
+    bad = outbox_row(
+        RunWorkflow(workflow="provision", aggregate_type="instance", aggregate_id="i1"), "cluster", "x", 1, 0, now=NOW
+    )
+    good = outbox_row(
+        RunWorkflow(workflow="provision", aggregate_type="cluster", aggregate_id="c1"), "cluster", "c1", 1, 0, now=NOW
+    )
+    async with uow() as t:
+        repos.outbox.insert(t, bad)
+        repos.outbox.insert(t, good)
+
+    await executor.drain_pending()
+
+    async with uow() as t:
+        assert repos.outbox.get(t, good.effect_id).status == "done"
+        assert repos.outbox.get(t, bad.effect_id).status == "pending"
+    assert len(engine.started) == 1
+
+    # Walk the backoff ladder to the end: the row goes dead, and a drain pass still returns.
+    for _ in range(10):
+        clock.advance(timedelta(hours=1))
+        await executor.drain_pending()
+    async with uow() as t:
+        dead = repos.outbox.get(t, bad.effect_id)
+    assert dead.status == "dead" and dead.attempts == 8
+    assert len(engine.started) == 1  # nothing was ever admitted for it

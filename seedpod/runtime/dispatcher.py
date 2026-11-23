@@ -87,6 +87,18 @@ from seedpod.data.uow import UnitOfWork
 
 __all__ = ["Dispatcher", "outbox_row"]
 
+# The aggregates ``apply()`` can transition. Every internal branch below selects on this
+# explicitly: a name outside it is an error, never "the other one". DR-0055 adds
+# ``"instance"`` as an aggregate, but its state machine does not exist yet, so it is
+# rejected here the same way an unknown name is, with a message that says so.
+_SUPPORTED_AGGREGATES = frozenset({"cluster", "deployment"})
+
+
+def _unsupported(aggregate: str) -> ValueError:
+    if aggregate == "instance":
+        return ValueError("the Dispatcher does not support the 'instance' aggregate yet (DR-0055)")
+    return ValueError(f"unknown aggregate type {aggregate!r}: expected one of {sorted(_SUPPORTED_AGGREGATES)}")
+
 # Conflict 2's amended EffectKind lane table (seedpod/core/effects.py's per-member
 # comments, restated here as the Dispatcher's own lookup): Persist/ScheduleTimer/
 # CancelTimer/Cascade commit inside the transition transaction (outbox row inserted
@@ -270,7 +282,10 @@ class Dispatcher:
         docstring). ``Ignore`` (``result.effects == ()``) writes NOTHING: no version
         bump, no audit row, no outbox row, no poke. ``StaleVersion`` from a losing CAS
         propagates to the caller unretried -- the re-read/re-decide loop (<=3
-        attempts) is the caller's job (docs/design/seam-a-core.md §D)."""
+        attempts) is the caller's job (docs/design/seam-a-core.md §D). An unsupported or
+        unknown ``aggregate`` raises ``ValueError`` before anything is read or written."""
+        if aggregate not in _SUPPORTED_AGGREGATES:
+            raise _unsupported(aggregate)
         assert _cascade_depth <= _MAX_CASCADE_DEPTH, (
             f"Cascade recursion exceeded depth {_MAX_CASCADE_DEPTH} "
             f"({aggregate}/{aggregate_id})"
@@ -334,14 +349,17 @@ class Dispatcher:
         ``DeploymentRepository.load`` use internally (imported, not reimplemented)."""
         if aggregate == "cluster":
             return _cluster_record_from_row(row)  # type: ignore[arg-type]
-        return _deployment_record_from_row(row)  # type: ignore[arg-type]
+        if aggregate == "deployment":
+            return _deployment_record_from_row(row)  # type: ignore[arg-type]
+        raise _unsupported(aggregate)
 
     def _load(self, t: Session, aggregate: str, aggregate_id: str) -> ClusterRecord | DeploymentRecord:
-        rec = (
-            self.repos.clusters.load(t, aggregate_id)
-            if aggregate == "cluster"
-            else self.repos.deployments.load(t, aggregate_id)
-        )
+        if aggregate == "cluster":
+            rec = self.repos.clusters.load(t, aggregate_id)
+        elif aggregate == "deployment":
+            rec = self.repos.deployments.load(t, aggregate_id)
+        else:
+            raise _unsupported(aggregate)
         if rec is None:
             raise LookupError(f"no {aggregate} {aggregate_id!r} to load and transition")
         return rec
@@ -354,6 +372,8 @@ class Dispatcher:
         *,
         birth_row: ClusterRow | DeploymentRow | None,
     ) -> None:
+        if aggregate not in _SUPPORTED_AGGREGATES:
+            raise _unsupported(aggregate)
         if eff.expected_version is None:
             if birth_row is None:
                 raise ValueError(
@@ -363,15 +383,19 @@ class Dispatcher:
                 )
             if aggregate == "cluster":
                 self.repos.clusters.insert(t, _overlay_cluster_row(birth_row, eff.record))  # type: ignore[arg-type]
-            else:
+            elif aggregate == "deployment":
                 self.repos.deployments.insert(
                     t, _overlay_deployment_row(birth_row, eff.record)  # type: ignore[arg-type]
                 )
+            else:
+                raise _unsupported(aggregate)
             return
         if aggregate == "cluster":
             self.repos.clusters.persist(t, eff.record, eff.expected_version, clock=self._clock)  # type: ignore[arg-type]
-        else:
+        elif aggregate == "deployment":
             self.repos.deployments.persist(t, eff.record, eff.expected_version, clock=self._clock)  # type: ignore[arg-type]
+        else:
+            raise _unsupported(aggregate)
 
     def _audit(
         self,
@@ -402,7 +426,7 @@ class Dispatcher:
                 actor=event.actor,
                 at=event.at,
             )
-        else:
+        elif aggregate == "deployment":
             self.repos.deployment_state_audits.add(
                 t,
                 deployment_id=result.record.id,
@@ -413,3 +437,5 @@ class Dispatcher:
                 actor=event.actor,
                 at=event.at,
             )
+        else:
+            raise _unsupported(aggregate)

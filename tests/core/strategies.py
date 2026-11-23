@@ -233,7 +233,8 @@ _notifies = st.builds(
 _run_workflows = st.builds(
     RunWorkflow,
     workflow=st.sampled_from(["provision", "deploy", "rollback", "destroy"]),
-    cluster_id=ids,
+    aggregate_type=st.sampled_from(["cluster", "instance"]),
+    aggregate_id=ids,
     deployment_id=st.one_of(st.none(), ids),
     args=json_mappings(),
 )
@@ -241,7 +242,8 @@ _run_workflows = st.builds(
 _cancel_workflows = st.builds(
     CancelWorkflow,
     workflow=st.sampled_from(["provision", "deploy", "rollback", "destroy"]),
-    cluster_id=ids,
+    aggregate_type=st.sampled_from(["cluster", "instance"]),
+    aggregate_id=ids,
     deployment_id=st.one_of(st.none(), ids),
     reason=safe_text,
 )
