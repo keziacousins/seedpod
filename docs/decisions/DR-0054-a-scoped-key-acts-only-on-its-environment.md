@@ -1,14 +1,15 @@
 ---
 title: DR-0054 — an API key scoped to one environment acts only on that environment, on every REST route
 type: decision
-status: proposal
+status: active
 created: 2026-10-25
-updated: 2026-10-25
+updated: 2026-11-23
+amended-by: DR-0055
 ---
 
 # DR-0054: a scoped key acts only on its environment
 
-**Status: PROPOSAL — not yet ratified.**
+**Status: ACTIVE — ratified by Kezia, 2026-11-23.**
 
 ## Context
 
