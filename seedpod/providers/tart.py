@@ -114,13 +114,17 @@ from seedpod.core.reconciliation_intents import OrphanIntent, ReconciliationInte
 from seedpod.providers.classify import TART_NOT_FOUND_PHRASES, classify_subprocess
 from seedpod.providers.contract import (
     RESOURCE_ALLOCATED,
+    BareInstanceCreated,
+    CreateBareInstance,
     CreateInstance,
+    DestroyBareInstance,
     DestroyInstance,
     DestroyOutcome,
     DestroyStatus,
     InstanceCreated,
     InstanceState,
     InstanceSummary,
+    ListBareInstances,
     ListInstances,
     ProbeDestruction,
     ProbeInstance,
@@ -133,11 +137,14 @@ from seedpod.providers.contract import (
     SubprocessRunner,
 )
 
-__all__ = ["TartConfig", "TartProvider", "VM_NAME_PREFIX"]
+__all__ = ["INSTANCE_VM_NAME_PREFIX", "TartConfig", "TartProvider", "VM_NAME_PREFIX"]
 
 _HOST = "localhost"  # tart is local-only (v1: single-machine topology, no remote daemon)
 
 VM_NAME_PREFIX = "seedpod-"
+# DR-0055: a bare instance's VM is ``spi-{slug}``. It must never match the cluster prefix: cluster
+# discovery lists by that prefix and cluster destroy falls back to ``seedpod-{slug}``.
+INSTANCE_VM_NAME_PREFIX = "spi-"
 
 # Cluster states (seedpod/core/records.py ClusterState, hyphenated wire values) excluded from
 # Phase-B orphan detection: terminal-ish/self-explaining drift. Verbatim from kind.py/
@@ -210,7 +217,10 @@ class TartConfig:
 class TartProvider:
     name: ClassVar[str] = "tart"
     supported: ClassVar[frozenset[type]] = frozenset(
-        {CreateInstance, ProbeInstance, DestroyInstance, ProbeDestruction, ListInstances, Reconcile}
+        {
+            CreateInstance, ProbeInstance, DestroyInstance, ProbeDestruction, ListInstances, Reconcile,
+            CreateBareInstance, DestroyBareInstance, ListBareInstances,  # DR-0055; probes serve both
+        }
     )
 
     def __init__(self, config: TartConfig, transport: SubprocessRunner) -> None:
@@ -275,6 +285,12 @@ class TartProvider:
             return self._list_instances(cmd)
         if isinstance(cmd, Reconcile):
             return self._reconcile(cmd)
+        if isinstance(cmd, CreateBareInstance):
+            return self._create_bare_instance(cmd)
+        if isinstance(cmd, DestroyBareInstance):
+            return self._destroy_bare_instance(cmd)
+        if isinstance(cmd, ListBareInstances):
+            return self._list_bare_instances(cmd)
         raise AssertionError(f"unreachable: {cmd!r} is in `supported` but has no handler")  # pragma: no cover
 
     # ------------------------------------------------------------------
@@ -431,6 +447,50 @@ class TartProvider:
         yield Result(tuple(intents))
 
     # ------------------------------------------------------------------
+    # commands — bare instances (DR-0055)
+    # ------------------------------------------------------------------
+
+    async def _create_bare_instance(self, cmd: CreateBareInstance) -> AsyncIterator[ProviderEvent]:
+        name = f"{INSTANCE_VM_NAME_PREFIX}{cmd.slug}"
+        resource_ids = {"tart_vm_name": name}
+        yield Progress(phase=RESOURCE_ALLOCATED, data={"resource_ids": resource_ids})  # before any tart call
+        adopted = await self._clone(cmd.image, name)
+        if not adopted:
+            await self._set_resources(name, memory_mb=cmd.memory_mb, cpu_cores=cmd.vcpu, disk_gb=cmd.disk_gb)
+            await self._run_detached(name)
+        address = await self._get_ip(name, command_name="create_bare_instance.get_ip")
+        yield Result(BareInstanceCreated(resource_ids=resource_ids, address=address, adopted_existing=adopted))
+
+    async def _destroy_bare_instance(self, cmd: DestroyBareInstance) -> AsyncIterator[ProviderEvent]:
+        own_name = f"{INSTANCE_VM_NAME_PREFIX}{cmd.slug}"
+        name = cmd.resource_ids.get("tart_vm_name") or own_name
+        if name != own_name:
+            raise PermanentError(
+                f"tart.destroy_bare_instance: refusing {name!r}: this instance's VM is {own_name!r}",
+                code=ErrorCode.INVALID_INPUT,
+                provider=self.name,
+                command="destroy_bare_instance",
+                detail={"name": name},
+            )
+        # Absence is read only from a `tart list` that succeeded (it raises Unreachable otherwise).
+        # `_stop` and `_delete` raise on a killed or non-zero command, so nothing below can hide a
+        # failure behind DESTROYED. An instance has no disk worth keeping: `delete_on_destroy` is ignored.
+        if any(vm.name == name for vm in await self._list_vms(command_name="destroy_bare_instance")):
+            await self._stop(name)
+            await self._delete(name)
+        yield Result(DestroyOutcome(status=DestroyStatus.DESTROYED))
+
+    async def _list_bare_instances(self, cmd: ListBareInstances) -> AsyncIterator[ProviderEvent]:
+        vms = await self._list_vms(command_name="list_bare_instances")
+        yield Result(
+            tuple(
+                InstanceSummary(name=vm.name, resource_ids={"tart_vm_name": vm.name})
+                for vm in vms
+                if vm.is_local and vm.name.startswith(INSTANCE_VM_NAME_PREFIX)
+            )
+        )
+
+    # ------------------------------------------------------------------
     # internals — node spec translation
     # ------------------------------------------------------------------
 
@@ -521,10 +581,12 @@ class TartProvider:
             )
         raise self._classify(result, command_name="create_instance.clone")
 
-    async def _set_resources(self, name: str, *, memory_mb: int, cpu_cores: int, disk_gb: int) -> None:
+    async def _set_resources(self, name: str, *, memory_mb: int, cpu_cores: int, disk_gb: int | None) -> None:
         """``tart set <name> --memory M --cpu C --disk-size D`` (v1 ``_tart_cli.set_resources``,
         reference-code .../_tart_cli.py:190-217)."""
-        args = ["set", name, "--memory", str(memory_mb), "--cpu", str(cpu_cores), "--disk-size", str(disk_gb)]
+        args = ["set", name, "--memory", str(memory_mb), "--cpu", str(cpu_cores)]
+        if disk_gb is not None:  # None: a bare instance that keeps its image's disk (`tart set` can only grow one)
+            args += ["--disk-size", str(disk_gb)]
         result = await self._run_tart(args, timeout=self.config.set_resources_timeout_s, command_name="create_instance.set_resources")
         if result.timed_out or result.binary_missing or result.returncode != 0:
             raise self._classify(result, command_name="create_instance.set_resources")

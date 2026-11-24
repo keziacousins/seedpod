@@ -93,9 +93,11 @@ import yaml
 
 from seedpod.core.acme import AcmeConfig
 from seedpod.core.errors import ErrorCode, PermanentError, ProviderError, TransientError
+from seedpod.core.instance_template import BOOT_PAYLOAD_DIR, BOOT_PAYLOAD_PATH, validate_entrypoint
 from seedpod.core.tempfiles import TempFileRegistry
 from seedpod.providers.classify import classify_subprocess
 from seedpod.providers.contract import (
+    BootInstance,
     CaptureHostKeys,
     FetchKubeconfig,
     HostKeys,
@@ -228,7 +230,7 @@ def _traefik_helm_config(
 class SshK3sProvider:
     name: ClassVar[str] = "ssh-k3s"
     supported: ClassVar[frozenset[type]] = frozenset(
-        {ProbeSshPort, CaptureHostKeys, InstallK3s, ProbeK3s, FetchKubeconfig}
+        {ProbeSshPort, CaptureHostKeys, InstallK3s, ProbeK3s, FetchKubeconfig, BootInstance}
     )
 
     def __init__(self, config: SshK3sConfig, transport: SubprocessRunner) -> None:
@@ -283,6 +285,8 @@ class SshK3sProvider:
             return self._probe_k3s(cmd)
         if isinstance(cmd, FetchKubeconfig):
             return self._fetch_kubeconfig(cmd)
+        if isinstance(cmd, BootInstance):
+            return self._boot_instance(cmd)
         raise AssertionError(f"unreachable: {cmd!r} is in `supported` but has no handler")  # pragma: no cover
 
     # ------------------------------------------------------------------
@@ -468,6 +472,27 @@ class SshK3sProvider:
 
         yield Result(Kubeconfig(yaml_text=yaml.safe_dump(doc, default_flow_style=False, sort_keys=False)))
 
+    async def _boot_instance(self, cmd: BootInstance) -> AsyncIterator[ProviderEvent]:
+        """DR-0055 decision 8: ONE strict-checked ssh call. The payload is ssh's STDIN, so no byte of it
+        is part of a shell command. The only caller text on the command line is the entrypoint,
+        validated and quoted. The file is written under ``umask 077`` and ``chmod 0600``, by root."""
+        try:
+            if not cmd.known_hosts:
+                raise ValueError("known_hosts is empty: CaptureHostKeys must run first")
+            entrypoint = validate_entrypoint(cmd.entrypoint)
+        except ValueError as e:
+            raise PermanentError(
+                f"ssh-k3s.boot_instance: {e}", code=ErrorCode.INVALID_INPUT, provider=self.name, command="boot_instance"
+            ) from e
+        command = (
+            f"sudo install -d -m 0700 {BOOT_PAYLOAD_DIR} && "
+            f"sudo sh -c 'umask 077 && cat > {BOOT_PAYLOAD_PATH} && chmod 0600 {BOOT_PAYLOAD_PATH}' && "
+            f"sudo {shlex.quote(entrypoint)} {BOOT_PAYLOAD_PATH}"
+        )
+        yield Progress(phase="instance.booting")
+        await self._run_strict(cmd.ssh, cmd.known_hosts, command, command_name="boot_instance", stdin=cmd.payload)
+        yield Result(None)
+
     # ------------------------------------------------------------------
     # SSH internals
     # ------------------------------------------------------------------
@@ -562,7 +587,9 @@ class SshK3sProvider:
             )
         return stdout_text
 
-    async def _run_strict(self, ssh: SSHTarget, known_hosts: str, command: str, *, command_name: str) -> str:
+    async def _run_strict(
+        self, ssh: SSHTarget, known_hosts: str, command: str, *, command_name: str, stdin: bytes | None = None
+    ) -> str:
         """Strict host-key-checked SSH (salvaged from ``execute``,
         reference-code/seedpod/seedpod/providers/_ssh_k3s_installer.py:275-384) — the
         ``retry_attempts``/``retry_delay`` loop is STRIPPED per the task: one bounded attempt,
@@ -583,7 +610,7 @@ class SshK3sProvider:
                 f"{ssh.user}@{ssh.host}",
                 command,
             ]
-            result = await self.transport.run(argv, timeout=ssh.command_timeout_s)
+            result = await self.transport.run(argv, stdin=stdin, timeout=ssh.command_timeout_s)
         stdout_text = result.stdout.decode(errors="replace").strip()
         stderr_text = result.stderr.decode(errors="replace").strip()
         if result.timed_out or result.binary_missing or result.returncode != 0:

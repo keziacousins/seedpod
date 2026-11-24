@@ -257,7 +257,7 @@ def test_verify_ssh_identities_accepts_an_unconfigured_path(tmp_path):
 
 
 def test_load_workflow_definitions_parses_all_shipped_files():
-    """The 8 files under config/workflows/ (tests/engine/test_shipped_workflows.py's
+    """The files under config/workflows/ (tests/engine/test_shipped_workflows.py's
     own inventory) all parse clean against the frozen grammar -- structural only
     (V7/V9/V10), no verb registry needed (see factory.py's module docstring)."""
     definitions = load_workflow_definitions(REPO_ROOT / "config" / "workflows")
@@ -270,6 +270,8 @@ def test_load_workflow_definitions_parses_all_shipped_files():
         "provision-kind",
         "provision-orbstack",
         "provision-tart",
+        "provision-instance-tart",  # DR-0055
+        "destroy-instance",
     }
     for wf in definitions.values():
         assert wf.version >= 1

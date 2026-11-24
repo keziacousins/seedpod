@@ -1,0 +1,28 @@
+# destroy-instance -- destroy a bare VM on any provider (DR-0055).
+#
+# instance.load_infra reads {provider, slug, resource_ids} fresh at run time. The VM is found by its
+# recorded id, or by spi-{slug} if none was recorded (a create that died before recording, or a late
+# create). DestroyBareInstance refuses any name that is not spi-*, so it never reaches a cluster's VM.
+# A destroy that cannot finish fails the run: InstanceDestroyFailed, and the machine retries. An
+# unreachable provider parks the run; it never counts as destroyed.
+workflow: destroy-instance
+version: 1
+inputs:
+  instance_id: {type: str}
+on_failure: report
+outcome:
+  succeeded: {event: InstanceDestroySucceeded}
+  failed:    {event: InstanceDestroyFailed}
+  cancelled: {event: InstanceDestroyFailed}
+steps:
+  - id: infra
+    uses: instance.load_infra
+    with: {instance_id: {from: run.instance_id}}
+    timeout_seconds: 30
+
+  - id: destroy
+    uses: instance.destroy
+    with: {provider: {from: infra.provider}, instance_id: {from: run.instance_id},
+           slug: {from: infra.slug}, resource_ids: {from: infra.resource_ids}}
+    retry: api_default
+    timeout_seconds: 120

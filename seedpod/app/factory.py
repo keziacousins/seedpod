@@ -113,6 +113,7 @@ from seedpod.app.services import (
     SnapshotService,
 )
 from seedpod.core.clock import Clock, SystemClock
+from seedpod.core.instance_template import InstanceTemplate
 from seedpod.data.database import Database
 from seedpod.data.repositories import (
     ApiKeyRepository,
@@ -160,6 +161,13 @@ from seedpod.engine.steps.infra import (
     InfraCreateInstance,
     InfraDestroyInstance,
     InfraFetchKubeconfig,
+)
+from seedpod.engine.steps.instance import (
+    InstanceBoot,
+    InstanceCreate,
+    InstanceDestroy,
+    InstanceLoadInfra,
+    InstanceLoadSpec,
 )
 from seedpod.engine.steps.k3s import (
     K3sAwaitApi,
@@ -378,6 +386,10 @@ def build_app(
         deployment_audits=deployment_audits_repo,
         manifest_resolver=manifest_resolver,
         snapshots=snapshot_service,
+        instance_templates=load_instance_templates(config.config_dir / "instance-templates"),
+        # DR-0055: the request route that records a requester's SSH key is a later phase. Until it
+        # lands there is no key, and `instance.load_spec` refuses by name; it never invents one.
+        instance_public_key_for=lambda instance_id: None,
     )
     definitions = load_workflow_definitions(config.config_dir / "workflows")
     step_services = StepServices(
@@ -827,6 +839,8 @@ def _build_step_registry(
     deployment_audits: DeploymentAuditRepository,
     manifest_resolver: ManifestResolver,
     snapshots: SnapshotService,
+    instance_templates: Mapping[str, InstanceTemplate],
+    instance_public_key_for: Callable[[str], str | None],
 ) -> StepRegistry:
     """The composition-root verb registry -- the FULL 30-verb DR-0022 catalog,
     complete as of this round's "restore-and-rehydrate" component. Built up
@@ -955,8 +969,26 @@ def _build_step_registry(
             DeployRestoreSnapshot.verb: DeployRestoreSnapshot(snapshots=snapshots, clock=clock),
             DeployEnsureRollouts.verb: DeployEnsureRollouts(),
             DeployAwaitWave.verb: DeployAwaitWave(),
+            # DR-0055: a bare VM, no k3s.
+            InstanceLoadSpec.verb: InstanceLoadSpec(
+                uow=uow, instances=repos.instances, templates=instance_templates,
+                ssh_identities=ssh_identities, public_key_for=instance_public_key_for,
+            ),
+            InstanceCreate.verb: InstanceCreate(),
+            InstanceBoot.verb: InstanceBoot(),
+            InstanceLoadInfra.verb: InstanceLoadInfra(uow=uow, instances=repos.instances),
+            InstanceDestroy.verb: InstanceDestroy(),
         }
     )
+
+
+def load_instance_templates(directory: Path) -> dict[str, InstanceTemplate]:
+    """``config/instance-templates/{name}.yml`` -> ``{name: template}``. A missing directory is no
+    templates. A malformed file raises at boot, like a bad k3s version, not mid-provision."""
+    return {
+        path.stem: InstanceTemplate.model_validate(_load_yaml(path))
+        for path in sorted(directory.glob("*.yml"))
+    }
 
 
 def load_workflow_definitions(directory: Path) -> dict[str, WorkflowDefinition]:

@@ -41,6 +41,7 @@ class FakeTartBackend:
     call_log: list[tuple[str, ...]] = field(default_factory=list)
     attempt_count: int = 0
     delete_fails_for: set[str] = field(default_factory=set)  # row 8: delete-after-stop failure
+    ip_on_run: str | None = None  # the address a VM gets when `tart run` starts it (None: never, as before)
 
     def seed_vm(self, name: str, *, running: bool = True, ip: str | None = "192.168.64.10") -> None:
         """Test setup helper (not part of the tart CLI surface): directly inserts a VM, bypassing
@@ -146,7 +147,7 @@ class FakeTartTransport:
             # has no IP yet — mirrors what a correctly-detached spawn would report without
             # waiting for the child to exit (see tart.py's `_run_detached` docstring).
             self.backend.vms[name]["running"] = True
-            self.backend.vms[name]["ip"] = None
+            self.backend.vms[name]["ip"] = self.backend.ip_on_run
             return SubprocessResult(returncode=0, stdout=b"", stderr=b"")
 
         if sub == "ip":

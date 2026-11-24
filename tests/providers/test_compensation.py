@@ -21,8 +21,12 @@ from seedpod.providers.compensation import undo_for
 from seedpod.providers.contract import (
     ApplyFirewalls,
     AssignToProject,
+    BareInstanceCreated,
+    BootInstance,
     CaptureHostKeys,
+    CreateBareInstance,
     CreateInstance,
+    DestroyBareInstance,
     DestroyInstance,
     FetchKubeconfig,
     HostKeys,
@@ -44,6 +48,7 @@ from seedpod.providers.contract import (
     KubeRolloutUndo,
     KubeRun,
     KubeWatchPods,
+    ListBareInstances,
     ListInstances,
     Observed,
     ProbeDestruction,
@@ -91,6 +96,10 @@ COMMAND_INSTANCES: dict[type, ProviderCommand] = {
         tags=("cluster-uuid:c1",),
     ),
     ProbeInstance: ProbeInstance(resource_ids={"droplet_id": "123"}),
+    CreateBareInstance: CreateBareInstance(instance_id="i1", slug="box", image="img", vcpu=1, memory_mb=1024),
+    DestroyBareInstance: DestroyBareInstance(instance_id="i1", slug="box"),
+    ListBareInstances: ListBareInstances(),
+    BootInstance: BootInstance(ssh=_SSH, known_hosts="h ssh-ed25519 AAAA", payload=b"{}", entrypoint="/opt/boot"),
     DestroyInstance: DestroyInstance(slug="s1", resource_ids={"droplet_id": "123"}),
     ProbeDestruction: ProbeDestruction(resource_ids={"droplet_id": "123"}),
     ListInstances: ListInstances(),
@@ -188,6 +197,20 @@ def test_create_instance_undo_none_when_nothing_ever_allocated():
     assert undo_for(cmd, EMPTY_OBSERVED) is None
 
 
+@pytest.mark.parametrize(
+    "observed, ids",
+    [
+        (Observed(data={}, value=BareInstanceCreated(resource_ids={"tart_vm_name": "spi-box"}, address=None)), {"tart_vm_name": "spi-box"}),
+        (Observed(data={"tart_vm_name": "spi-box"}, value=None), {"tart_vm_name": "spi-box"}),
+        (EMPTY_OBSERVED, {}),  # never None, unlike CreateInstance: the name spi-{slug} needs no note
+    ],
+)
+def test_create_bare_instance_undo_is_always_a_destroy_by_the_same_rule(observed, ids):
+    assert undo_for(COMMAND_INSTANCES[CreateBareInstance], observed) == DestroyBareInstance(
+        instance_id="i1", slug="box", resource_ids=ids
+    )
+
+
 def test_kube_apply_manifest_undo_is_literal_delete_inverse():
     cmd = COMMAND_INSTANCES[KubeApplyManifest]
     inverse = undo_for(cmd, EMPTY_OBSERVED)
@@ -202,7 +225,9 @@ def test_kube_apply_manifest_undo_is_literal_delete_inverse():
 # this module entirely)
 # ============================================================================
 
-NO_INVERSE_TYPES = [t for t in COMMAND_INSTANCES if t not in (CreateInstance, KubeApplyManifest)]
+NO_INVERSE_TYPES = [
+    t for t in COMMAND_INSTANCES if t not in (CreateInstance, CreateBareInstance, KubeApplyManifest)
+]
 
 
 @pytest.mark.parametrize("command_type", sorted(NO_INVERSE_TYPES, key=lambda t: t.__name__))

@@ -74,6 +74,7 @@ __all__ = [
     "DestroyOutcome",
     # result value types
     "InstanceCreated",
+    "BareInstanceCreated",
     "InstanceState",
     "InstanceSummary",
     "SshPortState",
@@ -93,6 +94,10 @@ __all__ = [
     "ProbeDestruction",
     "ListInstances",
     "Reconcile",
+    # commands — bare instances (DR-0055), tart only
+    "CreateBareInstance",
+    "DestroyBareInstance",
+    "ListBareInstances",
     # commands — digitalocean-only extras
     "ApplyFirewalls",
     "AssignToProject",
@@ -102,6 +107,7 @@ __all__ = [
     "InstallK3s",
     "ProbeK3s",
     "FetchKubeconfig",
+    "BootInstance",
     # commands — kubernetes plane
     "KubeGetClusterInfo",
     "KubeGetNodes",
@@ -119,6 +125,7 @@ __all__ = [
     "KubeWatchPods",
     # unions
     "MachineCommand",
+    "BareInstanceCommand",
     "DigitalOceanCommand",
     "K3sCommand",
     "KubectlCommand",
@@ -256,6 +263,15 @@ class InstanceCreated:
     address: str | None
     effective_pod_cidr: str
     effective_service_cidr: str
+    adopted_existing: bool = False
+
+
+@dataclass(frozen=True)
+class BareInstanceCreated:
+    """No CIDRs: a bare VM is not a cluster."""
+
+    resource_ids: Mapping[str, str]
+    address: str | None
     adopted_existing: bool = False
 
 
@@ -450,6 +466,46 @@ class Reconcile:
     # Result: tuple[ReconciliationIntent, ...]
 
 
+# Bare instances (DR-0055 decision 3). Only tart implements these; every other provider refuses
+# them as unsupported. They exist because ``DestroyInstance`` falls back to ``seedpod-{slug}`` and
+# ``ListInstances`` matches ``seedpod-``: a bare VM must never be reachable through either.
+
+
+@dataclass(frozen=True)
+class CreateBareInstance:
+    """MUST emit ``Progress(RESOURCE_ALLOCATED)`` before any backend call. Re-invocation adopts the
+    VM (``adopted_existing=True``), never a second one. The VM is named ``spi-{slug}``. ``image``
+    comes from a template, never from a request."""
+
+    instance_id: str  # the idempotency key
+    slug: str
+    image: str
+    vcpu: int
+    memory_mb: int
+    disk_gb: int | None = None  # None leaves the image's disk
+    tags: tuple[str, ...] = ()  # ignored by a provider with no tags (tart)
+    # Result: BareInstanceCreated
+
+
+@dataclass(frozen=True)
+class DestroyBareInstance:
+    """Idempotent. Destroys the recorded ``tart_vm_name``, else ``spi-{slug}``, and REFUSES any name
+    that does not start with ``spi-``, so it can never reach a cluster's VM. ``DESTROYED`` means a
+    ``tart list`` that succeeded did not show the VM, or the VM was stopped and deleted. A failed
+    ``list``, ``stop`` or ``delete`` raises: it is never ``DESTROYED``."""
+
+    instance_id: str
+    slug: str
+    resource_ids: Mapping[str, str] = field(default_factory=dict)
+    # Result: DestroyOutcome
+
+
+@dataclass(frozen=True)
+class ListBareInstances:
+    pass
+    # Result: tuple[InstanceSummary, ...] -- only ``spi-`` VMs
+
+
 @dataclass(frozen=True)
 class ApplyFirewalls:
     """DigitalOcean-only, best-effort, warn-and-continue by WORKFLOW policy (Seam B §2.2
@@ -556,6 +612,20 @@ class FetchKubeconfig:
     ssh: SSHTarget | None = None  # ssh-k3s variant
     known_hosts: str | None = None
     # Result: Kubeconfig — the engine encrypts + persists; providers never store it.
+
+
+@dataclass(frozen=True)
+class BootInstance:
+    """DR-0055 decision 8, over strict host-key checking, after the host key is pinned: write
+    ``payload`` to a root-only 0600 file, then run ``entrypoint`` with that path. ``payload`` travels
+    on ssh's stdin, never in the command line. ``entrypoint`` is the one caller string on the command
+    line, validated first. Not idempotent: the entrypoint may run twice if the caller retries."""
+
+    ssh: SSHTarget
+    known_hosts: str  # empty => PermanentError(INVALID_INPUT)
+    payload: bytes
+    entrypoint: str
+    # Result: None
 
 
 # ============================================================================
@@ -719,8 +789,9 @@ MachineCommand = (
 # DigitalOcean-only extras (§5.7.1 amendment — not part of the generic machine plane every
 # machine provider implements; `Provider.supported` gates which provider instance accepts
 # them, same convention as FetchKubeconfig's kind/orbstack-only membership below).
+BareInstanceCommand = CreateBareInstance | DestroyBareInstance | ListBareInstances  # DR-0055
 DigitalOceanCommand = ApplyFirewalls | AssignToProject
-K3sCommand = ProbeSshPort | CaptureHostKeys | InstallK3s | ProbeK3s | FetchKubeconfig
+K3sCommand = ProbeSshPort | CaptureHostKeys | InstallK3s | ProbeK3s | FetchKubeconfig | BootInstance
 KubectlCommand = (
     KubeGetClusterInfo
     | KubeGetNodes
@@ -737,7 +808,7 @@ KubectlCommand = (
     | KubeRun
     | KubeWatchPods
 )
-ProviderCommand = MachineCommand | DigitalOceanCommand | K3sCommand | KubectlCommand
+ProviderCommand = MachineCommand | BareInstanceCommand | DigitalOceanCommand | K3sCommand | KubectlCommand
 
 # FetchKubeconfig is in both the machine plane's kind/orbstack subset and the k3s plane
 # (§5.4 "Plane matrix": digitalocean/tart ⇒ machine plane minus FetchKubeconfig;

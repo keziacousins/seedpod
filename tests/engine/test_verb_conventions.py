@@ -120,6 +120,8 @@ FULLY_REGISTERED_WORKFLOWS = frozenset(
         # the 30th and last verb -- deploy-waves.yml is now fully covered too,
         # closing PARTIY-BACKLOG P0 #0 (a real deployment can reach a cluster).
         "deploy-waves.yml",
+        "provision-instance-tart.yml",  # DR-0055: a bare VM, no k3s
+        "destroy-instance.yml",
     }
 )
 
@@ -174,6 +176,8 @@ def registry(tmp_path) -> StepRegistry:
         crypto=crypto,
         clock=clock,
         ssh_identities=ssh_identities,
+        instance_templates={},
+        instance_public_key_for=lambda instance_id: None,
         k3s_versions={"digitalocean": "v1.36.5+k3s1", "tart": "v1.36.5+k3s1"},
         config_dir=CONFIG_DIR,
         dns=None,  # no Cloudflare token in tests; dns.delete_record still registers and no-ops
@@ -228,6 +232,12 @@ DR_0022_VERBS = frozenset(
         "dns.delete_record",
         "do.apply_firewalls",
         "do.assign_project",
+        # DR-0055 amends the catalog 33 -> 38: a bare VM has its own verbs.
+        "instance.load_spec",
+        "instance.create",
+        "instance.boot",
+        "instance.load_infra",
+        "instance.destroy",
     }
 )
 
@@ -244,7 +254,7 @@ AWAIT_NAME_PATTERN = re.compile(r"^[a-z0-9_]+\.await_[a-z0-9_]+$")
 # ---------------------------------------------------------------------------
 
 
-def test_dr_0022_catalog_is_exactly_33_verbs():
+def test_dr_0022_catalog_is_exactly_38_verbs():
     """Erratum E1: "the catalog is 30 verbs, not 31" -- the DR's table is
     correct and complete; the prose count was an arithmetic slip. **DR-0034
     amends it to 32**, adding `dns.create_record` and
@@ -253,8 +263,8 @@ def test_dr_0022_catalog_is_exactly_33_verbs():
     directly (not just via the set-equality check below) so a future edit
     that silently drops or duplicates an entry in either set is caught even
     if it happens to preserve set equality by coincidence."""
-    assert len(DR_0022_VERBS) == 33
-    assert len(DECLARED_VERBS) == 33
+    assert len(DR_0022_VERBS) == 38  # DR-0055 adds the five `instance.*` verbs
+    assert len(DECLARED_VERBS) == 38
 
 
 def test_declared_verbs_are_exactly_the_dr_0022_table():

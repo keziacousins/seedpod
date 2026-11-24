@@ -8,12 +8,13 @@ head step).
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from seedpod.core.effects import RunWorkflow
-from seedpod.core.records import ClusterRecord, ClusterState, Origin
+from seedpod.core.records import ClusterRecord, ClusterState, InstanceRecord, InstanceStatus, Origin
 from seedpod.engine.config import parse_workflow
 from seedpod.engine.dispatch_table import WorkflowDispatch
 
@@ -166,3 +167,18 @@ def test_unknown_abstract_verb_raises():
     eff = RunWorkflow(workflow="not-a-real-verb", aggregate_type="cluster", aggregate_id="cluster-1")
     with pytest.raises(ValueError):
         dispatch.resolve(eff, make_cluster())
+
+
+@pytest.mark.parametrize(("verb", "definition"), [("provision", "provision-instance-tart"), ("destroy", "destroy-instance")])
+def test_instance_dispatch_names_a_shipped_workflow_and_supplies_exactly_its_inputs(verb, definition):
+    """DR-0043's trap: the dispatch allowlist and the YAML's `inputs:` are two lists nothing else keeps equal."""
+    now = datetime(2026, 7, 15, tzinfo=UTC)
+    record = InstanceRecord(
+        id="inst-1", slug="box", state=InstanceStatus.PROVISIONING, version=1, provider="tart", environment="ephemeral",
+        lease_seconds=3600, expires_at=now + timedelta(hours=1), hard_expires_at=now + timedelta(hours=24),
+    )
+    name, inputs = make_dispatch().resolve_instance(
+        RunWorkflow(workflow=verb, aggregate_type="instance", aggregate_id="inst-1"), record
+    )
+    assert name == definition
+    assert set(inputs) == set(parse_workflow((WORKFLOWS_DIR / f"{name}.yml").read_text()).inputs)
