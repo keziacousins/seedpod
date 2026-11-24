@@ -16,7 +16,7 @@ since DR-0015 assigns their construction to this composition-root component.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +28,8 @@ from fastapi import FastAPI
 from seedpod.app.config import AppConfig
 from seedpod.core.clock import Clock
 from seedpod.core.errors import ErrorCode, PermanentError
+from seedpod.core.instance_limits import InstanceLimits
+from seedpod.core.instance_template import InstanceTemplate
 from seedpod.core.tempfiles import TempFileRegistry
 from seedpod.data.database import Database
 from seedpod.data.migrate import MIGRATIONS_DIR, migrate
@@ -160,6 +162,9 @@ class App:
     ghcr: GhcrService | None  # DR-0015: credential-gated on config.github_token
     dns: DnsService | None  # DR-0015: credential-gated on config.cloudflare_api_token
     manifest_resolver: ManifestResolver  # always constructed; ghcr_service=None degrades gracefully
+    id_gen: Callable[[], str]  # the one id source build_app's services share; `api/routers/instances.py` births with it
+    instance_templates: Mapping[str, InstanceTemplate]  # DR-0055: what a request may name
+    instance_limits: InstanceLimits  # DR-0055 decision 6: admission caps; no file means no caps
     clock: Clock  # Round 6, api-edge: the same Clock every other collaborator was built
     #                with (dispatcher/timers/executor/hub/... each hold their own private
     #                copy already) -- exposed here too because CLAUDE.md's "every timestamp

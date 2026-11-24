@@ -1602,6 +1602,7 @@ class InstanceRow:
     created_at: datetime
     updated_at: datetime
     destroyed_at: datetime | None
+    ssh_public_key: str | None = None  # the requester's key (0007); `instance.load_spec` reads it
 
 
 def _instance_params(row: InstanceRow) -> dict[str, Any]:
@@ -1628,6 +1629,7 @@ def _instance_params(row: InstanceRow) -> dict[str, Any]:
         "created_at": _iso(row.created_at),
         "updated_at": _iso(row.updated_at),
         "destroyed_at": _iso_or_none(row.destroyed_at),
+        "ssh_public_key": row.ssh_public_key,
     }
 
 
@@ -1655,6 +1657,7 @@ def _instance_from_mapping(m: Mapping[str, Any]) -> InstanceRow:
         created_at=_parse(m["created_at"]),
         updated_at=_parse(m["updated_at"]),
         destroyed_at=_parse_or_none(m["destroyed_at"]),
+        ssh_public_key=m["ssh_public_key"],
     )
 
 
@@ -1712,12 +1715,12 @@ class InstanceRepository:
                     (id, slug, provider, environment, template, size, status, version,
                      owner_key_id, resource_ids, address, known_hosts, lease_seconds,
                      expires_at, hard_expires_at, hourly_price, vcpu, memory_mb,
-                     failure_reason, created_at, updated_at, destroyed_at)
+                     failure_reason, created_at, updated_at, destroyed_at, ssh_public_key)
                 VALUES
                     (:id, :slug, :provider, :environment, :template, :size, :status, :version,
                      :owner_key_id, :resource_ids, :address, :known_hosts, :lease_seconds,
                      :expires_at, :hard_expires_at, :hourly_price, :vcpu, :memory_mb,
-                     :failure_reason, :created_at, :updated_at, :destroyed_at)
+                     :failure_reason, :created_at, :updated_at, :destroyed_at, :ssh_public_key)
                 """
             ),
             _instance_params(row),
@@ -1760,6 +1763,14 @@ class InstanceRepository:
 
     def list_all(self, session: Session) -> list[InstanceRow]:
         rows = session.execute(text("SELECT * FROM instances ORDER BY created_at")).mappings().all()
+        return [_instance_from_mapping(r) for r in rows]
+
+    def list_live(self, session: Session) -> list[InstanceRow]:
+        """Every instance that is not ``destroyed``: the rows that may still hold a resource, and
+        so the ones admission limits count (DR-0055 decision 6)."""
+        rows = session.execute(
+            text("SELECT * FROM instances WHERE status != 'destroyed' ORDER BY created_at")
+        ).mappings().all()
         return [_instance_from_mapping(r) for r in rows]
 
 

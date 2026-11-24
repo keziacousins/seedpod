@@ -1,8 +1,9 @@
 """The shape of an instance template, and the pure rules for boot data (DR-0055 decisions 5 and 8).
 
 A template is the ONLY source of an image: a request names a template and a size from its list, and
-never supplies an image or an entrypoint. ``app/factory.py``'s ``load_instance_templates`` reads the files. Limits,
-price and lease belong to the admission phase and are not parsed here. No IO.
+never supplies an image or an entrypoint. ``app/factory.py``'s ``load_instance_templates`` reads the
+files. A size's hourly price and a template's lease bounds are what admission reads
+(``api/routers/instances.py``). No IO.
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ from __future__ import annotations
 import json
 import re
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 __all__ = [
     "BOOT_PAYLOAD_DIR",
@@ -70,6 +71,7 @@ class InstanceSize(BaseModel):
     vcpu: int = Field(gt=0)
     memory_mb: int = Field(gt=0)
     disk_gb: int | None = Field(default=None, gt=0)  # None leaves the image's disk
+    hourly_price: float | None = Field(default=None, ge=0)  # None: admission refuses the size (decision 6)
 
 
 class InstanceTemplate(BaseModel):
@@ -82,7 +84,15 @@ class InstanceTemplate(BaseModel):
     ssh_user: str
     entrypoint: str
     sizes: dict[str, InstanceSize] = Field(min_length=1)
+    lease_seconds: int = Field(gt=0)  # the default lease (decision 7)
+    max_lifetime_seconds: int = Field(gt=0)  # `hard_expires_at` is this long after creation
 
     _entrypoint_is_safe = field_validator("entrypoint")(validate_entrypoint)
     _ssh_user_is_safe = field_validator("ssh_user")(_validate_ssh_user)
     _image_is_safe = field_validator("image")(_validate_image)
+
+    @model_validator(mode="after")
+    def _lease_fits_lifetime(self) -> InstanceTemplate:
+        if self.max_lifetime_seconds < self.lease_seconds:
+            raise ValueError("max_lifetime_seconds must be at least lease_seconds")
+        return self

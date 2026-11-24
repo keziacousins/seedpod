@@ -41,7 +41,7 @@ CONFIG = Path(__file__).resolve().parents[2] / "config"
 KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA requester@host"
 TEMPLATE = InstanceTemplate(
     provider="tart", image="local-dev-base-rosetta", ssh_user="admin", entrypoint="/usr/local/sbin/seedpod-boot",
-    sizes={"small": InstanceSize(vcpu=2, memory_mb=2048)},
+    sizes={"small": InstanceSize(vcpu=2, memory_mb=2048)}, lease_seconds=3600, max_lifetime_seconds=86400,
 )
 
 
@@ -60,7 +60,7 @@ def _stack(tmp_path, *faults: Fault):
     steps = [
         InstanceLoadSpec(
             uow=uow, instances=repos.instances, templates={"ubuntu": TEMPLATE},
-            ssh_identities={"tart": SshIdentity(private_key_path="/tmp/key")}, public_key_for=lambda _id: KEY,
+            ssh_identities={"tart": SshIdentity(private_key_path="/tmp/key")},
         ),
         InstanceCreate(), InfraAwaitInstance(), K3sAwaitSsh(), K3sTrustHostKeys(), InstanceBoot(),
         InstanceLoadInfra(uow=uow, instances=repos.instances), InstanceDestroy(),
@@ -83,7 +83,7 @@ async def _birth(stack: Stack) -> None:
         owner = make_owner_key(tx)
     row = make_instance_row(
         "i1", "box", owner, provider="tart", created_at=NOW, updated_at=NOW,
-        expires_at=NOW + timedelta(hours=1), hard_expires_at=NOW + timedelta(hours=24),
+        expires_at=NOW + timedelta(hours=1), hard_expires_at=NOW + timedelta(hours=24), ssh_public_key=KEY,
     )
     await stack.dispatcher.apply("instance", "i1", InstanceCreateRequested(at=NOW, actor="api:alice"), record=row)
 
@@ -120,7 +120,7 @@ async def test_a_provision_that_fails_after_create_leaves_no_vm(tmp_path, failur
 # --- templates ------------------------------------------------------------------------------
 
 
-_TEMPLATE = "provider: tart\nimage: img\nssh_user: admin\nentrypoint: /opt/boot\nsizes: {small: {vcpu: 2, memory_mb: 2048}}\n"
+_TEMPLATE = "provider: tart\nimage: img\nssh_user: admin\nentrypoint: /opt/boot\nsizes: {small: {vcpu: 2, memory_mb: 2048}}\nlease_seconds: 60\nmax_lifetime_seconds: 600\n"
 
 
 @pytest.mark.parametrize(
@@ -131,6 +131,8 @@ _TEMPLATE = "provider: tart\nimage: img\nssh_user: admin\nentrypoint: /opt/boot\
         ("image: img\n", ""),
         ("admin", "-oProxyCommand=x"),
         ("image: img", "image: --evil-flag"),
+        ("max_lifetime_seconds: 600", "max_lifetime_seconds: 59"),
+        ("memory_mb: 2048}", "memory_mb: 2048, hourly_price: -1}"),
     ],
 )
 def test_templates_load_from_yaml_and_a_bad_one_is_refused(tmp_path, edit):

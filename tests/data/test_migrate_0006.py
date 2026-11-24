@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import shutil
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,14 @@ def _through_0005(tmp_path: Path) -> Path:
     for f in sorted(MIGRATIONS_DIR.glob("000[1-5]_*.sql")):
         shutil.copy(f, d / f.name)
     return d
+
+
+def migrate_0006(engine) -> None:
+    """Up to 0006 and no further: a later migration must not change what these tests say about it."""
+    with tempfile.TemporaryDirectory(prefix="seedpod-migrations-through-0006-") as tmp:
+        for f in sorted(MIGRATIONS_DIR.glob("000[1-6]_*.sql")):
+            shutil.copy(f, Path(tmp) / f.name)
+        migrate(engine, migrations_dir=Path(tmp))
 
 
 @pytest.fixture
@@ -69,7 +78,7 @@ def test_0005_is_untouched():
 
 def test_it_adds_the_audit_table_and_swaps_the_slug_index(v5):
     before = _master(v5)
-    migrate(v5.engine)
+    migrate_0006(v5.engine)
     after = _master(v5)
 
     added = {k: v for k, v in after.items() if k not in before}
@@ -87,7 +96,7 @@ def test_it_adds_the_audit_table_and_swaps_the_slug_index(v5):
 
 
 def test_the_audit_table_has_the_cluster_audit_shape(v5):
-    migrate(v5.engine)
+    migrate_0006(v5.engine)
     with v5.engine.begin() as conn:
         cols = {r[1]: (r[2], r[3]) for r in conn.exec_driver_sql("PRAGMA table_info(instance_state_audits)")}
         csa = {r[1]: (r[2], r[3]) for r in conn.exec_driver_sql("PRAGMA table_info(cluster_state_audits)")}
@@ -99,7 +108,7 @@ def test_the_audit_table_has_the_cluster_audit_shape(v5):
 
 
 def test_an_audit_row_needs_a_real_instance(v5):
-    migrate(v5.engine)
+    migrate_0006(v5.engine)
     insert = (
         "INSERT INTO instance_state_audits (instance_id, from_state, to_state, event, actor, created_at)"
         " VALUES (:i, 'new', 'provisioning', 'E', 'a', :t)"
@@ -116,7 +125,7 @@ def test_an_audit_row_needs_a_real_instance(v5):
 def test_an_instance_slug_is_never_reused_in_any_status(v5, status):
     """Defect 5: a slug freed by `destroyed` let a second instance take it, and the first one, found
     running again (a zombie), then could not leave `destroyed`. Now the slug is unique outright."""
-    migrate(v5.engine)
+    migrate_0006(v5.engine)
     with v5.engine.begin() as conn:
         conn.execute(text("UPDATE instances SET status = :s WHERE id = 'i1'"), {"s": status})
     insert = (
@@ -130,14 +139,14 @@ def test_an_instance_slug_is_never_reused_in_any_status(v5, status):
 
 
 def test_it_is_idempotent(v5):
-    migrate(v5.engine)
-    migrate(v5.engine)
+    migrate_0006(v5.engine)
+    migrate_0006(v5.engine)
     with v5.engine.begin() as conn:
         assert conn.exec_driver_sql("PRAGMA user_version").scalar() == 6
 
 
 def test_the_reverse_sql_in_the_header_undoes_it(v5):
-    migrate(v5.engine)
+    migrate_0006(v5.engine)
     # the reverse SQL, as written in the file's own header
     header = (MIGRATIONS_DIR / "0006_instance_state_audits.sql").read_text().splitlines()
     reverse = "\n".join(ln[5:] for ln in header if ln.startswith("--   "))
@@ -148,5 +157,5 @@ def test_the_reverse_sql_in_the_header_undoes_it(v5):
     names = _master(v5)
     assert "instance_state_audits" not in names
     assert "ux_instances_slug_live" in names and "ux_instances_slug" not in names  # 0005's index is back
-    migrate(v5.engine)  # and forward again
+    migrate_0006(v5.engine)  # and forward again
     assert "instance_state_audits" in _master(v5)

@@ -7,7 +7,7 @@ idempotent, so a failure raises and the engine retries or reports it.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from typing import ClassVar
 
 from pydantic import BaseModel
@@ -71,12 +71,11 @@ class InstanceLoadSpec(Step[LoadSpecParams, LoadSpecOutput]):
         instances: InstanceRepository,
         templates: Mapping[str, InstanceTemplate],
         ssh_identities: Mapping[str, SshIdentity],
-        public_key_for: Callable[[str], str | None],
     ) -> None:
-        """The private key is ``cluster.load_spec``'s (DR-0023); the user is the template's.
-        ``public_key_for`` is the requester's SSH key: a seam until the request route lands."""
+        """The private key is ``cluster.load_spec``'s (DR-0023); the user is the template's. The
+        public key is the requester's, recorded on the row at admission."""
         self._uow, self._instances, self._templates = uow, instances, templates
-        self._ssh_identities, self._public_key_for = ssh_identities, public_key_for
+        self._ssh_identities = ssh_identities
 
     async def execute(self, params: LoadSpecParams, ctx: StepContext) -> LoadSpecOutput:
         async with self._uow() as tx:
@@ -90,7 +89,7 @@ class InstanceLoadSpec(Step[LoadSpecParams, LoadSpecOutput]):
         if size is None:
             raise _refuse(self.verb, f"template {row.template!r} has no size {row.size!r}")
         key_path = self._ssh_identities.get(row.provider, SshIdentity()).private_key_path
-        public_key = self._public_key_for(row.id)
+        public_key = row.ssh_public_key
         if key_path is None or public_key is None:
             raise _refuse(self.verb, f"provider {row.provider!r} has no SSH key, or instance {row.id!r} has no public key")
         try:

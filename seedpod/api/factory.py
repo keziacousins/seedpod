@@ -63,6 +63,7 @@ from seedpod.api.routers import (
     deployments,
     events,
     health,
+    instances,
     keys,
     permissions,
     presets,
@@ -114,6 +115,7 @@ def create_api(*, services: Services, hub: SSEHub, config: AppConfig) -> FastAPI
     api.include_router(permissions.router, prefix="/api")
     api.include_router(deployments.router, prefix="/api")
     api.include_router(clusters.router, prefix="/api")
+    api.include_router(instances.router, prefix="/api")  # DR-0055
     api.include_router(presets.router, prefix="/api")  # Round 6, api-features
     api.include_router(snapshots.router, prefix="/api")
     api.include_router(secrets.router, prefix="/api")

@@ -42,12 +42,12 @@ async def list_timers(
     async with app.uow() as t:
         rows = app.repos.timers.list_all(t)
         if api_key.environment != ALL_ENVIRONMENTS:
-            # DR-0054: every timer belongs to a cluster and has its environment. A timer
-            # on any other aggregate type is hidden from a scoped key, not shown.
-            environments = {c.id: c.environment for c in app.repos.clusters.list_all(t)}
+            # DR-0054: a timer has the environment of its cluster or instance (DR-0055). A timer on
+            # any other aggregate type maps to "", which no key admits.
+            environments = {("cluster", c.id): c.environment for c in app.repos.clusters.list_all(t)}
+            environments |= {("instance", i.id): i.environment for i in app.repos.instances.list_all(t)}
             rows = [
                 r for r in rows
-                if r.aggregate_type == "cluster"
-                and environment_admits(api_key.environment, environments.get(r.aggregate_id, ""))
+                if environment_admits(api_key.environment, environments.get((r.aggregate_type, r.aggregate_id), ""))
             ]
     return {"timers": [_serialize(r) for r in rows]}

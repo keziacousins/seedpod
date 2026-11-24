@@ -177,7 +177,6 @@ def registry(tmp_path) -> StepRegistry:
         clock=clock,
         ssh_identities=ssh_identities,
         instance_templates={},
-        instance_public_key_for=lambda instance_id: None,
         k3s_versions={"digitalocean": "v1.36.5+k3s1", "tart": "v1.36.5+k3s1"},
         config_dir=CONFIG_DIR,
         dns=None,  # no Cloudflare token in tests; dns.delete_record still registers and no-ops
