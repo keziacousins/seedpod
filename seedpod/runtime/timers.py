@@ -65,24 +65,6 @@ this module would duplicate, and risk drifting from, that law. (This is orthogon
 covers state that moved on; conditional consume covers a same-state re-arm the
 machine cannot see.)
 
-**A timer that can never fire (INSTANCE only).** The paragraph above holds for a timer whose
-aggregate exists. A timer whose aggregate ROW is not there makes ``apply()`` raise on every poll:
-the delete rolls back with it, the row survives, and the same error is logged each second until
-someone edits the database. For an ``instance`` timer, ``_fire_one`` asks the Dispatcher
-(``exists``, reads only) after the conditional consume and before ``apply()``. When the answer is
-no, the consume commits (the timer is gone) and one ERROR line records its key and stored event,
-because the row held the only copy. This is an existence check, not a state pre-check: a row that
-exists is still fired verbatim and the machine decides. It runs only for a timer this pass
-actually consumed (rowcount 1), so a re-armed timer is untouched. A ``cluster`` or ``deployment``
-timer is NOT checked: its missing-row failure rolls back and retries on the next poll, exactly as
-it did before DR-0055 (the instance rule is new and is not a change to those two).
-
-A timer for an aggregate TYPE the Dispatcher has no machine for (``knows``) is different: it is
-NOT consumed. A newer build may own that type (a rollback leaves its timers behind), and the row
-is the only copy. It is kept, its ``fire_at`` is pushed forward one hour (``postpone``, under the
-same exact-TEXT condition as the consume), and one ERROR line records it. The check comes before
-the consume. Siblings are not affected either way: each row has its own transaction.
-
 **Per-row isolation.** One due timer failing (e.g. a losing CAS) does not stop the
 rest of the batch or kill the poll loop -- each row's fire is wrapped individually so
 a single bad row is simply retried on a later poll while its siblings still fire this
@@ -143,7 +125,7 @@ import asyncio
 import contextlib
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from seedpod.core.clock import Clock
 from seedpod.core.codec import decode_event
@@ -159,9 +141,6 @@ _DEFAULT_POLL_INTERVAL = 1.0  # seconds -- see module docstring
 # `task.cancel()`. Only a genuinely stuck pass should ever reach it: a loop parked
 # on its wake-wait returns within one tick of `stop()`'s poke.
 _STOP_GRACE_SECONDS = 5.0
-
-# How far a timer for an aggregate type this build has no machine for is pushed forward.
-_UNKNOWN_AGGREGATE_RECHECK = timedelta(hours=1)
 
 _log = logging.getLogger(__name__)
 
@@ -309,34 +288,10 @@ class TimerService:
         whatever ``apply()`` attempted, leaving the row armed for the next poll
         (module docstring, "Atomic consume")."""
         async with self._uow() as t:
-            if not self._dispatcher.knows(row.aggregate_type):
-                # NOT consumed: a newer build may own this aggregate type (a rollback leaves its
-                # timers behind), and the row holds the only copy of the timer. Keep it, look
-                # again in an hour, and say so. Siblings are unaffected (own transaction).
-                postponed_to = self._clock.now() + _UNKNOWN_AGGREGATE_RECHECK
-                if self.repos.timers.postpone(
-                    t, row.aggregate_type, row.aggregate_id, row.timer_key, row.fire_at_text, postponed_to
-                ):
-                    _log.error(
-                        "timer kept: no machine for aggregate type %r (%s/%s/%s, event %s); "
-                        "postponed to %s",
-                        row.aggregate_type, row.aggregate_type, row.aggregate_id, row.timer_key, row.event,
-                        postponed_to.isoformat(),
-                    )
-                return
             consumed = self.repos.timers.consume(
                 t, row.aggregate_type, row.aggregate_id, row.timer_key, row.fire_at_text
             )
             if not consumed:
-                return
-            if row.aggregate_type == "instance" and not self._dispatcher.exists(
-                t, row.aggregate_type, row.aggregate_id
-            ):
-                _log.error(
-                    "timer dropped: %s %r does not exist (%s/%s/%s, event %s)",
-                    row.aggregate_type, row.aggregate_id, row.aggregate_type, row.aggregate_id,
-                    row.timer_key, row.event,
-                )
                 return
             event = decode_event(json.loads(row.event))
             await self._dispatcher.apply(row.aggregate_type, row.aggregate_id, event, tx=t)

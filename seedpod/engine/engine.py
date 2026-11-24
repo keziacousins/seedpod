@@ -43,12 +43,7 @@ from pydantic_core import PydanticUndefined
 
 from seedpod.core.clock import Clock
 from seedpod.core.errors import InfrastructureUnreachableError, PermanentError, TransientError
-from seedpod.core.events import (
-    EVENT_REGISTRY,
-    Event,
-    InstanceDestroyFailed,
-    InstanceProvisionFailed,
-)
+from seedpod.core.events import EVENT_REGISTRY, Event
 from seedpod.data.repositories import (
     ACTIVE_RUN_STATUSES,
     OutboxRepository,
@@ -137,14 +132,6 @@ class _RunAlreadyFinalized(Exception):
     as a pure no-op."""
 
 
-class _RunFenced(Exception):
-    """Internal signal: an INSTANCE run is already terminal, and a write from its own (straggling)
-    task was refused. Raised inside a write transaction, before anything is written, so the
-    transaction rolls back and the finished run keeps the status it was given. Caught at the
-    task's boundary (``_run_guarded``) as a no-op, and by ``_fail_unexpected`` before its fallback
-    write. Cluster runs are never fenced."""
-
-
 class _UnreachableExhausted(Exception):
     """Internal signal from ``_park_and_wait``; always caught inside this module.
 
@@ -163,9 +150,6 @@ class _UnreachableExhausted(Exception):
 
 _CONTINUED = object()  # sentinel: an on_failure:continue step recorded and the run proceeds
 
-
-# A run in one of these is finished. `_run` returns before doing anything to it.
-_TERMINAL_RUN_STATUSES = ("succeeded", "failed", "cancelled")
 
 # DR-0024: how long `stop()` lets live runs reach a persistence point before the
 # cancel backstop. Far below any step timeout on purpose -- see `stop()`.
@@ -186,13 +170,6 @@ class _RunState:
 class _RunHandle:
     task: asyncio.Task
     cancel_token: CancelToken
-    # Set by `_run` once the row is read: the instance this run belongs to, or None for a cluster
-    # (or deployment) run. Only the hard-cancel backstop reads it, to choose its path.
-    instance_id: str | None = None
-    # INSTANCE runs only (DR-0055): the one hard-cancel backstop this run has, and whether it has
-    # claimed the run for ending. A repeated cancel makes no second backstop; a claimed run has none.
-    backstop: asyncio.Future | None = None
-    abandoned: bool = False
 
 
 # ----------------------------------------------------------------------------------
@@ -394,13 +371,6 @@ class WorkflowEngine:
         self._unreachable_budget_seconds = unreachable_budget_seconds
         self._unreachable_reprobe_schedule = tuple(unreachable_reprobe_schedule)
         self._runs: dict[str, _RunHandle] = {}
-        # INSTANCE runs the hard-cancel backstop is ending right now (DR-0055). From the moment it
-        # claims the run to the moment its terminal write commits, the run may have no task and
-        # still be active. This set says "the engine is finishing it": the liveness sweep counts it
-        # as a path, and `_adopt` refuses it, so nothing adopts it and compensates behind the
-        # backstop's back. In memory only: after a crash it is empty, and `resume_inflight` adopts
-        # the run (its `cancel_requested` is durable) exactly as it adopts any other.
-        self._ending: set[str] = set()
         self._stopping = False  # DR-0024: one-way; a stopped engine adopts nothing
         self._ordinal_counters: dict[str, int] = {}
 
@@ -422,19 +392,13 @@ class WorkflowEngine:
         for row in rows:
             await self._adopt(row.id)
 
-    async def resume_run(self, run_id: str) -> bool:
-        """``resume_inflight()`` for ONE run: adopt it if it is non-terminal and has no live task.
-        Returns whether a task was started. A run that is terminal, missing, or already has a live
-        task is left alone, so a caller that races the executor's own hand-off (or another sweep)
-        can never cause a second task for the same run. Used by the instance liveness sweep."""
+    async def resume_run(self, run_id: str) -> None:
+        """``resume_inflight()`` for ONE run (the instance liveness sweep's repair): adopt it if it
+        is non-terminal. ``_adopt`` does nothing for a run that already has a live task."""
         async with self._uow() as tx:
             row = self._run_repo.get(tx, run_id)
-        if row is None or row.status not in ACTIVE_RUN_STATUSES:
-            return False
-        if self._stopping or run_id in self._runs or run_id in self._ending:
-            return False
-        await self._adopt(run_id)
-        return run_id in self._runs
+        if row is not None and row.status in ACTIVE_RUN_STATUSES:
+            await self._adopt(run_id)
 
     async def cancel(self, run_id: str) -> None:
         """``cancel(run_id)`` = commit ``cancel_requested=TRUE``, THEN trip the
@@ -445,11 +409,7 @@ class WorkflowEngine:
         if handle is None:
             return
         handle.cancel_token.trip()
-        if handle.instance_id is not None and (
-            handle.abandoned or (handle.backstop is not None and not handle.backstop.done())
-        ):
-            return  # an instance run has ONE backstop: a repeated cancel (the destroy row's retry) adds none
-        handle.backstop = asyncio.ensure_future(self._hard_cancel_backstop(handle, run_id))
+        asyncio.ensure_future(self._hard_cancel_backstop(handle))
 
     async def stop(self, *, grace_seconds: float = _DEFAULT_STOP_GRACE_SECONDS) -> None:
         """DR-0024 (ratified 2026-08-03): quiesce the engine for shutdown. Idempotent.
@@ -499,11 +459,6 @@ class WorkflowEngine:
     def is_running(self, run_id: str) -> bool:
         return run_id in self._runs
 
-    def is_ending(self, run_id: str) -> bool:
-        """Whether the hard-cancel backstop is ending this INSTANCE run right now: it may have no
-        task, and it is not adoptable (see ``_ending``)."""
-        return run_id in self._ending
-
     @property
     def definitions(self) -> Mapping[str, WorkflowDefinition]:
         """Read-only view of the concrete workflow definitions this engine was
@@ -528,10 +483,10 @@ class WorkflowEngine:
         # resume_inflight()/executor drain cannot spawn work into a shutting-down
         # process. One-way for this instance's lifetime -- App has no
         # restart-after-stop path (build_app() is the only constructor).
-        if self._stopping or run_id in self._runs or run_id in self._ending:
+        if self._stopping or run_id in self._runs:
             return
         token = CancelToken()
-        task = asyncio.ensure_future(self._run_guarded(run_id, token))
+        task = asyncio.ensure_future(self._run(run_id, token))
         self._runs[run_id] = _RunHandle(task=task, cancel_token=token)
         task.add_done_callback(self._on_run_done)
 
@@ -560,144 +515,16 @@ class WorkflowEngine:
                 exc_info=exc,
             )
 
-    async def _hard_cancel_backstop(self, handle: _RunHandle, run_id: str) -> None:
+    async def _hard_cancel_backstop(self, handle: _RunHandle) -> None:
         """G3's backstop: hard-cancel the run's asyncio task if it hasn't wound down
-        within ``cancel_grace_seconds`` of the trip.
-
-        A CLUSTER (or deployment) run stops there, as it always has: the task is cancelled and
-        the run keeps whatever status it had.
-
-        An INSTANCE run is also ended (DR-0055). Cancelling the task alone leaves the run
-        ``running`` with no task, and that run holds the instance's one-active-run slot, so the
-        destroy that asked for the cancel would wait for it for ever. So, after the task is
-        cancelled, the engine itself finishes the run (``_abandon_instance_run``)."""
+        within ``cancel_grace_seconds`` of the trip."""
         done, _pending = await asyncio.wait({handle.task}, timeout=self._cancel_grace_seconds)
-        if handle.task in done or handle.task.done():
-            return
-        if handle.instance_id is None:
+        if handle.task not in done and not handle.task.done():
             handle.task.cancel()
-            return
-        # An INSTANCE run. The backstop acts only on the run it was made for, and only while that
-        # run is still active and still owned by this task: checked BEFORE anything is cancelled
-        # or killed, because the instance may be on its next run by now.
-        try:
-            if not await self._claim_for_ending(handle, run_id):
-                return
-        except Exception:  # noqa: BLE001 -- nothing was cancelled; the next cancel makes a new backstop
-            _log.exception("run %s: could not read the run before its hard cancel", run_id)
-            return
-        try:
-            handle.task.cancel()
-            await self._abandon_instance_run(handle, run_id)
-        except Exception:  # noqa: BLE001 -- the sweep adopts or repairs it on its next pass
-            _log.exception("run %s: could not end the run after its hard cancel", run_id)
-        finally:
-            self._ending.discard(run_id)
-
-    async def _claim_for_ending(self, handle: _RunHandle, run_id: str) -> bool:
-        """Whether the backstop may end this instance run, and if so, mark it ``_ending`` before
-        anything else can happen (nothing awaits between the final check and the mark)."""
-        if self._runs.get(run_id) is not handle:
-            return False
-        async with self._uow() as tx:
-            row = self._run_repo.get(tx, run_id)
-        if row is None or row.status not in ACTIVE_RUN_STATUSES:
-            return False
-        if self._runs.get(run_id) is not handle or handle.task.done() or handle.abandoned or run_id in self._ending:
-            return False
-        handle.abandoned = True
-        self._ending.add(run_id)
-        return True
-
-    async def _abandon_instance_run(self, handle: _RunHandle, run_id: str) -> None:
-        """End an INSTANCE run whose step ignored its cancel past the grace period: ``cancelled``,
-        with the workflow's own ``cancelled`` outcome event applied to the instance, in ONE
-        transaction. Compensation is skipped (the step that would run it is the one that would not
-        stop). Any VM the run made is found by the destroy that follows, by its recorded ids or its
-        marker (DR-0055 decision 3).
-
-        The run's subprocesses are killed FIRST, and the run is finished after. The other order
-        would let the destroy run be admitted the moment the slot frees and have ITS subprocesses
-        killed by this call.
-
-        The write re-reads the run in its own transaction and does nothing if it is already
-        terminal (the run's own task may have finished at the same moment: the single-writer
-        lock makes one of the two win, never both). Once it commits, the run is terminal and
-        every later write from a straggling task of this run is refused (``_assert_live``)."""
-        instance_id = handle.instance_id
-        assert instance_id is not None
-        manager = self._step_services.subprocess_manager
-        # `SubprocessManagerLike` only promises register/unregister (a test fake need not kill
-        # anything), so the kill is used when the real manager offers it. It is scoped to THIS RUN,
-        # never to the instance: the instance's next run (the destroy) has processes of its own.
-        terminate = getattr(manager, "terminate_for_run", None)
-        if terminate is not None:
-            try:
-                await terminate(run_id)
-            except Exception:  # noqa: BLE001 -- a failed kill must not keep the run alive
-                _log.exception("run %s: terminating the subprocesses of the run failed (instance %s)", run_id, instance_id)
-        message = (
-            f"cancelled: a step did not stop within {self._cancel_grace_seconds:g}s of the cancel; "
-            "the engine ended the run"
-        )
-        error = {"kind": "cancelled", "step": None, "message": message}
-        try:
-            async with self._uow() as tx:
-                row = self._run_repo.get(tx, run_id)
-                if row is None or row.status not in ACTIVE_RUN_STATUSES:
-                    return  # the run's own task finished it first
-                wf = self._definitions.get(row.workflow)
-                if wf is None:
-                    raise LookupError(f"unknown workflow {row.workflow!r}")
-                error = {"kind": "cancelled", "step": row.failed_step, "message": message}
-                self._run_repo.update(tx, run_id, error=error)
-                state = _RunState(
-                    run_id=run_id, wf=wf, token=handle.cancel_token, row=row, scope={"run": dict(row.args)}
-                )
-                await self._apply_terminal(tx, state, "cancelled", "cancelled", message)
-            return
-        except Exception:  # noqa: BLE001 -- the workflow's own outcome could not be built or applied
-            _log.exception("run %s: the cancelled outcome failed; the run is ended by its name instead", run_id)
-        # A fresh transaction: the one above rolled back with its exception.
-        async with self._uow() as tx:
-            row = self._run_repo.get(tx, run_id)
-            if row is None or row.status not in ACTIVE_RUN_STATUSES:
-                return
-            self._run_repo.update(tx, run_id, status="cancelled", error=error, finished_at=self._clock.now())
-            await self._apply_instance_failure_in_tx(
-                tx, row, run_id, _outcome_reason("cancelled", message, "cancelled")
-            )
 
     # -------------------------------------------------------------------------
     # The run's task body -- the total function over crash states (§2.3.3)
     # -------------------------------------------------------------------------
-
-    async def _run_guarded(self, run_id: str, token: CancelToken) -> None:
-        """The run task's body: ``_run``, with a refused write from a FINISHED instance run ended
-        quietly. (See ``_RunFenced``: only an instance run, whose engine-ended terminal status a
-        straggling step must not overwrite, ever raises it.)"""
-        try:
-            await self._run(run_id, token)
-        except _RunFenced:
-            _log.warning("run %s: already finished by the engine; a later write from its task was refused", run_id)
-
-    def _assert_live(self, tx: Any, state: _RunState) -> None:
-        """INSTANCE runs only: refuse to write for a run that is already terminal. The check reads the
-        run's row in the SAME transaction as the write that follows, and the single-writer lock makes
-        the pair atomic against ``_abandon_instance_run``, the one place a run is ended behind its
-        task's back. A cluster or deployment run never reads or raises here."""
-        if state.row.instance_id is None:
-            return
-        current = self._run_repo.get(tx, state.run_id)
-        if current is None or current.status in _TERMINAL_RUN_STATUSES:
-            raise _RunFenced(state.run_id)
-
-    @contextlib.asynccontextmanager
-    async def _tx(self, state: _RunState):
-        """``self._uow()``, for a write made on behalf of a run's own task: fenced for an instance run."""
-        async with self._uow() as tx:
-            self._assert_live(tx, state)
-            yield tx
 
     async def _run(self, run_id: str, token: CancelToken) -> None:
         async with self._uow() as tx:
@@ -711,33 +538,16 @@ class WorkflowEngine:
                 self._ordinal_counters[run_id] = len(existing_notify_rows)
         if row is None:
             return
-        handle = self._runs.get(run_id)
-        if handle is not None:
-            handle.instance_id = row.instance_id
-        if row.instance_id is not None and row.status in _TERMINAL_RUN_STATUSES:
-            # INSTANCE runs only. A terminal status is a final answer. Nothing below may touch a
-            # finished run: not the unknown-workflow failure, not the missing-input failure (which
-            # would apply the outcome event a second time), not a resume. `start()` reaches here on a
-            # replayed admission, so a `succeeded` run is never rewritten to `failed`. (A cluster
-            # run is unchanged: it takes the path it took before DR-0055.)
-            return
         wf = self._definitions.get(row.workflow)
         if wf is None:
-            message = f"unknown workflow {row.workflow!r}"
             async with self._uow() as tx:
                 self._run_repo.update(
                     tx,
                     run_id,
                     status="failed",
-                    error={"kind": "permanent", "step": None, "message": message},
+                    error={"kind": "permanent", "step": None, "message": f"unknown workflow {row.workflow!r}"},
                     finished_at=self._clock.now(),
                 )
-                if row.instance_id is not None:
-                    # No definition means no `outcome:` block to read. But an instance in `destroying`
-                    # (or `provisioning`) is waiting on this run's report, and nothing else will send
-                    # it, so the report is built from the workflow's name. (A cluster run takes the
-                    # path it always did.)
-                    await self._apply_instance_failure_in_tx(tx, row, run_id, _outcome_reason("permanent", message, "failed"))
             return
 
         state = _RunState(run_id=run_id, wf=wf, token=token, row=row, scope={"run": dict(row.args)})
@@ -804,8 +614,6 @@ class WorkflowEngine:
             return
         except _RunAlreadyFinalized:
             return
-        except _RunFenced:
-            raise  # `_run_guarded` ends it quietly: an instance run the engine already finished
         except _RunFailed as fail:
             await self._handle_failure(state, fail)
             return
@@ -840,11 +648,9 @@ class WorkflowEngine:
         _log.error("run %s failed unexpectedly: %s", state.run_id, detail, exc_info=exc)
         error = {"kind": "permanent", "step": None, "message": detail}
         try:
-            async with self._tx(state) as tx:
+            async with self._uow() as tx:
                 self._run_repo.update(tx, state.run_id, error=error)
                 await self._apply_terminal(tx, state, "failed", "permanent", detail)
-        except _RunFenced:
-            raise  # an instance run the engine already ended: nothing may be written for it (`_run_guarded`)
         except Exception:  # noqa: BLE001 -- last-resort, see below
             # If the terminal write ITSELF fails (a malformed outcome block, a
             # scope-dependent payload the crash already poisoned, a DB error), fall
@@ -860,36 +666,13 @@ class WorkflowEngine:
                 state.run_id,
             )
             with contextlib.suppress(Exception):
-                async with self._tx(state) as tx:
+                async with self._uow() as tx:
                     self._run_repo.update(
                         tx, state.run_id, status="failed", error=error, finished_at=self._clock.now()
                     )
-                    if state.row.instance_id is not None:
-                        # An instance run still reports, from its name, so the instance does not wait
-                        # forever on a run that has ended (see `_apply_instance_failure_in_tx`).
-                        await self._apply_instance_failure_in_tx(
-                            tx, state.row, state.run_id, _outcome_reason("permanent", detail, "failed")
-                        )
-
-    async def _apply_instance_failure_in_tx(self, tx: Any, row: Any, run_id: str, reason: str) -> None:
-        """Report a run that ended without a usable definition (or whose own terminal write failed)
-        to its INSTANCE, in the caller's transaction: ``destroy*`` -> ``InstanceDestroyFailed``
-        (``destroy-failed``, which arms the retry), ``provision*`` -> ``InstanceProvisionFailed``
-        (``failed``, whose expiry is still armed). Any other name has no report to send, and is
-        logged: an instance run is only ever one of these two."""
-        at, actor = self._clock.now(), f"engine:run:{run_id}"
-        if row.workflow.startswith("destroy"):
-            event: Event = InstanceDestroyFailed(at=at, actor=actor, reason=reason)
-        elif row.workflow.startswith("provision"):
-            event = InstanceProvisionFailed(at=at, actor=actor, reason=reason)
-        else:
-            _log.error("run %s: workflow %r is neither a provision nor a destroy; no report for instance %s",
-                       run_id, row.workflow, row.instance_id)
-            return
-        await self._dispatcher.apply("instance", row.instance_id, event, tx=tx)
 
     async def _mark_started(self, state: _RunState) -> None:
-        async with self._tx(state) as tx:
+        async with self._uow() as tx:
             self._run_repo.update(tx, state.run_id, status="running", started_at=self._clock.now())
             await self._emit_job_notify_in_tx(tx, state, "job_started")
 
@@ -1020,7 +803,7 @@ class WorkflowEngine:
                     state, step_def, step_path, kind="permanent",
                     message=f"resume_replay_limit={self._resume_replay_limit} exceeded", output=existing.output,
                 )
-            async with self._tx(state) as tx:
+            async with self._uow() as tx:
                 self._step_repo.update(tx, state.run_id, step_path, interrupted_count=new_interrupted)
             params = step.Params(**self._decrypt_secrets_for(step.Params, existing.params))
             provisional = step.Output(**self._decrypt_secrets_for(step.Output, existing.output or {}))
@@ -1037,7 +820,7 @@ class WorkflowEngine:
                     state, step_def, step_path, kind="permanent",
                     message=f"resume_replay_limit={self._resume_replay_limit} exceeded", output=None,
                 )
-            async with self._tx(state) as tx:
+            async with self._uow() as tx:
                 self._step_repo.update(tx, state.run_id, step_path, interrupted_count=new_interrupted)
 
         start_attempt = existing.attempt if existing is not None else 1
@@ -1106,7 +889,7 @@ class WorkflowEngine:
     # -------------------------------------------------------------------------
 
     async def _insert_step_row(self, state: _RunState, step_path: str, verb: str, params: Any) -> None:
-        async with self._tx(state) as tx:
+        async with self._uow() as tx:
             run_row = self._run_repo.get(tx, state.run_id)
             if run_row is not None and run_row.cancel_requested:
                 raise _RunCancelledSignal(step_path=None)  # G2: DB-serialized cancel-vs-step-start
@@ -1121,17 +904,17 @@ class WorkflowEngine:
             )
 
     async def _persist_attempt(self, state: _RunState, step_path: str, attempt: int) -> None:
-        async with self._tx(state) as tx:
+        async with self._uow() as tx:
             self._step_repo.update(tx, state.run_id, step_path, attempt=attempt)
 
     async def _persist_step_gating(self, state: _RunState, step_path: str, output_dict: Mapping[str, Any]) -> None:
-        async with self._tx(state) as tx:
+        async with self._uow() as tx:
             self._step_repo.update(tx, state.run_id, step_path, status="gating", output=output_dict)
 
     async def _persist_step_succeeded(
         self, state: _RunState, step_def: StepDef, step_path: str, output_dict: Mapping[str, Any], scope_with_self: Mapping[str, Any]
     ) -> None:
-        async with self._tx(state) as tx:
+        async with self._uow() as tx:
             self._step_repo.update(tx, state.run_id, step_path, status="succeeded", output=output_dict, finished_at=self._clock.now())
             if step_def.emit is not None:
                 await self._apply_event_in_tx(tx, state, step_def.emit.event, step_def.emit.payload, scope_with_self)
@@ -1156,7 +939,7 @@ class WorkflowEngine:
         continued = step_def.on_failure == "continue"
         step_status = "failed_continued" if continued else "failed"
         run_status: str | None = None
-        async with self._tx(state) as tx:
+        async with self._uow() as tx:
             self._step_repo.update(
                 tx, state.run_id, step_path, status=step_status, error={"kind": kind, "message": message},
                 output=output, finished_at=self._clock.now(),
@@ -1182,7 +965,7 @@ class WorkflowEngine:
         workflow), the run's terminal 'failed' status, and the outcome event all
         commit in ONE transaction. A crash here must never resume into re-executing
         the permanently failed step, nor lose the outcome event."""
-        async with self._tx(state) as tx:
+        async with self._uow() as tx:
             self._step_repo.update(
                 tx, state.run_id, step_path, status="failed", error={"kind": "unreachable", "message": message},
                 output=output, finished_at=self._clock.now(),
@@ -1271,7 +1054,7 @@ class WorkflowEngine:
         let a cancel-triggered compensation's own Unreachable retries be short-
         circuited by the very token that triggered them, skipping the re-probe
         schedule entirely)."""
-        async with self._tx(state) as tx:
+        async with self._uow() as tx:
             current = self._run_repo.get(tx, state.run_id)
             prior_status = current.status if current is not None else "running"
             self._run_repo.update(tx, state.run_id, status="blocked")
@@ -1292,7 +1075,7 @@ class WorkflowEngine:
                         raise _UnreachableExhausted(step_path, reason=_failure_message(exc)) from None
                     continue
         finally:
-            async with self._tx(state) as tx:
+            async with self._uow() as tx:
                 row = self._run_repo.get(tx, state.run_id)
                 if row is not None and row.status == "blocked":
                     self._run_repo.update(tx, state.run_id, status=prior_status)
@@ -1315,14 +1098,11 @@ class WorkflowEngine:
             raise StepCancelled("cancelled during engine-owned wait")
 
     def _make_ctx(self, state: _RunState, step_path: str, attempt: int, token: CancelToken) -> StepContext:
-        # A run belongs to exactly one aggregate (WorkflowRunRow's invariant, the table's CHECK).
-        # The context carries that one id under its own name: an instance run never presents
-        # its id as a cluster's (DR-0055).
+        # A run belongs to one aggregate: the context carries that id under its own name (DR-0055).
         return StepContext(
             run_id=UUID(state.run_id), cluster_id=state.row.cluster_id, instance_id=state.row.instance_id,
-            workflow=state.wf.workflow,
-            step_path=step_path, attempt=attempt, cancel=token, services=self._step_services,
-            note_sink=self._note_sink, progress_sink=self._progress_sink,
+            workflow=state.wf.workflow, step_path=step_path, attempt=attempt, cancel=token,
+            services=self._step_services, note_sink=self._note_sink, progress_sink=self._progress_sink,
         )
 
     # -------------------------------------------------------------------------
@@ -1429,8 +1209,6 @@ class WorkflowEngine:
 
     async def _note_sink(self, run_id: UUID, step_path: str, facts: Mapping[str, str]) -> None:
         async with self._uow() as tx:
-            if self._is_finished_instance_run(tx, str(run_id)):
-                return  # a straggler of an instance run the engine ended: dropped, not written
             existing = self._step_repo.get(tx, str(run_id), step_path)
             merged = dict(existing.notes) if existing is not None else {}
             merged.update(facts)
@@ -1440,22 +1218,14 @@ class WorkflowEngine:
         self, run_id: UUID, cluster_id: str | None, workflow: str, step_path: str, attempt: int, message: str,
         fields: Mapping[str, Any], *, instance_id: str | None = None,
     ) -> None:
-        # The payload names the run's aggregate under its own key: `cluster_id` for a cluster
-        # run (unchanged), `instance_id` for an instance run -- never one id under the other's name.
         owner = {"cluster_id": cluster_id} if instance_id is None else {"instance_id": instance_id}
         async with self._uow() as tx:
-            if instance_id is not None and self._is_finished_instance_run(tx, str(run_id)):
-                return  # as `_note_sink`
             ordinal = self._next_ordinal(str(run_id))
             self._outbox_repo.insert_run_notify(
                 tx, run_id=str(run_id), step_path=step_path, ordinal=ordinal, topic="workflow_progress",
                 payload={"run_id": str(run_id), **owner, "workflow": workflow, "step_path": step_path, "attempt": attempt, "message": message, **fields},
                 clock=self._clock,
             )
-
-    def _is_finished_instance_run(self, tx: Any, run_id: str) -> bool:
-        row = self._run_repo.get(tx, run_id)
-        return row is not None and row.instance_id is not None and row.status in _TERMINAL_RUN_STATUSES
 
     def _next_ordinal(self, run_id: str) -> int:
         n = self._ordinal_counters.get(run_id, 0)
@@ -1588,12 +1358,12 @@ class WorkflowEngine:
             ok = await self._undo_one(state, step, step_def, row)
             if not ok:
                 undo_incomplete.append(row.step_path)
-                async with self._tx(state) as tx:
+                async with self._uow() as tx:
                     self._run_repo.update(tx, state.run_id, undo_incomplete=undo_incomplete)
         state.undo_incomplete = undo_incomplete
 
     async def _mark_undo(self, state: _RunState, step_path: str, status: str) -> None:
-        async with self._tx(state) as tx:
+        async with self._uow() as tx:
             self._step_repo.update(tx, state.run_id, step_path, undo_status=status)
 
     async def _undo_one(self, state: _RunState, step: Step, step_def: StepDef, row: WorkflowStepRow) -> bool:
@@ -1635,7 +1405,7 @@ class WorkflowEngine:
 
     async def _handle_cancel(self, state: _RunState, interrupted_step_path: str | None) -> None:
         compensate = state.wf.on_failure == "compensate"
-        async with self._tx(state) as tx:
+        async with self._uow() as tx:
             if interrupted_step_path is not None:
                 row = self._step_repo.get(tx, state.run_id, interrupted_step_path)
                 if row is not None and row.status in ("running", "gating"):
@@ -1663,30 +1433,6 @@ class WorkflowEngine:
         await self._finalize(state, "failed", error_kind=fail.kind, error_message=fail.message)
 
     async def _succeed(self, state: _RunState) -> None:
-        if state.row.instance_id is not None:
-            # An instance run's success event can be refused where it is BUILT (``InstanceProvisioned``
-            # needs an address and resource ids, and a step that returned an empty one is a defect in
-            # that step). Left to ``_finalize``, the ValueError would escape ``_run`` with the run still
-            # `running` and no task: nothing would ever report the instance. So the event is built first,
-            # and a refusal is an ordinary permanent step failure: the run goes `compensating`, undoes
-            # what it did, and finishes `failed` with the workflow's own `failed` event applied. Any
-            # resource id the run already recorded stays on the instance, which stays destroyable.
-            outcome_def = state.wf.outcome.succeeded
-            try:
-                self._build_outcome_event(
-                    outcome_def.event, outcome_def.payload, state.scope, state, "succeeded", None
-                )
-            except Exception as exc:  # noqa: BLE001 -- any refusal of the event is a failed run
-                message = f"invalid {outcome_def.event}: {type(exc).__name__}: {exc}"
-                _log.error("run %s: %s", state.run_id, message)
-                async with self._tx(state) as tx:
-                    self._run_repo.update(
-                        tx, state.run_id, status="compensating",
-                        error={"kind": "permanent", "step": None, "message": message},
-                    )
-                await self._compensate(state)
-                await self._finalize(state, "failed", error_kind="permanent", error_message=message)
-                return
         await self._finalize(state, "succeeded")
 
     async def _apply_terminal(
@@ -1711,5 +1457,5 @@ class WorkflowEngine:
         self, state: _RunState, status: str, *, error_kind: str | None = None,
         error_message: str | None = None,
     ) -> None:
-        async with self._tx(state) as tx:
+        async with self._uow() as tx:
             await self._apply_terminal(tx, state, status, error_kind, error_message)

@@ -498,6 +498,29 @@ async def test_a_failed_instance_is_destroyed_at_its_expiry(tmp_path, clock):
     assert (await timer_keys(stack)) == {}
 
 
+class EmptyAddressCreateStep(InstanceCreateStep):
+    async def execute(self, params, ctx):
+        await super().execute(params, ctx)
+        return CreateOutput(address="", resource_ids={"vm": f"spi-{params.instance_id}"})
+
+
+async def test_provision_success_with_an_empty_address_fails_the_instance_and_its_expiry_destroys_it(tmp_path, clock):
+    stack = build_stack(tmp_path, clock, create=EmptyAddressCreateStep())
+    await birth(stack)
+    await settle(stack)
+
+    row = await instance(stack)
+    assert row.status == "failed" and row.address is None and row.failure_reason
+    assert [r.status for r in await runs(stack)] == ["succeeded"]  # the run is done; the machine refused its report
+    assert (await timer_keys(stack))[("instance", "i1", "expiry")].fire_at == NOW + HOUR
+
+    clock.advance(HOUR + timedelta(seconds=1))
+    await fire_due_timers(stack)
+    await settle(stack)
+    assert (await instance(stack)).status == "destroyed"
+    assert stack.destroy.calls == 1
+
+
 # ---------------------------------------------------------------------------
 # destroy / expiry while a provision is running
 # ---------------------------------------------------------------------------
@@ -798,17 +821,15 @@ async def test_crash_mid_destroy_resumes_and_destroys_exactly_once(tmp_path, clo
 # ---------------------------------------------------------------------------
 
 
-async def test_cancelling_an_instance_run_kills_its_subprocess_registered_under_the_instance(tmp_path, clock):
+async def test_cancelling_an_instance_run_kills_its_real_subprocess(tmp_path, clock):
     manager = RecordingSubprocessManager()
     stack = build_stack(tmp_path, clock, boot=InstanceBootStep(subprocess=True), manager=manager)
     await birth(stack)
     await stack.executor.drain_pending()
     for _ in range(400):
-        if manager.instance_process_count("i1"):
+        if manager.handed:
             break
         await asyncio.sleep(0.01)
-    assert manager.instance_process_count("i1") == 1
-    assert manager.cluster_process_count("i1") == 0  # registered as an instance's, never as a cluster's
     (child,) = manager.handed
     assert child.returncode is None
 
@@ -816,7 +837,7 @@ async def test_cancelling_an_instance_run_kills_its_subprocess_registered_under_
     await settle(stack)
 
     assert child.returncode is not None  # the group was signalled: `sleep 30` did not run to completion
-    assert manager.instance_process_count("i1") == 0 and manager.active_count() == 0
+    assert manager.active_count() == 0
     (prov, *_rest) = await runs(stack)
     assert prov.status == "cancelled"
 

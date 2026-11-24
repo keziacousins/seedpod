@@ -1,7 +1,7 @@
-"""0006_instance_state_audits.sql (DR-0055): one table, one trigger, and a slug index swap.
+"""0006_instance_state_audits.sql (DR-0055): one table and a slug index swap.
 
 0005 is not edited and no existing table is rebuilt. These tests run it against a populated v5
-database, check nothing else moved, check the trigger, and run the reverse SQL from the file's
+database, check nothing else moved, and run the reverse SQL from the file's
 own header to prove it is the inverse. Real tmp SQLite, no mocks.
 """
 
@@ -67,7 +67,7 @@ def test_0005_is_untouched():
     assert digest == SHA256_0005
 
 
-def test_it_adds_the_audit_table_and_trigger_and_swaps_the_slug_index(v5):
+def test_it_adds_the_audit_table_and_swaps_the_slug_index(v5):
     before = _master(v5)
     migrate(v5.engine)
     after = _master(v5)
@@ -76,7 +76,6 @@ def test_it_adds_the_audit_table_and_trigger_and_swaps_the_slug_index(v5):
     assert added == {
         "instance_state_audits": ("table", "instance_state_audits"),
         "ix_isa_instance_time": ("index", "instance_state_audits"),
-        "instances_hard_expires_at_is_fixed": ("trigger", "instances"),
         "ux_instances_slug": ("index", "instances"),
     }
     assert {k for k in before if k not in after} == {"ux_instances_slug_live"}  # the only thing dropped
@@ -130,16 +129,6 @@ def test_an_instance_slug_is_never_reused_in_any_status(v5, status):
         conn.execute(text(insert), {"t": T})
 
 
-def test_the_trigger_refuses_to_move_hard_expires_at_and_nothing_else(v5):
-    migrate(v5.engine)
-    with pytest.raises(IntegrityError, match="hard_expires_at"), v5.engine.begin() as conn:
-        conn.execute(text("UPDATE instances SET hard_expires_at = '2099-01-01T00:00:00Z' WHERE id = 'i1'"))
-    with v5.engine.begin() as conn:
-        conn.execute(text("UPDATE instances SET hard_expires_at = hard_expires_at WHERE id = 'i1'"))  # no change
-        conn.execute(text("UPDATE instances SET expires_at = '2026-08-01T00:00:30Z', address = 'x' WHERE id = 'i1'"))
-        assert conn.execute(text("SELECT hard_expires_at FROM instances WHERE id = 'i1'")).scalar() == T
-
-
 def test_it_is_idempotent(v5):
     migrate(v5.engine)
     migrate(v5.engine)
@@ -152,12 +141,12 @@ def test_the_reverse_sql_in_the_header_undoes_it(v5):
     # the reverse SQL, as written in the file's own header
     header = (MIGRATIONS_DIR / "0006_instance_state_audits.sql").read_text().splitlines()
     reverse = "\n".join(ln[5:] for ln in header if ln.startswith("--   "))
-    assert "DROP TRIGGER" in reverse and "DROP TABLE" in reverse and "user_version = 5" in reverse
+    assert "DROP TABLE" in reverse and "user_version = 5" in reverse
     assert "DROP INDEX ux_instances_slug;" in reverse and "ux_instances_slug_live" in reverse
     with v5.engine.begin() as conn:
         conn.connection.driver_connection.executescript(reverse)
     names = _master(v5)
-    assert "instance_state_audits" not in names and "instances_hard_expires_at_is_fixed" not in names
+    assert "instance_state_audits" not in names
     assert "ux_instances_slug_live" in names and "ux_instances_slug" not in names  # 0005's index is back
     migrate(v5.engine)  # and forward again
     assert "instance_state_audits" in _master(v5)

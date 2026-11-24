@@ -85,7 +85,6 @@ __all__ = [
     "InstanceExpired",
     "InstanceStoppedObserved",
     "InstanceRunningObserved",
-    "InstanceUnreachableObserved",
     "InstanceTimerLost",
     "ClusterEvent",
     "DeploymentEvent",
@@ -409,19 +408,11 @@ class InstanceResourcesAllocated(Report):
 @_event
 @dataclass(frozen=True, slots=True, kw_only=True)
 class InstanceProvisioned(Report):
-    """Provision succeeded. Requires an address and resource ids, and has no kubeconfig field.
-    A report that leaves either out is a defect in the workflow that built it, so it is
-    refused here, where it is built, and not left for the machine to guess at. The check also
-    runs on decode, so an event read back from a stored timer or outbox row is held to it."""
+    """Provision succeeded. Has no kubeconfig field. The machine treats an empty address or
+    empty resource ids as a failed provision (``failed``), not as an active instance."""
 
     address: str
     resource_ids: Mapping[str, str]
-
-    def __post_init__(self) -> None:
-        if not self.address:
-            raise ValueError("InstanceProvisioned requires a non-empty address")
-        if not self.resource_ids:
-            raise ValueError("InstanceProvisioned requires at least one resource id")
 
 
 @_event
@@ -458,15 +449,6 @@ class InstanceStoppedObserved(Observation):
 @dataclass(frozen=True, slots=True, kw_only=True)
 class InstanceRunningObserved(Observation):
     pass  # the provider confirms the VM exists and is running
-
-
-@_event
-@dataclass(frozen=True, slots=True, kw_only=True)
-class InstanceUnreachableObserved(Observation):
-    # "Cannot determine state" (InfrastructureUnreachableError). It changes NOTHING in any
-    # state, so the reconciler can report it without every call site having to remember that
-    # unreachable is neither stopped, nor running, nor absent.
-    pass
 
 
 @_event
@@ -523,6 +505,5 @@ InstanceEvent = (
     | InstanceExpired
     | InstanceStoppedObserved
     | InstanceRunningObserved
-    | InstanceUnreachableObserved
     | InstanceTimerLost
 )

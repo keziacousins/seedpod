@@ -1,5 +1,5 @@
 """``StepContext`` for an instance run (DR-0055): it carries ``instance_id`` under its own name,
-never presents it as a cluster id, and registers its subprocesses and progress under the instance.
+never presents it as a cluster id, and reports its progress under the instance.
 """
 
 from __future__ import annotations
@@ -56,19 +56,3 @@ async def test_progress_on_a_cluster_run_is_exactly_what_it_was():
     ctx = make_step_context(cluster_id="c1", progress_sink=sink)
     await ctx.progress("booting")
     assert sink.calls[0][1] == "c1" and sink.instance_ids == [None]
-
-
-async def test_run_subprocess_registers_an_instance_run_under_its_instance():
-    manager = FakeSubprocessManager()
-    ctx = make_step_context(instance_id="i1", services=StepServices(subprocess_manager=manager))
-    result = await ctx.run_subprocess(["true"])
-    assert result.returncode == 0
-    assert manager.scopes == [(None, "i1")]  # never (i1, None): not a cluster id
-    assert len(manager.unregistered) == 1
-
-
-async def test_run_subprocess_registers_a_cluster_run_under_its_cluster_as_before():
-    manager = FakeSubprocessManager()
-    ctx = make_step_context(cluster_id="c1", services=StepServices(subprocess_manager=manager))
-    await ctx.run_subprocess(["true"])
-    assert manager.scopes == [("c1", None)]

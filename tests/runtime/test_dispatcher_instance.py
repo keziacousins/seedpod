@@ -21,11 +21,9 @@ from seedpod.core.events import (
     InstanceRenewRequested,
     InstanceResourcesAllocated,
     InstanceRunningObserved,
-    InstanceUnreachableObserved,
 )
 from seedpod.core.machine import InvalidTransition, StaleVersion
 from seedpod.core.records import InstanceRecord, InstanceStatus
-from seedpod.runtime.dispatcher import AggregateNotFoundError
 from tests.runtime.conftest import (
     NOW,
     FakePokeable,
@@ -204,23 +202,9 @@ async def test_a_refused_renewal_writes_nothing(db, uow, repos, dispatcher):
     assert (await _get(uow, repos)).version == 1
 
 
-async def test_ignore_writes_nothing_and_does_not_poke(db, uow, repos, dispatcher):
-    await _born(uow, repos, dispatcher)
-    fake = FakePokeable()
-    dispatcher.attach_executor(fake)
-    before = _counts(db)
-
-    await dispatcher.apply("instance", "i1", InstanceUnreachableObserved(at=LATER, actor="reconciler"))
-
-    assert _counts(db) == before and fake.count == 0
-    assert (await _get(uow, repos)).version == 1
-
-
 async def test_a_missing_instance_raises_a_lookup_error_and_writes_nothing(db, dispatcher):
     before = _counts(db)
-    with pytest.raises(AggregateNotFoundError):
-        await dispatcher.apply("instance", "ghost", InstanceExpired(at=NOW, actor="timer:expiry"))
-    with pytest.raises(LookupError):  # still the type callers always caught
+    with pytest.raises(LookupError):
         await dispatcher.apply("instance", "ghost", InstanceExpired(at=NOW, actor="timer:expiry"))
     assert _counts(db) == before
 
@@ -284,16 +268,6 @@ async def test_destroyed_does_not_free_the_slug_so_a_zombie_can_never_collide_wi
     # and the destroyed row can still be found running: the zombie transition has no slug to lose
     await dispatcher.apply("instance", "i1", InstanceRunningObserved(at=LATER, actor="reconciler"))
     assert (await _get(uow, repos, "i1")).status == "zombie"
-
-
-async def test_the_database_refuses_to_move_the_hard_limit(uow, repos, dispatcher):
-    await _born(uow, repos, dispatcher)
-    with pytest.raises(IntegrityError, match="hard_expires_at"):
-        async with uow() as tx:
-            tx.execute(text("UPDATE instances SET hard_expires_at = :t WHERE id = 'i1'"), {"t": "2099-01-01T00:00:00Z"})
-    # an UPDATE that leaves it as it was is fine
-    async with uow() as tx:
-        tx.execute(text("UPDATE instances SET hard_expires_at = hard_expires_at, address = 'x' WHERE id = 'i1'"))
 
 
 # ---------------------------------------------------------------------------

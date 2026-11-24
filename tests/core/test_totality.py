@@ -75,7 +75,7 @@ def test_an_event_covers_every_registered_kind():
 
 def test_event_type_unions_partition_an_event_exactly():
     # Sanity: ClusterEvent/DeploymentEvent/InstanceEvent (which drive the totality loop
-    # below) partition AN_EVENT exactly -- the 18+9+13 = 40 registered kinds, no overlap,
+    # below) partition AN_EVENT exactly -- the 18+9+12 = 39 registered kinds, no overlap,
     # nothing left over.
     #
     # The DISJOINTNESS assertion below is the load-bearing one: every event kind
@@ -93,7 +93,7 @@ def test_event_type_unions_partition_an_event_exactly():
     assert cluster | deployment | instance == set(AN_EVENT)
     assert len(cluster) == 18
     assert len(deployment) == 9
-    assert len(instance) == 13
+    assert len(instance) == 12
 
 
 # ---------------------------------------------------------------------------

@@ -88,27 +88,18 @@ from seedpod.data.repositories import (
 )
 from seedpod.data.uow import UnitOfWork
 
-__all__ = ["Dispatcher", "outbox_row", "UnknownAggregateError", "AggregateNotFoundError"]
+__all__ = ["Dispatcher", "outbox_row"]
 
 # The aggregates ``apply()`` can transition. Every internal branch below selects on this
 # explicitly: a name outside it is an error, never "the other one".
 _SUPPORTED_AGGREGATES = frozenset({"cluster", "deployment", "instance"})
 
 
-class UnknownAggregateError(ValueError):
-    """``apply()`` was handed an aggregate type it has no machine for. Nothing was read or
-    written. A ``ValueError``, as it always was."""
-
-
-class AggregateNotFoundError(LookupError):
-    """The aggregate type is known, but no such row exists. Nothing was written. A
-    ``LookupError``, as it always was."""
-
-
-def _unsupported(aggregate: str) -> UnknownAggregateError:
-    return UnknownAggregateError(
+def _unsupported(aggregate: str) -> ValueError:
+    return ValueError(
         f"unknown aggregate type {aggregate!r}: expected one of {sorted(_SUPPORTED_AGGREGATES)}"
     )
+
 
 # Conflict 2's amended EffectKind lane table (seedpod/core/effects.py's per-member
 # comments, restated here as the Dispatcher's own lookup): Persist/ScheduleTimer/
@@ -376,22 +367,6 @@ class Dispatcher:
         if self._timers is not None:
             self._timers.poke()
 
-    def knows(self, aggregate: str) -> bool:
-        """Whether ``apply()`` has a machine for this aggregate type."""
-        return aggregate in _SUPPORTED_AGGREGATES
-
-    def exists(self, t: Session, aggregate: str, aggregate_id: str) -> bool:
-        """Whether the row ``apply()`` would load is there. Raises ``UnknownAggregateError`` for
-        a type it has no machine for. Reads only. The timer service asks this before it fires
-        a timer, so a timer that can never succeed is dropped once instead of retried forever."""
-        if aggregate == "cluster":
-            return self.repos.clusters.get(t, aggregate_id) is not None
-        if aggregate == "deployment":
-            return self.repos.deployments.get(t, aggregate_id) is not None
-        if aggregate == "instance":
-            return self.repos.instances.get(t, aggregate_id) is not None
-        raise _unsupported(aggregate)
-
     def _narrow(
         self, aggregate: str, row: ClusterRow | DeploymentRow | InstanceRow
     ) -> ClusterRecord | DeploymentRecord | InstanceRecord:
@@ -418,7 +393,7 @@ class Dispatcher:
         else:
             raise _unsupported(aggregate)
         if rec is None:
-            raise AggregateNotFoundError(f"no {aggregate} {aggregate_id!r} to load and transition")
+            raise LookupError(f"no {aggregate} {aggregate_id!r} to load and transition")
         return rec
 
     def _persist(

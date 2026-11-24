@@ -41,20 +41,9 @@ class FakeSubprocessManager:
     def __init__(self) -> None:
         self.registered: list[asyncio.subprocess.Process] = []
         self.unregistered: list[asyncio.subprocess.Process] = []
-        self.scopes: list[tuple[str | None, str | None]] = []  # (cluster_id, instance_id) per register()
-        self.run_ids: list[str | None] = []  # run_id per register() (set on an instance run only)
 
-    def register(
-        self,
-        process: asyncio.subprocess.Process,
-        *,
-        cluster_id: str | None = None,
-        instance_id: str | None = None,
-        run_id: str | None = None,
-    ) -> None:
+    def register(self, process: asyncio.subprocess.Process, *, cluster_id: str | None = None) -> None:
         self.registered.append(process)
-        self.scopes.append((cluster_id, instance_id))
-        self.run_ids.append(run_id)
 
     def unregister(self, process: asyncio.subprocess.Process) -> None:
         self.unregistered.append(process)

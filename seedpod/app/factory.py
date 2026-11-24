@@ -409,7 +409,6 @@ def build_app(
         dispatch=dispatch,
         clock=clock,
         poll_interval=config.outbox_poll_interval,
-        dispatcher=dispatcher,
     )
     dispatcher.attach_executor(executor)  # sole late wire: .poke() latency hint only
     dispatcher.attach_timers(timers)  # ditto

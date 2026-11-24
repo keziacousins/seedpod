@@ -157,17 +157,3 @@ async def test_audit_rows_carry_the_events_actor_time_reason_and_full_context(uo
     )
     assert oldest.context["kind"] == "InstanceDestroyFailed" and oldest.context["reason"] == "api 500"
     assert (newest.event, newest.reason, newest.created_at) == ("InstanceExpired", None, at + HOUR)
-
-
-async def test_list_live_ids_skips_destroyed_and_decodes_nothing(uow):
-    """The liveness sweep enumerates with this, so that one row that cannot be decoded cannot hide the others."""
-    async with uow() as tx:
-        owner = _owner(tx)
-        repo.insert(tx, _row("old", "a", owner, created_at=NOW))
-        repo.insert(tx, _row("gone", "b", owner, status="destroyed", created_at=NOW + HOUR, destroyed_at=NOW + HOUR))
-        repo.insert(tx, _row("poison", "c", owner, created_at=NOW + 2 * HOUR))
-        repo.insert(tx, _row("new", "d", owner, created_at=NOW + 3 * HOUR))
-        tx.execute(text("UPDATE instances SET resource_ids = '{not json' WHERE id = 'poison'"))
-        with pytest.raises(ValueError):
-            repo.list_all(tx)  # the full read dies on the poison row
-        assert repo.list_live_ids(tx) == ["old", "poison", "new"]

@@ -109,7 +109,6 @@ from seedpod.core.events import (
     InstanceRunningObserved,
     InstanceStoppedObserved,
     InstanceTimerLost,
-    InstanceUnreachableObserved,
     Observation,
     ProvisionFailed,
     ProvisionSucceeded,
@@ -1007,8 +1006,7 @@ DEPLOYMENT_TABLE = _fill_defaults(
 #    older than ``expires_at`` when the destroy was requested before the lease ended, so
 #    ``destroy-failed`` accepts ``InstanceExpired`` without the staleness check (no renewal is
 #    possible there, so an old fire cannot be stale).
-# 4. **Unreachable is not absent.** ``InstanceUnreachableObserved`` is Ignore in every state.
-# 5. An ``InstanceExpired`` older than ``record.expires_at`` is stale and ignored (except in
+# 4. An ``InstanceExpired`` older than ``record.expires_at`` is stale and ignored (except in
 #    ``destroy-failed``, invariant 3). The timer
 #    service already drops a re-armed timer (DR-0009), so this only covers a fire that was
 #    built before a renewal and delivered after it.
@@ -1100,6 +1098,14 @@ def _instance_provisioning_resources_allocated(
 
 def _instance_provisioning_provisioned(record: InstanceRecord, event: InstanceProvisioned) -> TransitionResult:
     merged = {**dict(record.resource_ids), **dict(event.resource_ids)}
+    if not event.address or not event.resource_ids:
+        # A success with nothing to reach or nothing to destroy is a defect in the workflow that
+        # reported it. Not `active`: `failed`, whose expiry is still armed, so it is destroyed at expiry.
+        # Any ids it did report are kept, because destroy needs them.
+        return _instance_result(
+            record, event, state=InstanceStatus.FAILED, resource_ids=merged,
+            failure_reason="provision reported success without an address and resource ids",
+        )
     return _instance_result(
         record, event, state=InstanceStatus.ACTIVE, address=event.address, resource_ids=merged, failure_reason=None
     )
@@ -1140,13 +1146,13 @@ def _instance_destroy(record: InstanceRecord, event: Event) -> TransitionResult:
 
 def _instance_provisioning_expired(record: InstanceRecord, event: InstanceExpired) -> TransitionResult:
     if event.at < record.expires_at:
-        return _ignore(record, event)  # stale: see invariant 5
+        return _ignore(record, event)  # stale: the expiry moved after this timer was armed
     return _begin_instance_destroy(record, event, cancel_provision=True)
 
 
 def _instance_expired(record: InstanceRecord, event: InstanceExpired) -> TransitionResult:
     if event.at < record.expires_at:
-        return _ignore(record, event)  # stale: see invariant 5
+        return _ignore(record, event)  # stale: the expiry moved after this timer was armed
     return _begin_instance_destroy(record, event, cancel_provision=False)
 
 
@@ -1281,8 +1287,8 @@ _INSTANCE_TABLE_RAW: dict[tuple[InstanceStatus, type], Callable] = {
     (InstanceStatus.DESTROYED, InstanceRunningObserved): _instance_destroyed_running_observed,
     # Not listed, so by the totality law: a Command is InvalidTransition (renew outside
     # active; destroy while destroying or after destroyed -- the API's 409), a Report, timer or
-    # Observation is Ignore. That includes InstanceUnreachableObserved everywhere (invariant 4),
-    # a stale report for a run the machine has moved past, and a duplicate InstanceProvisioned.
+    # Observation is Ignore. That includes a stale report for a run the machine has moved past,
+    # and a duplicate InstanceProvisioned.
 }
 
 _INSTANCE_EVENT_TYPES: tuple[type, ...] = (
@@ -1297,7 +1303,6 @@ _INSTANCE_EVENT_TYPES: tuple[type, ...] = (
     InstanceExpired,
     InstanceStoppedObserved,
     InstanceRunningObserved,
-    InstanceUnreachableObserved,
     InstanceTimerLost,
 )
 

@@ -83,14 +83,7 @@ class SubprocessManagerLike(Protocol):
     directly — so a no-op fake fully satisfies tests.
     """
 
-    def register(
-        self,
-        process: asyncio.subprocess.Process,
-        *,
-        cluster_id: str | None = None,
-        instance_id: str | None = None,
-        run_id: str | None = None,
-    ) -> None: ...
+    def register(self, process: asyncio.subprocess.Process, *, cluster_id: str | None = None) -> None: ...
 
     def unregister(self, process: asyncio.subprocess.Process) -> None: ...
 
@@ -137,11 +130,9 @@ class StepContext:
     """Seam B §2.1 verbatim contract. Constructed per attempt by the engine; ``attempt``
     is 1-based and read from the DB, so it survives restart.
 
-    **A run belongs to exactly one aggregate** (DR-0055): a cluster (``cluster_id``) or an
-    instance (``instance_id``). The constructor refuses both or neither. A step reads the id of
-    the kind it was written for, and the other one RAISES rather than answering ``None``: a
-    cluster step that ran on an instance run would otherwise look up cluster ``None``, and an
-    instance's id is never offered as a cluster's."""
+    **A run belongs to exactly one aggregate** (DR-0055): a cluster or an instance. The constructor
+    refuses both or neither, and the id of the other kind RAISES rather than answering ``None``, so
+    a cluster step on an instance run cannot look up cluster ``None``."""
 
     def __init__(
         self,
@@ -200,15 +191,10 @@ class StepContext:
         Never raises to the step; never touches the cursor. Replaces per-job SSE
         and _job_wrapper's 36-char-arg scanning (gotcha 15)."""
         try:
-            if self._instance_id is None:
-                await self._progress_sink(
-                    self.run_id, self._cluster_id, self.workflow, self.step_path, self.attempt, message, fields
-                )
-            else:
-                await self._progress_sink(
-                    self.run_id, None, self.workflow, self.step_path, self.attempt, message, fields,
-                    instance_id=self._instance_id,
-                )
+            owner = {} if self._instance_id is None else {"instance_id": self._instance_id}
+            await self._progress_sink(
+                self.run_id, self._cluster_id, self.workflow, self.step_path, self.attempt, message, fields, **owner
+            )
         except Exception:
             return  # never raises to the step
 
@@ -255,12 +241,7 @@ class StepContext:
             # generalized from per-process SIGTERM/SIGKILL to process-GROUP kill so a
             # spawned kubectl/ssh's own children die too)
         )
-        if self._instance_id is None:
-            self.services.subprocess_manager.register(process, cluster_id=self._cluster_id)
-        else:
-            self.services.subprocess_manager.register(
-                process, instance_id=self._instance_id, run_id=str(self.run_id)
-            )
+        self.services.subprocess_manager.register(process, cluster_id=self._cluster_id)  # None for an instance run
         try:
             communicate_task = asyncio.ensure_future(process.communicate(stdin))
             cancel_task = asyncio.ensure_future(self.cancel.wait())

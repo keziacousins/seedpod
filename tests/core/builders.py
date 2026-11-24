@@ -53,7 +53,6 @@ from seedpod.core.events import (
     InstanceRunningObserved,
     InstanceStoppedObserved,
     InstanceTimerLost,
-    InstanceUnreachableObserved,
     ProvisionFailed,
     ProvisionSucceeded,
     RetryRequested,
@@ -206,7 +205,6 @@ AN_EVENT: dict[type, Event] = {
     InstanceExpired: InstanceExpired(at=AT, actor="timer:expiry"),
     InstanceStoppedObserved: InstanceStoppedObserved(at=AT, actor="reconciler"),
     InstanceRunningObserved: InstanceRunningObserved(at=AT, actor="reconciler"),
-    InstanceUnreachableObserved: InstanceUnreachableObserved(at=AT, actor="reconciler"),
     InstanceTimerLost: InstanceTimerLost(at=AT, actor="sweep:instance-liveness"),
 }
 

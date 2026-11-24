@@ -67,39 +67,22 @@ inside ``EffectExecutor``").**
         hand-off never landed.
 
    **Aggregate (DR-0055).** Both effects name their run's aggregate (``aggregate_type`` +
-   ``aggregate_id``): ``"cluster"`` or ``"instance"``. ``_target_of`` raises for anything else
-   before any read or write. A cluster run is inserted with ``cluster_id`` and resolved by
-   ``dispatch.resolve``. An instance run is inserted with ``instance_id`` and NO cluster_id,
-   resolved by ``dispatch.resolve_instance`` to ``provision-instance-{provider}`` or
-   ``destroy-instance``. The two never share an id: a cluster and an instance with the same id
-   string are two aggregates, and a run for one is never read as a run for the other. The
-   one-active-run slot is per aggregate (``ux_wr_one_active`` for clusters,
-   ``ux_wr_one_active_instance`` for instances).
+   ``aggregate_id``): ``"cluster"`` or ``"instance"``; ``_target_of`` raises for anything else
+   before any read or write. An instance run is inserted with ``instance_id`` and no
+   ``cluster_id``, resolved by ``dispatch.resolve_instance``, and holds its own one-active-run
+   slot (``ux_wr_one_active_instance``). A cluster and an instance with the same id string are
+   two aggregates: each lookup is on its own column.
 
-   **Stale instance rows (DR-0055).** An instance ``provision`` row is admitted only while the
-   instance is ``provisioning``, and a ``destroy`` row only while it is ``destroying``. Any other
-   state means the row was overtaken (a provision held back by a missing definition until after
-   the instance was destroyed, say). It is marked ``done`` with NO run, in the admission
-   transaction, and logged. The check comes AFTER one other: when ``dedupe_key`` shows that THIS
-   effect already admitted a run (a replay after a failed done-mark), that run is handed to the
-   engine first, whatever state the instance is in now. A stale-drop there would abandon a run that
-   nothing else starts. A retried destroy is not stale: its row is written on the transition
-   into ``destroying``. A ``CancelWorkflow`` for an instance cancels the live run only when that
-   run is the workflow the effect names, so a delayed ``provision`` cancel cannot cancel the
-   ``destroy`` run that has taken the slot. A cluster's cancel is unchanged.
-
-   **Destroy admitted while a provision is active** (an instance destroyed or expired while it is
-   still provisioning) takes the cluster's branch 1 below, unchanged: the ``destroy`` row sees
-   the live provision run, flips its ``cancel_requested`` and trips its token (the machine
-   emitted ``CancelWorkflow`` just before it, so this is usually already done), then leaves its
-   own row ``pending`` and retries every ``_SUPERSEDE_RETRY_SECONDS`` WITHOUT counting an
-   attempt, until the provision run is terminal (its compensation has finished). Only then is
-   the destroy run inserted. It is never dropped and never run beside the provision.
+   **Stale instance rows.** An instance ``provision`` row is admitted only while the instance is
+   ``provisioning``, and a ``destroy`` row only while it is ``destroying``. Any other state means
+   the row was overtaken (a provision held back until after the instance was destroyed, say): it
+   is marked ``done`` with NO run, in the admission transaction, and logged. A ``destroy`` that
+   meets a live provision run takes the cluster's branch 1 below, unchanged.
 
    ``CancelWorkflow`` admission: ``UPDATE workflow_runs SET cancel_requested=1
-   WHERE cluster_id=? (or instance_id=?) AND status IN (pending,running,blocked,compensating);
+   WHERE cluster_id=? AND status IN (pending,running,blocked,compensating);
    trip the in-memory token; mark row done`` -- implemented by looking up
-   ``active_for_cluster`` / ``active_for_instance`` then delegating BOTH the DB flip and the token trip to
+   ``active_for_cluster`` then delegating BOTH the DB flip and the token trip to
    ``engine.cancel(run_id)`` (its real committed API already does exactly this
    pair, atomically-enough for this purpose: DB write first, durable, THEN the
    in-memory trip -- G1).
@@ -111,15 +94,7 @@ inside ``EffectExecutor``").**
    10m...]`` (clamped to the ladder's last entry past its length -- the
    ellipsis); ``dead`` once ``attempts >= 8``, ``last_error`` set (dead rows are
    reconciliation's surface, per DR-0002 -- this module never touches them
-   again). **A ``dead`` ``run_workflow`` row for an INSTANCE is reported to its aggregate, in the
-   transaction that marks it dead** (``_mark_instance_run_row_dead``), when the instance then has
-   no other path: ``destroying`` becomes ``InstanceDestroyFailed`` (``destroy-failed``, which arms
-   the retry timer) and ``provisioning`` becomes ``InstanceProvisionFailed`` (``failed``, whose
-   expiry is still armed). No run will ever start for a dead row, so without this an instance in
-   ``destroying`` would wait for ever. The report is best-effort: a failed report still marks the
-   row dead, and the instance liveness sweep (``runtime/instance_liveness.py``) repairs the same
-   state on its next pass, as it does for a row whose payload cannot be decoded. A
-   cluster's dead row is unchanged. A payload that fails to decode for one of THESE two kinds is a
+   again). A payload that fails to decode for one of THESE two kinds is a
    genuine drain failure too, not a special case: ``_process_row`` decodes
    INSIDE this try/except (not before it), so an undecodable run_workflow/
    cancel_workflow row degrades through the same backoff ladder to ``dead``
@@ -174,8 +149,6 @@ from seedpod.core.records import ClusterRecord, InstanceRecord, InstanceStatus
 from seedpod.data.repositories import OutboxRow, Repositories, WorkflowRunRow
 from seedpod.data.uow import UnitOfWork
 from seedpod.engine.dispatch_table import WorkflowDispatch
-from seedpod.runtime.dispatcher import Dispatcher
-from seedpod.runtime.instance_liveness import report_if_no_path
 
 __all__ = ["EffectExecutor", "HubLike", "EngineLike"]
 
@@ -205,29 +178,17 @@ _HOUSEKEEPING_INTERVAL = timedelta(hours=1)  # DR-0002: "hourly"
 
 
 def _target_of(eff: RunWorkflow | CancelWorkflow) -> tuple[str, str]:
-    """``(aggregate_type, aggregate_id)`` of the aggregate a ``RunWorkflow``/``CancelWorkflow``
-    belongs to (DR-0055). Only ``"cluster"`` and ``"instance"`` are admitted. Anything else
-    raises BEFORE any lookup or run insert, so an unknown type can never be read as either. The
-    raise lands in ``_process_row``'s drain-failure path: backoff, then ``dead``, with the
-    row's ``available_at`` in the future, so it cannot starve the rows behind it."""
+    """``(aggregate_type, aggregate_id)`` a ``RunWorkflow``/``CancelWorkflow`` belongs to (DR-0055).
+    Anything but ``"cluster"`` or ``"instance"`` raises BEFORE any lookup or run insert. The raise
+    lands in ``_process_row``'s drain-failure path: backoff, then ``dead``, with the row's
+    ``next available_at`` in the future, so it cannot starve the rows behind it."""
     if eff.aggregate_type in ("cluster", "instance"):
         return eff.aggregate_type, eff.aggregate_id
     raise ValueError(f"{eff.kind}: unknown aggregate type {eff.aggregate_type!r}")
 
 
-def _stale_instance_run(eff: RunWorkflow, owner: InstanceRecord) -> str | None:
-    """Why an instance ``RunWorkflow`` row must not be admitted, or None to admit it.
-
-    The machine writes a ``provision`` row only on birth (the instance is ``provisioning``) and a
-    ``destroy`` row only on entering ``destroying``. A row that reaches admission while the
-    instance is in any other state was overtaken by what happened since. Admitting a provision
-    after a destroy would create a VM nothing owns. A retried destroy is not stale: its own row is
-    written on the transition into ``destroying``, so the instance is in that state when it runs."""
-    if eff.workflow == "provision" and owner.state is not InstanceStatus.PROVISIONING:
-        return f"instance {owner.id!r} is {owner.state.value!r}, no longer provisioning"
-    if eff.workflow == "destroy" and owner.state is not InstanceStatus.DESTROYING:
-        return f"instance {owner.id!r} is {owner.state.value!r}, no longer destroying"
-    return None
+# The state an instance must be in for a run of that workflow to be admitted (see the module docstring).
+_INSTANCE_RUN_STATE = {"provision": InstanceStatus.PROVISIONING, "destroy": InstanceStatus.DESTROYING}
 
 
 class HubLike(Protocol):
@@ -268,14 +229,9 @@ class EffectExecutor:
         clock: Clock,
         poll_interval: float = _DEFAULT_POLL_INTERVAL,
         retention_days: int = _DEFAULT_RETENTION_DAYS,
-        dispatcher: Dispatcher | None = None,
     ) -> None:
         self._uow = uow
         self._repos = repos
-        # Only used to report a dead INSTANCE run row to its aggregate (``_handle_drain_failure``).
-        # The default needs nothing the executor lacks, so every existing caller stays valid; the
-        # composition root passes the real one so its ``poke()`` wires apply.
-        self._dispatcher = dispatcher if dispatcher is not None else Dispatcher(uow, repos, clock)
         self._run_repo = repos.workflow_runs
         self._hub = hub
         self._engine = engine
@@ -458,84 +414,61 @@ class EffectExecutor:
 
     async def _drain_run_workflow(self, row: OutboxRow, eff: RunWorkflow) -> None:
         aggregate, aggregate_id = _target_of(eff)
-        if aggregate == "instance" and eff.deployment_id is not None:
-            raise ValueError(f"RunWorkflow for instance {aggregate_id!r} names deployment {eff.deployment_id!r}")
         new_run_id = str(uuid4())
-        owner: ClusterRecord | InstanceRecord | None = None
-        stale: str | None = None
-        inserted = False
-        already_admitted = False
         try:
             async with self._uow() as t:
                 if aggregate == "cluster":
-                    owner = self._repos.clusters.load(t, aggregate_id)
-                    if owner is None:
-                        raise LookupError(f"RunWorkflow admission: no cluster {aggregate_id!r} to resolve provider")
-                    concrete_name, args = self._dispatch.resolve(eff, owner)
-                elif self._run_repo.get_by_dedupe_key(t, row.effect_id) is not None:
-                    # THIS effect already admitted a run (a replay: a prior pass committed the run and
-                    # failed to mark the row done). That run is owed to the engine whatever the instance
-                    # has become since, so it is handed over BEFORE any staleness check: a stale-drop
-                    # here would mark the row done and abandon a run nothing else would ever start.
-                    # (The run itself still ends correctly: a terminal run is not touched, and a live
-                    # one reports its own outcome.) It also keeps this effect from meeting its OWN run
-                    # in the one-active-run index and cancelling it as a "conflict".
-                    already_admitted = True
-                    concrete_name, args = "", {}
+                    owner: ClusterRecord | InstanceRecord | None = self._repos.clusters.load(t, aggregate_id)
                 else:
                     owner = self._repos.instances.load(t, aggregate_id)
-                    if owner is None:
-                        raise LookupError(f"RunWorkflow admission: no instance {aggregate_id!r} to resolve provider")
-                    stale = _stale_instance_run(eff, owner)
-                    if stale is not None:
-                        # The row was written for a state the instance has since left (a provision
-                        # held back by a missing definition while the instance was destroyed, say).
-                        # Admitting it would run a workflow the machine no longer wants. Done, with no
-                        # run, in this transaction, so a replay sees the same answer.
+                if owner is None:
+                    raise LookupError(f"RunWorkflow admission: no {aggregate} {aggregate_id!r} to resolve provider")
+                if isinstance(owner, ClusterRecord):
+                    concrete_name, args = self._dispatch.resolve(eff, owner)
+                else:
+                    concrete_name, args = self._dispatch.resolve_instance(eff, owner)
+                    if owner.state is not _INSTANCE_RUN_STATE[eff.workflow]:
+                        # Overtaken by what happened since it was written. Done, with no run.
                         self._repos.outbox.mark_done(t, row.effect_id, done_at=self._clock.now())
-                        concrete_name, args = "", {}
-                    else:
-                        concrete_name, args = self._dispatch.resolve_instance(eff, owner)
-                if stale is None and not already_admitted:
-                    definitions = self._engine.definitions
-                    if concrete_name not in definitions:
-                        raise LookupError(f"RunWorkflow admission: unknown workflow definition {concrete_name!r}")
-                    new_row = WorkflowRunRow(
-                        id=new_run_id,
-                        workflow=concrete_name,
-                        workflow_version=definitions[concrete_name].version,
-                        cluster_id=aggregate_id if aggregate == "cluster" else None,
-                        instance_id=aggregate_id if aggregate == "instance" else None,
-                        deployment_id=eff.deployment_id,
-                        dedupe_key=row.effect_id,
-                        args=dict(args),
-                        status="pending",
-                        cancel_requested=False,
-                        failed_step=None,
-                        error=None,
-                        undo_incomplete=None,
-                        initiated_by=None,
-                        created_at=self._clock.now(),
-                        started_at=None,
-                        finished_at=None,
-                    )
-                    inserted = self._run_repo.insert_admitted(t, new_row)
+                        _log.warning(
+                            "outbox row %s: instance %r is %r, not admitting %s", row.effect_id, aggregate_id,
+                            owner.state.value, eff.workflow,
+                        )
+                        return
+                definitions = self._engine.definitions
+                if concrete_name not in definitions:
+                    raise LookupError(f"RunWorkflow admission: unknown workflow definition {concrete_name!r}")
+                new_row = WorkflowRunRow(
+                    id=new_run_id,
+                    workflow=concrete_name,
+                    workflow_version=definitions[concrete_name].version,
+                    cluster_id=aggregate_id if aggregate == "cluster" else None,
+                    instance_id=aggregate_id if aggregate == "instance" else None,
+                    deployment_id=eff.deployment_id,
+                    dedupe_key=row.effect_id,
+                    args=dict(args),
+                    status="pending",
+                    cancel_requested=False,
+                    failed_step=None,
+                    error=None,
+                    undo_incomplete=None,
+                    initiated_by=None,
+                    created_at=self._clock.now(),
+                    started_at=None,
+                    finished_at=None,
+                )
+                inserted = self._run_repo.insert_admitted(t, new_row)
         except IntegrityError:
             # ux_wr_one_active (or its instance twin), NOT dedupe_key (that's ON CONFLICT DO
             # NOTHING, handled above without raising) -- Conflict 2 rule 3 (DR-0011).
-            # `owner` is guaranteed bound here: the only raises reachable before
-            # `insert_admitted` are the `is None` LookupErrors above, which this except
-            # clause does NOT catch.
-            assert owner is not None
+            # `owner` is guaranteed bound here: the only raise reachable before
+            # `insert_admitted` is the `owner is None` LookupError above, which
+            # this except clause does NOT catch.
             await self._handle_active_run_conflict(row, eff, owner)
             return
 
-        if stale is not None:
-            _log.warning("outbox row %s (%s): %s; marked done, no run admitted", row.effect_id, eff.workflow, stale)
-            return
-
         target_run_id = new_run_id
-        if not inserted or already_admitted:
+        if not inserted:
             # dedupe_key already existed: a replay of THIS exact effect (H7 --
             # a prior pass admitted the run but crashed before this row could be
             # marked done). Re-derive the run this effect_id already admitted.
@@ -581,7 +514,7 @@ class EffectExecutor:
            broadcast): ``effect_id = "{row.effect_id}#run_conflict"``
            (``ON CONFLICT DO NOTHING``, so a crash between this INSERT and the
            done-mark replays without duplicating the Notify), aggregate
-           ``cluster/{cluster_id}@0#0`` (``instance/{instance_id}@0#0`` for an instance),
+           ``cluster/{cluster_id}@0#0`` (``instance/...`` for an instance),
            ``environment := owner.environment`` (drain time IS this Notify's decision
            time -- DR-0010 extension).
            Delivery then follows the universal one-attempt notify drain
@@ -592,7 +525,9 @@ class EffectExecutor:
         async with self._uow() as t:
             active = self._active_run(t, aggregate, aggregate_id)
 
-        if eff.workflow == "destroy" and active is not None:
+        # An instance run is cancelled once. Each repeat would arm another hard-cancel backstop,
+        # which kills an undo that takes longer than the grace, so destroy would never start.
+        if eff.workflow == "destroy" and active is not None and (aggregate == "cluster" or not active.cancel_requested):
             await self._engine.cancel(active.id)
 
         already_unwinding = active is None or active.cancel_requested or eff.workflow == "destroy"
@@ -640,8 +575,6 @@ class EffectExecutor:
     # -------------------------------------------------------------------------
 
     def _active_run(self, t, aggregate: str, aggregate_id: str) -> WorkflowRunRow | None:
-        """The aggregate's one live run. A cluster id and an instance id are never mixed up:
-        each lookup is on its own column."""
         if aggregate == "cluster":
             return self._run_repo.active_for_cluster(t, aggregate_id)
         return self._run_repo.active_for_instance(t, aggregate_id)
@@ -650,25 +583,6 @@ class EffectExecutor:
         aggregate, aggregate_id = _target_of(eff)
         async with self._uow() as t:
             active = self._active_run(t, aggregate, aggregate_id)
-            if active is not None and aggregate == "instance":
-                # An instance's cancel names the workflow it is for. A cancel for `provision` that
-                # was delayed (a failed attempt, a backoff) must not cancel the `destroy` run that
-                # has taken the slot since. A cluster's cancel is unchanged: it cancels the live run.
-                instance = self._repos.instances.load(t, aggregate_id)
-                wanted = (
-                    self._dispatch.resolve_instance(
-                        RunWorkflow(workflow=eff.workflow, aggregate_type="instance", aggregate_id=aggregate_id),
-                        instance,
-                    )[0]
-                    if instance is not None
-                    else None
-                )
-                if active.workflow != wanted:
-                    _log.warning(
-                        "outbox row %s: cancel for %r skipped, the live run for instance %r is %r",
-                        row.effect_id, eff.workflow, aggregate_id, active.workflow,
-                    )
-                    active = None
         if active is not None:
             await self._engine.cancel(active.id)
         async with self._uow() as t:
@@ -681,13 +595,6 @@ class EffectExecutor:
     async def _handle_drain_failure(self, row: OutboxRow, exc: Exception) -> None:
         attempts = row.attempts + 1
         _log.exception("drain failed for outbox row %s (kind=%s), attempt %d", row.effect_id, row.kind, attempts)
-        if (
-            attempts >= _DEAD_AT_ATTEMPTS
-            and row.kind == "run_workflow"
-            and row.aggregate_type == "instance"
-        ):
-            await self._mark_instance_run_row_dead(row, attempts, exc)
-            return
         async with self._uow() as t:
             if attempts >= _DEAD_AT_ATTEMPTS:
                 self._repos.outbox.mark_dead(t, row.effect_id, attempts=attempts, last_error=str(exc))
@@ -700,34 +607,3 @@ class EffectExecutor:
                     available_at=self._clock.now() + timedelta(seconds=delay),
                     last_error=str(exc),
                 )
-
-    async def _mark_instance_run_row_dead(self, row: OutboxRow, attempts: int, exc: Exception) -> None:
-        """A ``run_workflow`` row for an INSTANCE just ran out of attempts. No run will ever start for
-        it, so an instance waiting in ``destroying`` (or ``provisioning``) for that run would wait for
-        ever. The row is marked dead and, in the SAME transaction, the instance is reported if (and
-        only if) it now has no other path (``report_if_no_path``: ``destroying`` ->
-        ``InstanceDestroyFailed``, which arms the retry timer; ``provisioning`` ->
-        ``InstanceProvisionFailed``, whose expiry is still armed). The decision is made from the
-        instance's state, not from the row's payload, so a row whose payload cannot be decoded is
-        covered too.
-
-        The report is best-effort and is NOT the guarantee: if it fails, the row is still marked dead
-        (a failed report must not keep a row alive and starve the ones behind it), and the instance
-        liveness sweep finds the same stranded state on its next pass and applies the same event. A
-        cluster's dead row is left as it was: reconciliation's surface (DR-0002)."""
-        try:
-            async with self._uow() as t:
-                self._repos.outbox.mark_dead(t, row.effect_id, attempts=attempts, last_error=str(exc))
-                await report_if_no_path(
-                    self._repos, self._dispatcher, t, row.aggregate_id, clock=self._clock,
-                    reason=f"outbox row {row.effect_id} could not be admitted and went dead: {exc}",
-                    actor="executor:dead-row",
-                )
-            return
-        except Exception:  # noqa: BLE001 -- see the docstring: the sweep is the backstop
-            _log.exception(
-                "outbox row %s: could not report its death to the instance; marking it dead without "
-                "(the liveness sweep repairs the instance)", row.effect_id,
-            )
-        async with self._uow() as t:
-            self._repos.outbox.mark_dead(t, row.effect_id, attempts=attempts, last_error=str(exc))

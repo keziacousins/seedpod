@@ -63,7 +63,6 @@ from seedpod.core.events import (
     InstanceRunningObserved,
     InstanceStoppedObserved,
     InstanceTimerLost,
-    InstanceUnreachableObserved,
     ProvisionFailed,
     ProvisionSucceeded,
     RetryRequested,
@@ -189,11 +188,6 @@ deployment_events = st.one_of(
     st.builds(RollbackFinished, at=aware_utc_datetimes, actor=actors, ok=st.booleans()),
 )
 
-def _non_empty_string_mappings():
-    """A genuinely non-empty mapping: InstanceProvisioned refuses an empty one."""
-    return st.dictionaries(keys=nonempty_safe_text, values=safe_text, min_size=1, max_size=3)
-
-
 instance_events = st.one_of(
     st.builds(InstanceCreateRequested, at=aware_utc_datetimes, actor=actors),
     st.builds(InstanceRenewRequested, at=aware_utc_datetimes, actor=actors),
@@ -203,8 +197,8 @@ instance_events = st.one_of(
         InstanceProvisioned,
         at=aware_utc_datetimes,
         actor=actors,
-        address=nonempty_safe_text,
-        resource_ids=_non_empty_string_mappings(),
+        address=safe_text,
+        resource_ids=string_mappings(),
     ),
     st.builds(InstanceProvisionFailed, at=aware_utc_datetimes, actor=actors, reason=safe_text),
     st.builds(InstanceDestroySucceeded, at=aware_utc_datetimes, actor=actors),
@@ -212,7 +206,6 @@ instance_events = st.one_of(
     st.builds(InstanceExpired, at=aware_utc_datetimes, actor=actors),
     st.builds(InstanceStoppedObserved, at=aware_utc_datetimes, actor=actors),
     st.builds(InstanceRunningObserved, at=aware_utc_datetimes, actor=actors),
-    st.builds(InstanceUnreachableObserved, at=aware_utc_datetimes, actor=actors),
     st.builds(InstanceTimerLost, at=aware_utc_datetimes, actor=actors),
 )
 

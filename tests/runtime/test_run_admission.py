@@ -499,21 +499,6 @@ async def test_instance_run_for_a_missing_instance_fails_and_does_not_use_a_clus
     assert after.available_at > NOW
 
 
-async def test_instance_run_naming_a_deployment_is_refused(uow, repos, executor, engine):
-    await _insert_instance(uow, repos, "i1")
-    engine.definitions["provision-instance-fake"] = FakeWorkflowDefinition(version=1)
-    eff = RunWorkflow(workflow="provision", aggregate_type="instance", aggregate_id="i1", deployment_id="d1")
-    row = outbox_row(eff, "instance", "i1", 1, 0, now=NOW)
-    async with uow() as t:
-        repos.outbox.insert(t, row)
-
-    await executor.drain_pending()
-
-    async with uow() as t:
-        assert repos.workflow_runs.list_all(t) == []
-        assert "deployment" in repos.outbox.get(t, row.effect_id).last_error
-
-
 async def test_instance_verb_that_does_not_exist_fails_the_row(uow, repos, executor, engine):
     await _insert_instance(uow, repos, "i1")
     engine.definitions["provision-instance-fake"] = FakeWorkflowDefinition(version=1)

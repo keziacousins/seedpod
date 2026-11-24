@@ -4,7 +4,7 @@ Totality over (state x event) lives in ``test_totality.py``, with the cluster an
 tables. This file holds what is specific to the instance machine: each rule's effects, the
 renewal arithmetic, the timer invariant over random event sequences, and the guarantees the
 brief names (no kubeconfig on a VM, ``hard_expires_at`` immutable, a failed destroy can always be
-retried, unreachable changes nothing).
+retried).
 
 No ``unittest.mock``: ``transition()`` is pure, so these are input/output checks over
 ``tests/core/builders.py``.
@@ -20,7 +20,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from seedpod.core.codec import decode_effect, decode_event, encode
+from seedpod.core.codec import decode_effect, encode
 from seedpod.core.effects import (
     CancelTimer,
     CancelWorkflow,
@@ -44,7 +44,6 @@ from seedpod.core.events import (
     InstanceRunningObserved,
     InstanceStoppedObserved,
     InstanceTimerLost,
-    InstanceUnreachableObserved,
 )
 from seedpod.core.machine import (
     INSTANCE_DESTROY_RETRY_DELAY,
@@ -155,28 +154,21 @@ def test_a_vm_has_no_kubeconfig_anywhere():
         InstanceProvisioned(at=AT, actor="e", address="a", resource_ids={"vm": "1"}, kubeconfig_ref="x")  # type: ignore[call-arg]
 
 
-@pytest.mark.parametrize("address", ["", None])
-def test_provision_success_requires_an_address(address):
-    with pytest.raises((ValueError, TypeError)):
-        InstanceProvisioned(at=AT, actor="e", address=address, resource_ids={"vm": "1"})  # type: ignore[arg-type]
-
-
-@pytest.mark.parametrize("resource_ids", [{}, ()])
-def test_provision_success_requires_resource_ids(resource_ids):
-    with pytest.raises(ValueError, match="resource id"):
-        InstanceProvisioned(at=AT, actor="e", address="192.0.2.7", resource_ids=resource_ids)
-
-
-def test_provision_success_requires_both_fields_at_all():
-    with pytest.raises(TypeError):
-        InstanceProvisioned(at=AT, actor="e")  # type: ignore[call-arg]
-
-
-def test_a_stored_provisioned_event_with_no_resource_ids_is_refused_on_decode():
-    stored = encode(AN_EVENT[InstanceProvisioned])
-    stored["resource_ids"] = {}
-    with pytest.raises(ValueError, match="resource id"):
-        decode_event(stored)
+@pytest.mark.parametrize(
+    "address, resource_ids", [("", {"vm": "1"}), ("192.0.2.7", {}), ("", {})]
+)
+def test_provision_success_without_an_address_or_resource_ids_fails_the_instance_and_keeps_its_expiry(
+    address, resource_ids
+):
+    record = _a_live_instance(S.PROVISIONING)
+    result = transition(
+        record, InstanceProvisioned(at=AT, actor="engine:run:1", address=address, resource_ids=resource_ids)
+    )
+    assert result.record.state is S.FAILED
+    assert result.record.failure_reason
+    assert result.record.address is None
+    assert resource_ids.items() <= dict(result.record.resource_ids).items()  # destroy needs any id it reported
+    assert _kinds(result.effects) == [Persist, Notify]  # the expiry timer is untouched, so still armed
 
 
 def test_resources_allocated_merges_ids_while_provisioning_and_stays_provisioning():
@@ -458,16 +450,8 @@ def test_a_running_vm_anywhere_but_a_destroyed_row_changes_nothing(state):
     assert result.effects == () and result.record == record
 
 
-@pytest.mark.parametrize("state", [s for s in S if s is not S.NEW])  # NEW refuses every non-birth event
-@pytest.mark.parametrize("actor", ["reconciler", "health"])
-def test_unreachable_changes_nothing_in_any_state(state, actor):
-    record = an_instance(state=state)
-    result = transition(record, InstanceUnreachableObserved(at=AT, actor=actor))
-    assert result.effects == () and result.record == record
-
-
 @pytest.mark.parametrize(
-    "event_type", [InstanceStoppedObserved, InstanceRunningObserved, InstanceUnreachableObserved]
+    "event_type", [InstanceStoppedObserved, InstanceRunningObserved]
 )
 @pytest.mark.parametrize("actor", ["api:alice", "engine:run:1", "timer:expiry"])
 def test_an_observation_from_an_unprivileged_actor_is_refused(event_type, actor):
@@ -619,7 +603,7 @@ def test_instance_events_do_not_address_the_cluster_table():
 
 _KINDS = [
     "provision_ok", "provision_failed", "allocated", "renew", "destroy", "destroy_ok", "destroy_failed",
-    "stopped", "running", "unreachable", "tick", "fire",
+    "stopped", "running", "tick", "fire",
 ]
 
 
@@ -683,7 +667,6 @@ def _step(world: _World, kind: str, secs: int) -> None:
         "destroy_failed": lambda: InstanceDestroyFailed(at=at, actor=actor, reason="x"),
         "stopped": lambda: InstanceStoppedObserved(at=at, actor="reconciler"),
         "running": lambda: InstanceRunningObserved(at=at, actor="reconciler"),
-        "unreachable": lambda: InstanceUnreachableObserved(at=at, actor="reconciler"),
     }[kind]()
     world.apply(event)
 

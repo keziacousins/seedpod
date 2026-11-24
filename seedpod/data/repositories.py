@@ -58,7 +58,6 @@ docs/design/seam-d-foundation.md Decision 6's "two changes" note).
 from __future__ import annotations
 
 import json
-import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -83,8 +82,6 @@ from seedpod.core.records import (
     Origin,
 )
 from seedpod.services.crypto import CryptoService
-
-_log = logging.getLogger(__name__)
 
 __all__ = [
     "WorkflowRunRow",
@@ -1765,15 +1762,6 @@ class InstanceRepository:
         rows = session.execute(text("SELECT * FROM instances ORDER BY created_at")).mappings().all()
         return [_instance_from_mapping(r) for r in rows]
 
-    def list_live_ids(self, session: Session) -> list[str]:
-        """The id of every instance whose status column is not ``destroyed``, oldest first. Reads the
-        two columns it needs and decodes NOTHING, so a row that cannot be decoded is still listed:
-        the caller loads each id on its own and isolates the failure to that one instance."""
-        rows = session.execute(
-            text("SELECT id FROM instances WHERE status != 'destroyed' ORDER BY created_at, id")
-        ).all()
-        return [r[0] for r in rows]
-
 
 # ---------------------------------------------------------------------------
 # cluster_state_audits / deployment_state_audits
@@ -2377,35 +2365,6 @@ class TimerRepository:
         )
         return result.rowcount > 0
 
-    def postpone(
-        self,
-        session: Session,
-        aggregate_type: str,
-        aggregate_id: str,
-        timer_key: str,
-        fire_at_text: str,
-        new_fire_at: datetime,
-    ) -> bool:
-        """Move one timer's ``fire_at`` later, keeping its event and everything else, under the
-        same exact-TEXT condition as ``consume`` (so a concurrent re-arm or cancel is not
-        overwritten). For a timer this build cannot fire (an aggregate type it has no machine
-        for): a newer build may own it, so it is kept, not deleted. Returns False when the row
-        was no longer the one scanned."""
-        result = session.execute(
-            text(
-                "UPDATE timers SET fire_at = :new_fire_at WHERE aggregate_type = :aggregate_type "
-                "AND aggregate_id = :aggregate_id AND timer_key = :timer_key AND fire_at = :fire_at_text"
-            ),
-            {
-                "aggregate_type": aggregate_type,
-                "aggregate_id": aggregate_id,
-                "timer_key": timer_key,
-                "fire_at_text": fire_at_text,
-                "new_fire_at": _iso(new_fire_at),
-            },
-        )
-        return result.rowcount > 0
-
     def get(self, session: Session, aggregate_type: str, aggregate_id: str, timer_key: str) -> TimerRow | None:
         row = session.execute(
             text(
@@ -2416,45 +2375,14 @@ class TimerRepository:
         ).mappings().first()
         return _timer_from_mapping(row) if row is not None else None
 
-    def get_raw(
-        self, session: Session, aggregate_type: str, aggregate_id: str, timer_key: str
-    ) -> tuple[Any, Any] | None:
-        """``(fire_at, event)`` of one timer exactly as stored, parsing NOTHING, or ``None`` if it is
-        not armed. For a caller that must judge a row that may be corrupt (``get`` and ``due`` raise
-        on a ``fire_at`` they cannot parse)."""
-        row = session.execute(
-            text(
-                "SELECT fire_at, event FROM timers WHERE aggregate_type = :aggregate_type "
-                "AND aggregate_id = :aggregate_id AND timer_key = :timer_key"
-            ),
-            {"aggregate_type": aggregate_type, "aggregate_id": aggregate_id, "timer_key": timer_key},
-        ).first()
-        return (row[0], row[1]) if row is not None else None
-
     def due(self, session: Session, now: datetime) -> list[TimerRow]:
         """Every timer whose ``fire_at`` has passed, ordered by ``fire_at`` -- the
-        (later-work) ``TimerService``'s poll query.
-
-        DR-0055: an INSTANCE timer with an unreadable ``fire_at`` is skipped and logged, so it
-        cannot stop every other timer. The liveness sweep replaces it. A corrupt cluster or
-        deployment timer still raises, as it always has."""
+        (later-work) ``TimerService``'s poll query."""
         rows = session.execute(
             text("SELECT * FROM timers WHERE fire_at <= :now ORDER BY fire_at"),
             {"now": _iso(now)},
         ).mappings().all()
-        timers: list[TimerRow] = []
-        for row in rows:
-            try:
-                timers.append(_timer_from_mapping(row))
-            except (ValueError, TypeError):
-                if row["aggregate_type"] != "instance":
-                    raise
-                _log.error(
-                    "skipping instance timer with an unreadable fire_at: %s/%s",
-                    row["aggregate_id"],
-                    row["timer_key"],
-                )
-        return timers
+        return [_timer_from_mapping(r) for r in rows]
 
     def next_fire_at(self, session: Session) -> datetime | None:
         """The earliest ``fire_at`` across every armed timer -- lets the (later-work)

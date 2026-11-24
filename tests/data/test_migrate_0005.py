@@ -31,7 +31,7 @@ RUN_COLUMNS = (
 )
 
 
-# 0005 as it left the schema. Later migrations (0006 adds a trigger and a table) must not change what
+# 0005 as it left the schema. Later migrations (0006 adds a table) must not change what
 # these tests say about 0005, so they migrate through this directory and stop at 0005.
 _THROUGH_0005 = tempfile.TemporaryDirectory(prefix="seedpod-migrations-through-0005-")
 for _f in sorted(MIGRATIONS_DIR.glob("000[1-5]_*.sql")):
