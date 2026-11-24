@@ -41,6 +41,7 @@ from seedpod.runtime.dispatcher import Dispatcher
 from seedpod.runtime.effect_executor import EffectExecutor
 from seedpod.runtime.health import HealthMonitor
 from seedpod.runtime.instance_liveness import InstanceLivenessSweep
+from seedpod.runtime.instance_reconcile import InstanceReconciler
 from seedpod.runtime.reconciliation import ReconciliationService
 from seedpod.runtime.sse import SSEHub
 from seedpod.runtime.subprocess_manager import SubprocessManager
@@ -153,6 +154,7 @@ class App:
     engine: WorkflowEngine
     executor: EffectExecutor
     instance_liveness: InstanceLivenessSweep  # DR-0055: correctness, like the executor and timers
+    instance_reconciler: InstanceReconciler  # DR-0055: periodic, behind `background_tasks` like the cluster reconciler
     services: Services
     api: FastAPI
     http_transport: httpx.AsyncClient  # DR-0015: shared outbound-HTTP seam for GHCR/DNS
@@ -204,6 +206,7 @@ class App:
         if self.config.background_tasks:
             await self.engine.resume_inflight()
             await self.services.reconciliation.start()
+            await self.instance_reconciler.start()
             await self.services.health.start()
             # DR-0044. Behind the flag like the other periodic loops (tests stay
             # deterministic and call `flush_last_used()` directly), but note the
@@ -247,6 +250,7 @@ class App:
         await self.instance_liveness.stop()
         if self.config.background_tasks:
             await self.services.health.stop()
+            await self.instance_reconciler.stop()
             await self.services.reconciliation.stop()
         await self.engine.stop()
         await self.timers.stop()

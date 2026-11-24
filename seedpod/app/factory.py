@@ -196,6 +196,7 @@ from seedpod.runtime.dispatcher import Dispatcher
 from seedpod.runtime.effect_executor import EffectExecutor
 from seedpod.runtime.health import HealthMonitor
 from seedpod.runtime.instance_liveness import InstanceLivenessSweep
+from seedpod.runtime.instance_reconcile import InstanceReconciler
 from seedpod.runtime.reconciliation import ReconciliationService
 from seedpod.runtime.sse import SSEHub
 from seedpod.runtime.subprocess_manager import (
@@ -426,6 +427,7 @@ def build_app(
     # DR-0055: the level-triggered backstop for an instance's way to destruction. Reads the
     # database and the engine's task table only; every change goes through the Dispatcher.
     instance_liveness = InstanceLivenessSweep(uow, repos, dispatcher, engine, clock)
+    instance_reconciler = InstanceReconciler(uow, repos, dispatcher, providers, clock)
 
     # 9 -- thin application services (seedpod/app/services/) + the Round-5 runtime
     # services this component must wire (seam-d Decision 8 predates
@@ -483,6 +485,7 @@ def build_app(
         engine=engine,
         executor=executor,
         instance_liveness=instance_liveness,
+        instance_reconciler=instance_reconciler,
         services=services,
         api=api,
         http_transport=transport,
