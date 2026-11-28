@@ -200,9 +200,7 @@ class FakeDigitalOceanTransport(httpx.AsyncBaseTransport):
 
         if request.method == "POST" and route == "/tags":
             name = json.loads(request.content or b"{}")["name"]
-            if name in self.backend.tags:
-                return self._json(422, {"id": "unprocessable_entity", "message": "tag already exists"})
-            self.backend.tags.add(name)
+            self.backend.tags.add(name)  # the real API answers 201 for a tag that exists already, too
             return self._json(201, {"tag": {"name": name}})
 
         if request.method in ("POST", "PUT") and route.startswith("/firewalls") and not route.endswith("/droplets"):

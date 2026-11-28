@@ -684,11 +684,12 @@ class DigitalOceanProvider:
         if current is not None and shape(current) == shape(desired):
             return
         # A firewall may name only a tag that exists, and this tag exists only once an instance droplet
-        # has it. So the first create on an account makes it. 422 is DigitalOcean's "it exists already".
+        # has it. So the first create on an account makes it. DigitalOcean answers 201 whether or not the
+        # tag existed (seen on the real API, 2026-11-28).
         response, _ = await self._request_json(
             "POST", "/tags", json_body={"name": _INSTANCE_TAG}, timeout=self.config.request_timeout_s, command=command
         )
-        if response.status_code not in (201, 422):
+        if response.status_code != 201:
             self._raise_for_status(response, command)
         if current is None:
             response, _ = await self._request_json(
