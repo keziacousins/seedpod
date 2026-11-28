@@ -199,7 +199,8 @@ async def test_the_audit_lists_state_changes_oldest_first_within_scope(app, clie
     created = (await client.post("/api/instances", headers=alice, json=_body())).json()
     await _insert(app, "i2", "mine", owner=created["owner_key_id"], status="active", expires_at=NOW + timedelta(seconds=600))
     assert (await client.post("/api/instances/mine/renew", headers=alice)).status_code == 200
-    assert (await client.delete("/api/instances/mine", headers=alice)).status_code == 202
+    destroyed = await client.delete("/api/instances/mine", headers=alice)
+    assert destroyed.status_code == 202
 
     audit = (await client.get("/api/instances/mine/audit", headers=alice)).json()["audit"]
     assert [(a["from_state"], a["to_state"], a["event"]) for a in audit][-1] == (
