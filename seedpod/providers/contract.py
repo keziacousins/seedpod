@@ -466,16 +466,18 @@ class Reconcile:
     # Result: tuple[ReconciliationIntent, ...]
 
 
-# Bare instances (DR-0055 decision 3). Only tart implements these; every other provider refuses
+# Bare instances (DR-0055 decision 3). Only tart and digitalocean implement these; every other provider refuses
 # them as unsupported. They exist because ``DestroyInstance`` falls back to ``seedpod-{slug}`` and
 # ``ListInstances`` matches ``seedpod-``: a bare VM must never be reachable through either.
 
 
 @dataclass(frozen=True)
 class CreateBareInstance:
-    """MUST emit ``Progress(RESOURCE_ALLOCATED)`` before any backend call. Re-invocation adopts the
-    VM (``adopted_existing=True``), never a second one. The VM is named ``spi-{slug}``. ``image``
-    comes from a template, never from a request."""
+    """MUST emit ``Progress(RESOURCE_ALLOCATED)`` as soon as the VM's id is known: before any backend call on
+    tart (the name is ``spi-{slug}``); right after the POST on DigitalOcean, whose droplet id does not exist
+    earlier (its tag ``instance-uuid:{id}`` is the identity until then). Re-invocation adopts the VM
+    (``adopted_existing=True``), never a second one. The VM is named ``spi-{slug}``. ``image`` comes from a
+    template, never from a request."""
 
     instance_id: str  # the idempotency key
     slug: str
@@ -484,13 +486,17 @@ class CreateBareInstance:
     memory_mb: int
     disk_gb: int | None = None  # None leaves the image's disk
     tags: tuple[str, ...] = ()  # ignored by a provider with no tags (tart)
+    provider_size: str | None = None  # DigitalOcean's droplet size (required there); tart ignores it
+    region: str | None = None  # None: the provider's default; tart ignores it
     # Result: BareInstanceCreated
 
 
 @dataclass(frozen=True)
 class DestroyBareInstance:
     """Idempotent. Destroys the recorded ``tart_vm_name``, else ``spi-{slug}``, and REFUSES any name
-    that does not start with ``spi-``, so it can never reach a cluster's VM. ``DESTROYED`` means a
+    that does not start with ``spi-``, so it can never reach a cluster's VM. DigitalOcean destroys the
+    recorded ``droplet_id``, else the droplet tagged ``instance-uuid:{id}``, and REFUSES a droplet
+    without that tag (DR-0056). ``DESTROYED`` means a
     ``tart list`` that succeeded did not show the VM, or the VM was stopped and deleted. A failed
     ``list``, ``stop`` or ``delete`` raises: it is never ``DESTROYED``."""
 

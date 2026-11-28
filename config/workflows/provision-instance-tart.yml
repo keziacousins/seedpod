@@ -24,7 +24,8 @@ steps:
     uses: instance.create
     with: {provider: {from: spec.provider}, instance_id: {from: run.instance_id}, slug: {from: spec.slug},
            image: {from: spec.image}, vcpu: {from: spec.vcpu}, memory_mb: {from: spec.memory_mb},
-           disk_gb: {from: spec.disk_gb}}
+           disk_gb: {from: spec.disk_gb},
+           provider_size: {from: spec.provider_size}, region: {from: spec.region}}
     timeout_seconds: 120
     emit:
       event: InstanceResourcesAllocated

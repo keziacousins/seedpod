@@ -20,7 +20,10 @@ _SIZES = {"small": InstanceSize(vcpu=2, memory_mb=2048, hourly_price=0.5), "unpr
 _BASE = {"image": "img", "ssh_user": "admin", "entrypoint": "/opt/boot", "sizes": _SIZES}
 TEMPLATES = {
     "ubuntu": InstanceTemplate(provider="fake", lease_seconds=3600, max_lifetime_seconds=7200, **_BASE),
-    "remote": InstanceTemplate(provider="digitalocean", lease_seconds=3600, max_lifetime_seconds=7200, **_BASE),
+    "remote": InstanceTemplate(
+        provider="digitalocean", lease_seconds=3600, max_lifetime_seconds=7200,
+        **{**_BASE, "sizes": {n: z.model_copy(update={"provider_size": "s-1vcpu-1gb"}) for n, z in _SIZES.items()}},  # DR-0056
+    ),
 }
 
 

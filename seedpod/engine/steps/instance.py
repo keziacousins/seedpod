@@ -53,6 +53,8 @@ class LoadSpecOutput(BaseModel):
     vcpu: int
     memory_mb: int
     disk_gb: int | None
+    provider_size: str | None = None
+    region: str | None = None
     entrypoint: str
     ssh_user: str
     ssh_private_key_path: str
@@ -98,7 +100,8 @@ class InstanceLoadSpec(Step[LoadSpecParams, LoadSpecOutput]):
             raise _refuse(self.verb, str(e)) from e
         return LoadSpecOutput(
             provider=row.provider, slug=row.slug, image=template.image, vcpu=size.vcpu, memory_mb=size.memory_mb,
-            disk_gb=size.disk_gb, entrypoint=template.entrypoint, ssh_user=template.ssh_user,
+            disk_gb=size.disk_gb, provider_size=size.provider_size, region=template.region,
+            entrypoint=template.entrypoint, ssh_user=template.ssh_user,
             ssh_private_key_path=key_path, ssh_public_key=public_key,
         )
 
@@ -111,6 +114,8 @@ class CreateParams(BaseModel):
     vcpu: int
     memory_mb: int
     disk_gb: int | None
+    provider_size: str | None = None
+    region: str | None = None
 
 
 class CreateOutput(BaseModel):
@@ -130,6 +135,7 @@ class InstanceCreate(LateBoundProviderStep[CreateParams, CreateOutput]):
         return CreateBareInstance(
             instance_id=params.instance_id, slug=params.slug, image=params.image, vcpu=params.vcpu,
             memory_mb=params.memory_mb, disk_gb=params.disk_gb, tags=_TAGS,
+            provider_size=params.provider_size, region=params.region,
         )
 
     def output_from(self, value: object) -> CreateOutput:

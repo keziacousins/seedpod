@@ -3,7 +3,8 @@ title: DR-0055 — a bare VM is an instance, its own aggregate, and never a clus
 type: decision
 status: active
 created: 2026-11-23
-updated: 2026-11-23
+updated: 2026-11-28
+amended-by: DR-0056
 ---
 
 # DR-0055: a bare VM is an instance, not a cluster

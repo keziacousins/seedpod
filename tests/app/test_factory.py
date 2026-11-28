@@ -271,6 +271,7 @@ def test_load_workflow_definitions_parses_all_shipped_files():
         "provision-orbstack",
         "provision-tart",
         "provision-instance-tart",  # DR-0055
+        "provision-instance-digitalocean",
         "destroy-instance",
     }
     for wf in definitions.values():

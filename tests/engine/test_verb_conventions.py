@@ -121,6 +121,7 @@ FULLY_REGISTERED_WORKFLOWS = frozenset(
         # closing PARTIY-BACKLOG P0 #0 (a real deployment can reach a cluster).
         "deploy-waves.yml",
         "provision-instance-tart.yml",  # DR-0055: a bare VM, no k3s
+        "provision-instance-digitalocean.yml",
         "destroy-instance.yml",
     }
 )

@@ -1,8 +1,9 @@
 # destroy-instance -- destroy a bare VM on any provider (DR-0055).
 #
 # instance.load_infra reads {provider, slug, resource_ids} fresh at run time. The VM is found by its
-# recorded id, or by spi-{slug} if none was recorded (a create that died before recording, or a late
-# create). DestroyBareInstance refuses any name that is not spi-*, so it never reaches a cluster's VM.
+# recorded id, or by its instance marker if none was recorded (a create that died before recording, or
+# a late create): spi-{slug} on tart, the instance-uuid:{id} tag on DigitalOcean. DestroyBareInstance
+# refuses a VM that is not this instance's (DR-0056 decision 5), so it never reaches a cluster's VM.
 # A destroy that cannot finish fails the run: InstanceDestroyFailed, and the machine retries. An
 # unreachable provider parks the run; it never counts as destroyed.
 workflow: destroy-instance

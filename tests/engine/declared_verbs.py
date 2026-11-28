@@ -651,10 +651,11 @@ def _fixture(name: str, **fields: object) -> type[BaseModel]:
 InstLoadParams = _fixture("InstLoadParams", instance_id=str)  # also instance.load_infra's
 InstLoadSpecOutput = _fixture(
     "InstLoadSpecOutput", provider=str, slug=str, image=str, vcpu=int, memory_mb=int, disk_gb=int | None,
-    entrypoint=str, ssh_user=str, ssh_private_key_path=str, ssh_public_key=str,
+    provider_size=(str | None, None), region=(str | None, None), entrypoint=str, ssh_user=str, ssh_private_key_path=str, ssh_public_key=str,
 )
 InstCreateParams = _fixture(
-    "InstCreateParams", provider=str, instance_id=str, slug=str, image=str, vcpu=int, memory_mb=int, disk_gb=int | None
+    "InstCreateParams", provider=str, instance_id=str, slug=str, image=str, vcpu=int, memory_mb=int, disk_gb=int | None,
+    provider_size=(str | None, None), region=(str | None, None),
 )
 InstCreateOutput = _fixture(
     "InstCreateOutput", resource_ids=Mapping[str, str], address=(str | None, None), adopted_existing=(bool, False)

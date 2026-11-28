@@ -38,6 +38,7 @@ _SSH_KEY = re.compile(
 # These two reach a command line as arguments, so neither may start with `-`.
 _SSH_USER = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*")
 _IMAGE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/:@-]*")
+_PROVIDER_NAME = r"^[a-z0-9-]+$"  # a droplet size or a region: it goes into a JSON body, not argv, but stay plain
 
 
 def _validate_ssh_user(value: str) -> str:
@@ -72,6 +73,7 @@ class InstanceSize(BaseModel):
     memory_mb: int = Field(gt=0)
     disk_gb: int | None = Field(default=None, gt=0)  # None leaves the image's disk
     hourly_price: float | None = Field(default=None, ge=0)  # None: admission refuses the size (decision 6)
+    provider_size: str | None = Field(default=None, pattern=_PROVIDER_NAME)  # DigitalOcean: the droplet size (DR-0056)
 
 
 class InstanceTemplate(BaseModel):
@@ -84,6 +86,7 @@ class InstanceTemplate(BaseModel):
     ssh_user: str
     entrypoint: str
     sizes: dict[str, InstanceSize] = Field(min_length=1)
+    region: str | None = Field(default=None, pattern=_PROVIDER_NAME)  # None: the provider's default region
     lease_seconds: int = Field(gt=0)  # the default lease (decision 7)
     max_lifetime_seconds: int = Field(gt=0)  # `hard_expires_at` is this long after creation
 
@@ -95,4 +98,10 @@ class InstanceTemplate(BaseModel):
     def _lease_fits_lifetime(self) -> InstanceTemplate:
         if self.max_lifetime_seconds < self.lease_seconds:
             raise ValueError("max_lifetime_seconds must be at least lease_seconds")
+        return self
+
+    @model_validator(mode="after")
+    def _digitalocean_sizes_are_named(self) -> InstanceTemplate:
+        if self.provider == "digitalocean" and any(size.provider_size is None for size in self.sizes.values()):
+            raise ValueError("a digitalocean template names a provider_size for every size (DR-0056)")
         return self

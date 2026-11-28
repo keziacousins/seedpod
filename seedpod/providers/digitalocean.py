@@ -126,13 +126,17 @@ from seedpod.providers.contract import (
     RESOURCE_ALLOCATED,
     ApplyFirewalls,
     AssignToProject,
+    BareInstanceCreated,
+    CreateBareInstance,
     CreateInstance,
+    DestroyBareInstance,
     DestroyInstance,
     DestroyOutcome,
     DestroyStatus,
     InstanceCreated,
     InstanceState,
     InstanceSummary,
+    ListBareInstances,
     ListInstances,
     ProbeDestruction,
     ProbeInstance,
@@ -146,6 +150,10 @@ from seedpod.providers.contract import (
 __all__ = ["DigitalOceanConfig", "DigitalOceanProvider"]
 
 _HOST = "api.digitalocean.com"
+
+# DR-0056: a bare instance's droplet carries exactly these tags, never `seedpod-managed`.
+_INSTANCE_TAG = "seedpod-instance"
+_INSTANCE_FIREWALL = "seedpod-instances"
 
 # Cluster states (seedpod/core/records.py ClusterState, hyphenated wire values) that are
 # NOT candidates for Phase B orphan detection: terminal-ish/self-explaining drift. Mirrors
@@ -259,6 +267,9 @@ class DigitalOceanProvider:
             Reconcile,
             ApplyFirewalls,
             AssignToProject,
+            CreateBareInstance,
+            DestroyBareInstance,
+            ListBareInstances,  # DR-0055, DR-0056; probes serve both
         }
     )
 
@@ -312,6 +323,12 @@ class DigitalOceanProvider:
             return self._apply_firewalls(cmd)
         if isinstance(cmd, AssignToProject):
             return self._assign_to_project_command(cmd)
+        if isinstance(cmd, CreateBareInstance):
+            return self._create_bare_instance(cmd)
+        if isinstance(cmd, DestroyBareInstance):
+            return self._destroy_bare_instance(cmd)
+        if isinstance(cmd, ListBareInstances):
+            return self._list_bare_instances(cmd)
         raise AssertionError(f"unreachable: {cmd!r} is in `supported` but has no handler")  # pragma: no cover
 
     # ------------------------------------------------------------------
@@ -368,28 +385,7 @@ class DigitalOceanProvider:
         }
         if vpc_uuid:
             payload["vpc_uuid"] = vpc_uuid
-        response, body = await self._request_json(
-            "POST", "/droplets", json_body=payload, timeout=self.config.create_timeout_s, command="create_instance"
-        )
-        if response.status_code == 422:
-            # Row 14: DO create quota exceeded ⇒ Permanent/CAPACITY. DO's droplet-limit error
-            # has no distinct HTTP status from other validation failures (both are 422); this
-            # is the one place this provider treats a structural DO response shape as
-            # capacity rather than routing through classify_http's generic INVALID_INPUT
-            # fallback — no free-form message sniffing, keyed on the status DO actually uses
-            # for "no more droplets can be created" in practice.
-            message = str(body.get("message", "")) if isinstance(body, dict) else ""
-            raise PermanentError(
-                f"digitalocean.create_instance: {message or 'droplet creation rejected (422)'}",
-                code=ErrorCode.CAPACITY,
-                provider=self.name,
-                command="create_instance",
-                detail={"status": "422", "message": message},
-            )
-        if response.status_code not in (200, 201, 202):
-            self._raise_for_status(response, "create_instance")
-
-        droplet = body["droplet"]
+        droplet = await self._post_droplet(payload, command="create_instance")
         resource_ids = {"droplet_id": str(droplet["id"])}
         # Tag-before-boot: DO assigns `tags` atomically in the create payload above — no
         # separate tagging call, so there is no window where the droplet exists untagged.
@@ -573,6 +569,140 @@ class DigitalOceanProvider:
         yield Result(tuple(intents))
 
     # ------------------------------------------------------------------
+    # commands — bare instances (DR-0055, DR-0056)
+    # ------------------------------------------------------------------
+
+    async def _list_droplets(self, tag: str, *, command: str) -> list[dict]:
+        response, body = await self._request_json(
+            "GET", f"/droplets?tag_name={tag}&per_page=200", timeout=self.config.list_timeout_s, command=command
+        )
+        if response.status_code != 200:
+            self._raise_for_status(response, command)
+        return body.get("droplets") or []
+
+    async def _create_bare_instance(self, cmd: CreateBareInstance) -> AsyncIterator[ProviderEvent]:
+        """A droplet id exists only after the POST, so RESOURCE_ALLOCATED follows it. Identity is the tag
+        ``instance-uuid:{id}``, set in the POST itself: a create that dies in between is found by that tag."""
+        command = "create_bare_instance"
+        if not cmd.provider_size:
+            raise PermanentError(
+                f"digitalocean.{command}: the template names no provider_size",
+                code=ErrorCode.INVALID_INPUT, provider=self.name, command=command,
+            )
+        await self._ensure_instance_firewall(command=f"{command}.firewall")  # before any droplet exists
+        tag = f"instance-uuid:{cmd.instance_id}"
+        existing = await self._list_droplets(tag, command=f"{command}.adopt_check")
+        if existing:
+            droplet = existing[0]
+        else:
+            payload = {
+                "name": f"spi-{cmd.slug}",
+                "region": cmd.region or self.config.default_region,
+                "size": cmd.provider_size,
+                "image": int(cmd.image) if cmd.image.isdigit() else cmd.image,  # a snapshot id is a number
+                "ssh_keys": [await self._resolve_ssh_key_id(command=command)],
+                "tags": [_INSTANCE_TAG, tag],
+            }
+            droplet = await self._post_droplet(payload, command=command)
+        resource_ids = {"droplet_id": str(droplet["id"])}
+        yield Progress(phase=RESOURCE_ALLOCATED, data={"resource_ids": resource_ids})
+        yield Result(
+            BareInstanceCreated(resource_ids=resource_ids, address=_public_ipv4(droplet), adopted_existing=bool(existing))
+        )
+
+    async def _destroy_bare_instance(self, cmd: DestroyBareInstance) -> AsyncIterator[ProviderEvent]:
+        """Reads the droplet first and deletes it only if it carries this instance's tag (DR-0056 decision 5).
+        Absence is read only from a call that succeeded (a 404, or an empty tag list)."""
+        command, tag, droplet_id = "destroy_bare_instance", f"instance-uuid:{cmd.instance_id}", cmd.resource_ids.get("droplet_id")
+        if droplet_id:
+            response, body = await self._request_json(
+                "GET", f"/droplets/{droplet_id}", timeout=self.config.request_timeout_s, command=command
+            )
+            if response.status_code == 404:
+                yield Result(DestroyOutcome(status=DestroyStatus.DESTROYED, note="droplet already absent"))
+                return
+            if response.status_code != 200:
+                self._raise_for_status(response, command)
+            droplet = body["droplet"]
+        else:
+            found = await self._list_droplets(tag, command=f"{command}.lookup")
+            if not found:
+                yield Result(DestroyOutcome(status=DestroyStatus.DESTROYED, note="no droplet found"))
+                return
+            droplet = found[0]
+        if tag not in (droplet.get("tags") or ()):
+            raise PermanentError(
+                f"digitalocean.{command}: refusing droplet {droplet['id']}: it does not carry {tag!r}",
+                code=ErrorCode.INVALID_INPUT, provider=self.name, command=command, detail={"droplet_id": str(droplet["id"])},
+            )
+        response, _ = await self._request_json(
+            "DELETE", f"/droplets/{droplet['id']}", timeout=self.config.delete_timeout_s, command=command
+        )
+        if response.status_code not in (204, 404):
+            self._raise_for_status(response, command)
+        yield Result(DestroyOutcome(status=DestroyStatus.DESTROYED))
+
+    async def _list_bare_instances(self, cmd: ListBareInstances) -> AsyncIterator[ProviderEvent]:
+        droplets = await self._list_droplets(_INSTANCE_TAG, command="list_bare_instances")
+        yield Result(
+            tuple(InstanceSummary(name=d["name"], resource_ids={"droplet_id": str(d["id"])}) for d in droplets)
+        )
+
+    async def _ensure_instance_firewall(self, *, command: str) -> None:
+        """``seedpod-instances``, attached by the tag ``seedpod-instance``: SSH in from the configured sources,
+        everything out. Created if missing, replaced if its rules differ, and any failure raises (DR-0056 decision 1)."""
+        everywhere = {"addresses": ["0.0.0.0/0", "::/0"]}
+        desired = {
+            "name": _INSTANCE_FIREWALL,
+            "inbound_rules": [
+                {"protocol": "tcp", "ports": "22", "sources": {"addresses": list(self.config.ssh_allowed_sources)}}
+            ],
+            "outbound_rules": [
+                {"protocol": "tcp", "ports": "all", "destinations": everywhere},
+                {"protocol": "udp", "ports": "all", "destinations": everywhere},
+                {"protocol": "icmp", "destinations": everywhere},
+            ],
+            "tags": [_INSTANCE_TAG],
+        }
+
+        def shape(fw: dict) -> object:  # what we set, without the empty fields DigitalOcean adds on read
+            rule = lambda r, end: (  # noqa: E731
+                r["protocol"], "all" if r.get("ports") in (None, "", "0") else r["ports"], tuple(sorted(r[end].get("addresses") or ()))
+            )
+            return (
+                sorted(rule(r, "sources") for r in fw.get("inbound_rules") or ()),
+                sorted(rule(r, "destinations") for r in fw.get("outbound_rules") or ()),
+                sorted(fw.get("tags") or ()),
+            )
+
+        response, body = await self._request_json(
+            "GET", "/firewalls?per_page=200", timeout=self.config.list_timeout_s, command=command
+        )
+        if response.status_code != 200:
+            self._raise_for_status(response, command)
+        current = next((fw for fw in body.get("firewalls") or [] if fw.get("name") == _INSTANCE_FIREWALL), None)
+        if current is not None and shape(current) == shape(desired):
+            return
+        # A firewall may name only a tag that exists, and this tag exists only once an instance droplet
+        # has it. So the first create on an account makes it. 422 is DigitalOcean's "it exists already".
+        response, _ = await self._request_json(
+            "POST", "/tags", json_body={"name": _INSTANCE_TAG}, timeout=self.config.request_timeout_s, command=command
+        )
+        if response.status_code not in (201, 422):
+            self._raise_for_status(response, command)
+        if current is None:
+            response, _ = await self._request_json(
+                "POST", "/firewalls", json_body=desired, timeout=self.config.create_timeout_s, command=command
+            )
+        else:
+            put = {**desired, "droplet_ids": current.get("droplet_ids") or []}
+            response, _ = await self._request_json(
+                "PUT", f"/firewalls/{current['id']}", json_body=put, timeout=self.config.request_timeout_s, command=command
+            )
+        if response.status_code not in (200, 201, 202):
+            self._raise_for_status(response, command)
+
+    # ------------------------------------------------------------------
     # internals
     # ------------------------------------------------------------------
 
@@ -599,6 +729,29 @@ class DigitalOceanProvider:
                 if score < best_score:
                     best_score, best_match = score, droplet_size
         return best_match or self.config.default_droplet_size
+
+    async def _post_droplet(self, payload: dict, *, command: str) -> dict:
+        response, body = await self._request_json(
+            "POST", "/droplets", json_body=payload, timeout=self.config.create_timeout_s, command=command
+        )
+        if response.status_code == 422:
+            # Row 14: DO create quota exceeded ⇒ Permanent/CAPACITY. DO's droplet-limit error
+            # has no distinct HTTP status from other validation failures (both are 422); this
+            # is the one place this provider treats a structural DO response shape as
+            # capacity rather than routing through classify_http's generic INVALID_INPUT
+            # fallback — no free-form message sniffing, keyed on the status DO actually uses
+            # for "no more droplets can be created" in practice.
+            message = str(body.get("message", "")) if isinstance(body, dict) else ""
+            raise PermanentError(
+                f"digitalocean.{command}: {message or 'droplet creation rejected (422)'}",
+                code=ErrorCode.CAPACITY,
+                provider=self.name,
+                command=command,
+                detail={"status": "422", "message": message},
+            )
+        if response.status_code not in (200, 201, 202):
+            self._raise_for_status(response, command)
+        return body["droplet"]
 
     async def _resolve_ssh_key_id(self, *, command: str) -> int:
         """Honestly named replacement for v1's misleadingly-named ``_get_or_create_ssh_key``

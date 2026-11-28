@@ -80,9 +80,9 @@ def undo_for(cmd: ProviderCommand, observed: Observed) -> ProviderCommand | None
             return None
 
         case CreateBareInstance(instance_id=instance_id, slug=slug):
-            # DR-0055. Never ``None``, unlike ``CreateInstance``: the VM's name (``spi-{slug}``) is
-            # known before any backend call, so even a create that never recorded an id has a
-            # destroy that finds it by name.
+            # DR-0055. Never ``None``, unlike ``CreateInstance``: the VM's marker is known before any
+            # backend call (``spi-{slug}`` on tart, the ``instance-uuid:{id}`` tag on DigitalOcean), so
+            # even a create that never recorded an id has a destroy that finds it by that marker.
             ids = observed.value.resource_ids if observed.value is not None else observed.data  # type: ignore[attr-defined]
             return DestroyBareInstance(instance_id=instance_id, slug=slug, resource_ids=dict(ids))
 
