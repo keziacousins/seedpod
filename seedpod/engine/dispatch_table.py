@@ -53,8 +53,7 @@ class WorkflowDispatch:
                 return (f"provision-instance-{instance.provider}", {"instance_id": eff.aggregate_id})
             case "destroy":
                 return ("destroy-instance", {"instance_id": eff.aggregate_id})
-            case _:
-                raise ValueError(f"unknown abstract workflow verb for an instance: {eff.workflow!r}")
+        raise ValueError(f"unknown abstract workflow verb for an instance: {eff.workflow!r}")
 
     def resolve(self, eff: RunWorkflow, cluster: ClusterRecord) -> tuple[str, dict]:
         # Every verb below is a CLUSTER verb (instance workflows resolve in `resolve_instance`).

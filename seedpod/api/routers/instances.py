@@ -166,6 +166,29 @@ async def create_instance(
     return _serialize(row)
 
 
+@router.get("/instance-templates")
+async def list_instance_templates(
+    request: Request, api_key=Depends(require_permission("instances:read"))  # noqa: B008
+) -> dict[str, Any]:
+    """What a create form offers: the templates whose provider this app has, and their sizes. Never the
+    image, entrypoint, SSH user or provider size (a template's internals stay in the config)."""
+    app = get_app(request)
+    return {
+        "templates": [
+            {
+                "name": name, "provider": t.provider, "region": t.region, "lease_seconds": t.lease_seconds,
+                "max_lifetime_seconds": t.max_lifetime_seconds,
+                "sizes": [
+                    {"name": n, "vcpu": z.vcpu, "memory_mb": z.memory_mb, "disk_gb": z.disk_gb, "hourly_price": z.hourly_price}
+                    for n, z in t.sizes.items()
+                ],
+            }
+            for name, t in sorted(app.instance_templates.items())
+            if t.provider in app.providers
+        ]
+    }
+
+
 @router.get("/instances")
 async def list_instances(
     request: Request, api_key=Depends(require_permission("instances:read"))  # noqa: B008
@@ -184,6 +207,25 @@ async def get_instance(
     app = get_app(request)
     async with app.uow() as tx:
         return _serialize(_in_scope(app, tx, api_key, id_or_slug))
+
+
+@router.get("/instances/{id_or_slug}/audit")
+async def instance_audit(
+    id_or_slug: str, request: Request, api_key=Depends(require_permission("instances:read"))  # noqa: B008
+) -> dict[str, Any]:
+    """The instance's state changes, oldest first. The same scope rules as ``GET`` one."""
+    app = get_app(request)
+    async with app.uow() as tx:
+        rows = app.repos.instance_state_audits.list_for_instance(tx, _in_scope(app, tx, api_key, id_or_slug).id)
+    return {
+        "audit": [
+            {
+                "from_state": r.from_state, "to_state": r.to_state, "event": r.event, "actor": r.actor,
+                "reason": r.reason, "created_at": _iso(r.created_at),
+            }
+            for r in reversed(rows)
+        ]
+    }
 
 
 async def _command(app: Any, api_key: ApiKeyRow, id_or_slug: str, event_type: type) -> dict[str, Any]:

@@ -134,7 +134,8 @@ async def test_a_key_sees_only_its_own_instances_and_a_wildcard_key_sees_all(app
         for by in (created["id"], created["slug"]):
             assert (await client.get(f"/api/instances/{by}", headers=headers)).status_code == (200 if visible else 404)
     assert (await client.post(f"/api/instances/{created['id']}/renew", headers=bob)).status_code == 404
-    assert (await client.delete(f"/api/instances/{created['id']}", headers=bob)).status_code == 404
+    deleted = await client.delete(f"/api/instances/{created['id']}", headers=bob)
+    assert deleted.status_code == 404
     assert (await client.get("/api/instances/absent", headers=alice)).status_code == 404
 
 
@@ -163,7 +164,8 @@ async def test_renew_extends_the_lease_and_destroy_begins_destruction(app, clien
     destroyed = await client.delete("/api/instances/box", headers=headers)
     assert (destroyed.status_code, destroyed.json()["status"]) == (202, "destroying")
     assert (await client.post("/api/instances/box/renew", headers=headers)).status_code == 409
-    assert (await client.delete("/api/instances/box", headers=headers)).status_code == 409
+    again = await client.delete("/api/instances/box", headers=headers)
+    assert again.status_code == 409
 
 
 @pytest.mark.parametrize("over", [{"status": "failed"}, {"status": "active", "expires_at": NOW}])
@@ -177,3 +179,38 @@ async def test_a_key_without_the_permission_is_403(app, client):
     headers, _ = await _key(app, permissions=("instances:read",))
     assert (await client.post("/api/instances", headers=headers, json=_body())).status_code == 403
     assert (await client.get("/api/instances", headers=headers)).status_code == 200
+
+
+async def test_the_template_list_shows_configured_providers_and_hides_internals(app, client):
+    headers, _ = await _key(app, permissions=("instances:read",))
+    response = await client.get("/api/instance-templates", headers=headers)
+    assert response.status_code == 200, response.text
+    (template,) = response.json()["templates"]  # "remote" is digitalocean, which is not configured here
+    assert {k: v for k, v in template.items() if k != "sizes"} == {
+        "name": "ubuntu", "provider": "fake", "region": None, "lease_seconds": 3600, "max_lifetime_seconds": 7200,
+    }
+    assert template["sizes"][0] == {"name": "small", "vcpu": 2, "memory_mb": 2048, "disk_gb": None, "hourly_price": 0.5}
+    assert not {"image", "entrypoint", "ssh_user", "provider_size"} & (template.keys() | template["sizes"][0].keys())
+    assert (await client.get("/api/instance-templates", headers=(await _key(app, "x", permissions=("clusters:read",)))[0])).status_code == 403
+
+
+async def test_the_audit_lists_state_changes_oldest_first_within_scope(app, client):
+    alice, _ = await _key(app, "alice")
+    created = (await client.post("/api/instances", headers=alice, json=_body())).json()
+    await _insert(app, "i2", "mine", owner=created["owner_key_id"], status="active", expires_at=NOW + timedelta(seconds=600))
+    assert (await client.post("/api/instances/mine/renew", headers=alice)).status_code == 200
+    assert (await client.delete("/api/instances/mine", headers=alice)).status_code == 202
+
+    audit = (await client.get("/api/instances/mine/audit", headers=alice)).json()["audit"]
+    assert [(a["from_state"], a["to_state"], a["event"]) for a in audit][-1] == (
+        "active", "destroying", "InstanceDestroyRequested",
+    )
+    assert audit[0]["event"] == "InstanceRenewRequested" and {"actor", "reason", "created_at"} <= audit[0].keys()
+    first = (await client.get(f"/api/instances/{created['id']}/audit", headers=alice)).json()["audit"]
+    assert [(a["from_state"], a["to_state"]) for a in first] == [("new", "provisioning")]
+
+    bob, _ = await _key(app, "bob")
+    assert (await client.get(f"/api/instances/{created['id']}/audit", headers=bob)).status_code == 404
+    staging, _ = await _key(app, "stg", environment="staging", permissions=("*",))
+    response = await client.get(f"/api/instances/{created['id']}/audit", headers=staging)
+    assert response.status_code == 403 and "'staging'" in response.json()["detail"]

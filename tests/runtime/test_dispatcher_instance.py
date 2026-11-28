@@ -229,7 +229,7 @@ async def test_audit_and_persist_commit_or_roll_back_together(db, uow, repos, di
     class Boom(Exception):
         pass
 
-    with pytest.raises(Boom):
+    async def apply_then_fail() -> None:
         async with uow() as tx:
             await dispatcher.apply(
                 "instance", "i1",
@@ -237,6 +237,9 @@ async def test_audit_and_persist_commit_or_roll_back_together(db, uow, repos, di
                 tx=tx,
             )
             raise Boom  # the caller's transaction fails AFTER apply wrote everything
+
+    with pytest.raises(Boom):
+        await apply_then_fail()
 
     assert _counts(db) == before
     assert (await _get(uow, repos)).status == "provisioning"

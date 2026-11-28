@@ -69,3 +69,34 @@ export function formatDate(isoString) {
 
   return date.toLocaleDateString();
 }
+
+/**
+ * Format a length of time in whole seconds, such as 5430 -> "1h 30m 30s".
+ * Zero units are left out, and 0 is "0s".
+ * @param {number} seconds
+ * @returns {string}
+ */
+export function formatDuration(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return "-";
+  const left = Math.floor(seconds);
+  const parts = [
+    [Math.floor(left / 86400), "d"],
+    [Math.floor((left % 86400) / 3600), "h"],
+    [Math.floor((left % 3600) / 60), "m"],
+    [left % 60, "s"],
+  ].filter(([n]) => n > 0);
+  return parts.length ? parts.map(([n, u]) => `${n}${u}`).join(" ") : "0s";
+}
+
+/**
+ * Time left until a timestamp, as a duration, or "Expired" once it has passed.
+ * @param {string} isoString - ISO timestamp from server
+ * @param {number} [now] - ms since the epoch; a parameter so a test can fix it
+ * @returns {string}
+ */
+export function formatRemaining(isoString, now = Date.now()) {
+  const date = parseUTC(isoString);
+  if (!date) return "-";
+  const ms = date.getTime() - now;
+  return ms <= 0 ? "Expired" : formatDuration(ms / 1000);
+}

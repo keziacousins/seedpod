@@ -48,7 +48,11 @@ class ApiClient {
 
     if (!response.ok) {
       const error = await response.json().catch(() => ({ detail: 'Unknown error' }));
-      throw new Error(error.detail || `HTTP ${response.status}`);
+      // A 422 from request validation sends `detail` as a list of {loc, msg}.
+      const detail = Array.isArray(error.detail)
+        ? error.detail.map((d) => `${(d.loc || []).slice(1).join('.')}: ${d.msg}`).join('; ')
+        : error.detail;
+      throw new Error(detail || `HTTP ${response.status}`);
     }
 
     // Handle empty responses
