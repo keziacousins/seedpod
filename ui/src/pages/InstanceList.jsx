@@ -14,11 +14,7 @@ const when = (value, row) =>
   value && row.status !== "destroyed" ? <span title={formatDateTime(value)}>{formatRemaining(value)}</span> : "-";
 
 const columns = [
-  {
-    key: "slug",
-    label: "Slug",
-    render: (slug, row) => <a href={`/instances/${row.id}`}>{slug}</a>,
-  },
+  { key: "slug", label: "Slug" },
   { key: "status", label: "Status", render: (s) => <StatusBadge status={s} /> },
   { key: "provider", label: "Provider" },
   { key: "environment", label: "Environment" },
@@ -89,6 +85,7 @@ export function InstanceList() {
         columns={columns}
         data={showDestroyed ? instances : instances.filter((i) => i.status !== "destroyed")}
         keyField="id"
+        onRowClick={(row) => route(`/instances/${row.id}`)}
       />
       {showCreate && (
         <CreateInstanceModal
