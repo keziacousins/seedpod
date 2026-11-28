@@ -66,6 +66,19 @@ inside ``EffectExecutor``").**
         called AFTER ``executor.start()``) is the backstop for any run whose
         hand-off never landed.
 
+   **Aggregate (DR-0055).** Both effects name their run's aggregate (``aggregate_type`` +
+   ``aggregate_id``): ``"cluster"`` or ``"instance"``; ``_target_of`` raises for anything else
+   before any read or write. An instance run is inserted with ``instance_id`` and no
+   ``cluster_id``, resolved by ``dispatch.resolve_instance``, and holds its own one-active-run
+   slot (``ux_wr_one_active_instance``). A cluster and an instance with the same id string are
+   two aggregates: each lookup is on its own column.
+
+   **Stale instance rows.** An instance ``provision`` row is admitted only while the instance is
+   ``provisioning``, and a ``destroy`` row only while it is ``destroying``. Any other state means
+   the row was overtaken (a provision held back until after the instance was destroyed, say): it
+   is marked ``done`` with NO run, in the admission transaction, and logged. A ``destroy`` that
+   meets a live provision run takes the cluster's branch 1 below, unchanged.
+
    ``CancelWorkflow`` admission: ``UPDATE workflow_runs SET cancel_requested=1
    WHERE cluster_id=? AND status IN (pending,running,blocked,compensating);
    trip the in-memory token; mark row done`` -- implemented by looking up
@@ -132,7 +145,7 @@ from sqlalchemy.exc import IntegrityError
 from seedpod.core.clock import Clock
 from seedpod.core.codec import canonical_json, decode_effect
 from seedpod.core.effects import CancelWorkflow, Notify, RunWorkflow
-from seedpod.core.records import ClusterRecord
+from seedpod.core.records import ClusterRecord, InstanceRecord, InstanceStatus
 from seedpod.data.repositories import OutboxRow, Repositories, WorkflowRunRow
 from seedpod.data.uow import UnitOfWork
 from seedpod.engine.dispatch_table import WorkflowDispatch
@@ -162,6 +175,20 @@ _DEFAULT_POLL_INTERVAL = 1.0  # seconds -- same reasoning as TimerService's defa
 _STOP_GRACE_SECONDS = 5.0
 _DEFAULT_RETENTION_DAYS = 7  # DR-0002
 _HOUSEKEEPING_INTERVAL = timedelta(hours=1)  # DR-0002: "hourly"
+
+
+def _target_of(eff: RunWorkflow | CancelWorkflow) -> tuple[str, str]:
+    """``(aggregate_type, aggregate_id)`` a ``RunWorkflow``/``CancelWorkflow`` belongs to (DR-0055).
+    Anything but ``"cluster"`` or ``"instance"`` raises BEFORE any lookup or run insert. The raise
+    lands in ``_process_row``'s drain-failure path: backoff, then ``dead``, with the row's
+    ``next available_at`` in the future, so it cannot starve the rows behind it."""
+    if eff.aggregate_type in ("cluster", "instance"):
+        return eff.aggregate_type, eff.aggregate_id
+    raise ValueError(f"{eff.kind}: unknown aggregate type {eff.aggregate_type!r}")
+
+
+# The state an instance must be in for a run of that workflow to be admitted (see the module docstring).
+_INSTANCE_RUN_STATE = {"provision": InstanceStatus.PROVISIONING, "destroy": InstanceStatus.DESTROYING}
 
 
 class HubLike(Protocol):
@@ -386,13 +413,28 @@ class EffectExecutor:
     # -------------------------------------------------------------------------
 
     async def _drain_run_workflow(self, row: OutboxRow, eff: RunWorkflow) -> None:
+        aggregate, aggregate_id = _target_of(eff)
         new_run_id = str(uuid4())
         try:
             async with self._uow() as t:
-                cluster = self._repos.clusters.load(t, eff.cluster_id)
-                if cluster is None:
-                    raise LookupError(f"RunWorkflow admission: no cluster {eff.cluster_id!r} to resolve provider")
-                concrete_name, args = self._dispatch.resolve(eff, cluster)
+                if aggregate == "cluster":
+                    owner: ClusterRecord | InstanceRecord | None = self._repos.clusters.load(t, aggregate_id)
+                else:
+                    owner = self._repos.instances.load(t, aggregate_id)
+                if owner is None:
+                    raise LookupError(f"RunWorkflow admission: no {aggregate} {aggregate_id!r} to resolve provider")
+                if isinstance(owner, ClusterRecord):
+                    concrete_name, args = self._dispatch.resolve(eff, owner)
+                else:
+                    concrete_name, args = self._dispatch.resolve_instance(eff, owner)
+                    if owner.state is not _INSTANCE_RUN_STATE[eff.workflow]:
+                        # Overtaken by what happened since it was written. Done, with no run.
+                        self._repos.outbox.mark_done(t, row.effect_id, done_at=self._clock.now())
+                        _log.warning(
+                            "outbox row %s: instance %r is %r, not admitting %s", row.effect_id, aggregate_id,
+                            owner.state.value, eff.workflow,
+                        )
+                        return
                 definitions = self._engine.definitions
                 if concrete_name not in definitions:
                     raise LookupError(f"RunWorkflow admission: unknown workflow definition {concrete_name!r}")
@@ -400,7 +442,8 @@ class EffectExecutor:
                     id=new_run_id,
                     workflow=concrete_name,
                     workflow_version=definitions[concrete_name].version,
-                    cluster_id=eff.cluster_id,
+                    cluster_id=aggregate_id if aggregate == "cluster" else None,
+                    instance_id=aggregate_id if aggregate == "instance" else None,
                     deployment_id=eff.deployment_id,
                     dedupe_key=row.effect_id,
                     args=dict(args),
@@ -416,12 +459,12 @@ class EffectExecutor:
                 )
                 inserted = self._run_repo.insert_admitted(t, new_row)
         except IntegrityError:
-            # ux_wr_one_active, NOT dedupe_key (that's ON CONFLICT DO NOTHING,
-            # handled above without raising) -- Conflict 2 rule 3 (DR-0011).
-            # `cluster` is guaranteed bound here: the only raise reachable before
-            # `insert_admitted` is the `cluster is None` LookupError above, which
+            # ux_wr_one_active (or its instance twin), NOT dedupe_key (that's ON CONFLICT DO
+            # NOTHING, handled above without raising) -- Conflict 2 rule 3 (DR-0011).
+            # `owner` is guaranteed bound here: the only raise reachable before
+            # `insert_admitted` is the `owner is None` LookupError above, which
             # this except clause does NOT catch.
-            await self._handle_active_run_conflict(row, eff, cluster)
+            await self._handle_active_run_conflict(row, eff, owner)
             return
 
         target_run_id = new_run_id
@@ -441,7 +484,9 @@ class EffectExecutor:
         except Exception:  # noqa: BLE001 -- best-effort hand-off; resume_inflight() is the backstop
             _log.exception("engine hand-off failed for run %s (resume_inflight() is the backstop)", target_run_id)
 
-    async def _handle_active_run_conflict(self, row: OutboxRow, eff: RunWorkflow, cluster: ClusterRecord) -> None:
+    async def _handle_active_run_conflict(
+        self, row: OutboxRow, eff: RunWorkflow, owner: ClusterRecord | InstanceRecord
+    ) -> None:
         """docs/decisions/DR-0011-admitter-wait-and-run-conflict.md, Clause 1 --
         Conflict 2 rule 3's ``ux_wr_one_active`` branch, generalized to three
         branches (see the module docstring's numbered section 2 for the
@@ -469,16 +514,20 @@ class EffectExecutor:
            broadcast): ``effect_id = "{row.effect_id}#run_conflict"``
            (``ON CONFLICT DO NOTHING``, so a crash between this INSERT and the
            done-mark replays without duplicating the Notify), aggregate
-           ``cluster/{cluster_id}@0#0``, ``environment := cluster.environment``
-           (drain time IS this Notify's decision time -- DR-0010 extension).
+           ``cluster/{cluster_id}@0#0`` (``instance/...`` for an instance),
+           ``environment := owner.environment`` (drain time IS this Notify's decision
+           time -- DR-0010 extension).
            Delivery then follows the universal one-attempt notify drain
            (``_drain_notify`` above) on a later pass -- one Notify delivery
            path, one audit trail (Conflict 1's "every effect is a row").
         """
+        aggregate, aggregate_id = _target_of(eff)
         async with self._uow() as t:
-            active = self._run_repo.active_for_cluster(t, eff.cluster_id)
+            active = self._active_run(t, aggregate, aggregate_id)
 
-        if eff.workflow == "destroy" and active is not None:
+        # An instance run is cancelled once. Each repeat would arm another hard-cancel backstop,
+        # which kills an undo that takes longer than the grace, so destroy would never start.
+        if eff.workflow == "destroy" and active is not None and (aggregate == "cluster" or not active.cancel_requested):
             await self._engine.cancel(active.id)
 
         already_unwinding = active is None or active.cancel_requested or eff.workflow == "destroy"
@@ -494,17 +543,17 @@ class EffectExecutor:
             topic="run_conflict",
             payload={
                 "workflow": eff.workflow,
-                "cluster_id": eff.cluster_id,
+                f"{aggregate}_id": aggregate_id,
                 "deployment_id": eff.deployment_id,
                 "blocked_by_run_id": active.id if active is not None else None,
             },
-            environment=cluster.environment,
+            environment=owner.environment,
         )
         notify_row = OutboxRow(
             seq=None,
             effect_id=f"{row.effect_id}#run_conflict",
-            aggregate_type="cluster",
-            aggregate_id=eff.cluster_id,
+            aggregate_type=aggregate,
+            aggregate_id=aggregate_id,
             to_version=0,
             ordinal=0,
             kind="notify",
@@ -525,9 +574,15 @@ class EffectExecutor:
     # cancel_workflow
     # -------------------------------------------------------------------------
 
+    def _active_run(self, t, aggregate: str, aggregate_id: str) -> WorkflowRunRow | None:
+        if aggregate == "cluster":
+            return self._run_repo.active_for_cluster(t, aggregate_id)
+        return self._run_repo.active_for_instance(t, aggregate_id)
+
     async def _drain_cancel_workflow(self, row: OutboxRow, eff: CancelWorkflow) -> None:
+        aggregate, aggregate_id = _target_of(eff)
         async with self._uow() as t:
-            active = self._run_repo.active_for_cluster(t, eff.cluster_id)
+            active = self._active_run(t, aggregate, aggregate_id)
         if active is not None:
             await self._engine.cancel(active.id)
         async with self._uow() as t:

@@ -59,7 +59,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Final, Literal
 
@@ -77,6 +77,8 @@ from seedpod.core.records import (
     ClusterState,
     DeploymentRecord,
     DeploymentState,
+    InstanceRecord,
+    InstanceStatus,
     Origin,
 )
 from seedpod.services.crypto import CryptoService
@@ -93,6 +95,10 @@ __all__ = [
     "ClusterRepository",
     "DeploymentRow",
     "DeploymentRepository",
+    "InstanceRow",
+    "InstanceRepository",
+    "InstanceStateAuditRow",
+    "InstanceStateAuditRepository",
     "ClusterStateAuditRow",
     "ClusterStateAuditRepository",
     "DeploymentStateAuditRow",
@@ -199,12 +205,15 @@ def _dump_nn(value: Mapping[str, Any] | Sequence[Any], *, kind: Literal["map", "
 
 @dataclass(frozen=True, slots=True)
 class WorkflowRunRow:
-    """One ``workflow_runs`` row (session-in/DTO-out; mirrors 0001_initial.sql exactly)."""
+    """One ``workflow_runs`` row (session-in/DTO-out; mirrors the table as 0005_instances.sql
+    left it). A run belongs to exactly one aggregate: ``cluster_id`` for a cluster or
+    deployment run, ``instance_id`` for an instance run (DR-0055 decision 4). The table's
+    CHECK enforces that; ``__post_init__`` says so before a statement is sent."""
 
     id: str
     workflow: str  # CONCRETE definition name (Conflict 13), not the abstract verb
     workflow_version: int
-    cluster_id: str
+    cluster_id: str | None
     deployment_id: str | None
     dedupe_key: str | None
     args: Mapping[str, Any]
@@ -217,6 +226,14 @@ class WorkflowRunRow:
     created_at: datetime
     started_at: datetime | None
     finished_at: datetime | None
+    instance_id: str | None = field(default=None, kw_only=True)
+
+    def __post_init__(self) -> None:
+        if (self.cluster_id is None) == (self.instance_id is None):
+            raise ValueError(
+                f"workflow run {self.id!r} needs exactly one of cluster_id and instance_id "
+                f"(got cluster_id={self.cluster_id!r}, instance_id={self.instance_id!r})"
+            )
 
 
 def _run_params(row: WorkflowRunRow) -> dict[str, Any]:
@@ -225,6 +242,7 @@ def _run_params(row: WorkflowRunRow) -> dict[str, Any]:
         "workflow": row.workflow,
         "workflow_version": row.workflow_version,
         "cluster_id": row.cluster_id,
+        "instance_id": row.instance_id,
         "deployment_id": row.deployment_id,
         "dedupe_key": row.dedupe_key,
         "args": _dump(row.args) or "{}",
@@ -246,6 +264,7 @@ def _run_from_mapping(m: Mapping[str, Any]) -> WorkflowRunRow:
         workflow=m["workflow"],
         workflow_version=m["workflow_version"],
         cluster_id=m["cluster_id"],
+        instance_id=m["instance_id"],
         deployment_id=m["deployment_id"],
         dedupe_key=m["dedupe_key"],
         args=_load(m["args"]) or {},
@@ -275,11 +294,11 @@ class WorkflowRunRepository:
             text(
                 """
                 INSERT INTO workflow_runs
-                    (id, workflow, workflow_version, cluster_id, deployment_id, dedupe_key,
+                    (id, workflow, workflow_version, cluster_id, instance_id, deployment_id, dedupe_key,
                      args, status, cancel_requested, failed_step, error, undo_incomplete,
                      initiated_by, created_at, started_at, finished_at)
                 VALUES
-                    (:id, :workflow, :workflow_version, :cluster_id, :deployment_id, :dedupe_key,
+                    (:id, :workflow, :workflow_version, :cluster_id, :instance_id, :deployment_id, :dedupe_key,
                      :args, :status, :cancel_requested, :failed_step, :error, :undo_incomplete,
                      :initiated_by, :created_at, :started_at, :finished_at)
                 """
@@ -303,11 +322,11 @@ class WorkflowRunRepository:
             text(
                 """
                 INSERT INTO workflow_runs
-                    (id, workflow, workflow_version, cluster_id, deployment_id, dedupe_key,
+                    (id, workflow, workflow_version, cluster_id, instance_id, deployment_id, dedupe_key,
                      args, status, cancel_requested, failed_step, error, undo_incomplete,
                      initiated_by, created_at, started_at, finished_at)
                 VALUES
-                    (:id, :workflow, :workflow_version, :cluster_id, :deployment_id, :dedupe_key,
+                    (:id, :workflow, :workflow_version, :cluster_id, :instance_id, :deployment_id, :dedupe_key,
                      :args, :status, :cancel_requested, :failed_step, :error, :undo_incomplete,
                      :initiated_by, :created_at, :started_at, :finished_at)
                 ON CONFLICT (dedupe_key) DO NOTHING
@@ -354,6 +373,18 @@ class WorkflowRunRepository:
                 "AND status IN :statuses"
             ).bindparams(bindparam("statuses", expanding=True)),
             {"cluster_id": cluster_id, "statuses": list(ACTIVE_RUN_STATUSES)},
+        ).mappings().first()
+        return _run_from_mapping(row) if row is not None else None
+
+    def active_for_instance(self, session: Session, instance_id: str) -> WorkflowRunRow | None:
+        """The instance twin of ``active_for_cluster``, held to one row by
+        ``ux_wr_one_active_instance`` (DR-0055 decision 4)."""
+        row = session.execute(
+            text(
+                "SELECT * FROM workflow_runs WHERE instance_id = :instance_id "
+                "AND status IN :statuses"
+            ).bindparams(bindparam("statuses", expanding=True)),
+            {"instance_id": instance_id, "statuses": list(ACTIVE_RUN_STATUSES)},
         ).mappings().first()
         return _run_from_mapping(row) if row is not None else None
 
@@ -1537,6 +1568,213 @@ class DeploymentRepository:
 
 
 # ---------------------------------------------------------------------------
+# instances (DR-0055; table created by 0005_instances.sql)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class InstanceRow:
+    """One ``instances`` row, shaped exactly like 0005_instances.sql -- a strict superset of
+    what ``InstanceRecord`` (the pure DTO the machine transitions) carries. Used for births
+    (``insert``) and every row-level read; ``InstanceRepository.load`` narrows a row to the
+    record. The columns the machine does not own (template, size, owner, price, vcpu, memory,
+    known_hosts) are written once at birth and never by ``persist``."""
+
+    id: str
+    slug: str
+    provider: str
+    environment: str
+    template: str
+    size: str
+    status: str  # InstanceStatus value; the table's CHECK holds the same set
+    version: int
+    owner_key_id: int
+    resource_ids: Mapping[str, str]
+    address: str | None
+    known_hosts: str | None
+    lease_seconds: int
+    expires_at: datetime
+    hard_expires_at: datetime
+    hourly_price: float
+    vcpu: int
+    memory_mb: int
+    failure_reason: str | None
+    created_at: datetime
+    updated_at: datetime
+    destroyed_at: datetime | None
+    ssh_public_key: str | None = None  # the requester's key (0007); `instance.load_spec` reads it
+
+
+def _instance_params(row: InstanceRow) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "slug": row.slug,
+        "provider": row.provider,
+        "environment": row.environment,
+        "template": row.template,
+        "size": row.size,
+        "status": row.status,
+        "version": row.version,
+        "owner_key_id": row.owner_key_id,
+        "resource_ids": _dump_nn(row.resource_ids, kind="map"),
+        "address": row.address,
+        "known_hosts": row.known_hosts,
+        "lease_seconds": row.lease_seconds,
+        "expires_at": _iso(row.expires_at),
+        "hard_expires_at": _iso(row.hard_expires_at),
+        "hourly_price": row.hourly_price,
+        "vcpu": row.vcpu,
+        "memory_mb": row.memory_mb,
+        "failure_reason": row.failure_reason,
+        "created_at": _iso(row.created_at),
+        "updated_at": _iso(row.updated_at),
+        "destroyed_at": _iso_or_none(row.destroyed_at),
+        "ssh_public_key": row.ssh_public_key,
+    }
+
+
+def _instance_from_mapping(m: Mapping[str, Any]) -> InstanceRow:
+    return InstanceRow(
+        id=m["id"],
+        slug=m["slug"],
+        provider=m["provider"],
+        environment=m["environment"],
+        template=m["template"],
+        size=m["size"],
+        status=m["status"],
+        version=m["version"],
+        owner_key_id=m["owner_key_id"],
+        resource_ids=_load(m["resource_ids"]) or {},
+        address=m["address"],
+        known_hosts=m["known_hosts"],
+        lease_seconds=m["lease_seconds"],
+        expires_at=_parse(m["expires_at"]),
+        hard_expires_at=_parse(m["hard_expires_at"]),
+        hourly_price=m["hourly_price"],
+        vcpu=m["vcpu"],
+        memory_mb=m["memory_mb"],
+        failure_reason=m["failure_reason"],
+        created_at=_parse(m["created_at"]),
+        updated_at=_parse(m["updated_at"]),
+        destroyed_at=_parse_or_none(m["destroyed_at"]),
+        ssh_public_key=m["ssh_public_key"],
+    )
+
+
+def _instance_record_from_row(row: InstanceRow) -> InstanceRecord:
+    """Narrow a full ``InstanceRow`` to the pure ``InstanceRecord`` -- the inverse of what
+    ``InstanceRepository.persist`` writes back."""
+    return InstanceRecord(
+        id=row.id,
+        slug=row.slug,
+        state=InstanceStatus(row.status),
+        version=row.version,
+        provider=row.provider,
+        environment=row.environment,
+        lease_seconds=row.lease_seconds,
+        expires_at=row.expires_at,
+        hard_expires_at=row.hard_expires_at,
+        address=row.address,
+        resource_ids=row.resource_ids,
+        failure_reason=row.failure_reason,
+        destroyed_at=row.destroyed_at,
+    )
+
+
+class InstanceRepository:
+    """``instances``: session-in, DTO-out, never commits. The same split as
+    ``ClusterRepository``: ``insert`` is the birth, ``persist`` is the compare-and-swap UPDATE
+    over the columns ``InstanceRecord`` carries, ``load`` is the Dispatcher's read side."""
+
+    def get(self, session: Session, instance_id: str) -> InstanceRow | None:
+        row = session.execute(
+            text("SELECT * FROM instances WHERE id = :id"), {"id": instance_id}
+        ).mappings().first()
+        return _instance_from_mapping(row) if row is not None else None
+
+    def get_by_slug(self, session: Session, slug: str) -> InstanceRow | None:
+        """The instance that holds ``slug``, in any status. A slug is never reused, not even
+        after ``destroyed`` (``ux_instances_slug``, 0006), so there is at most one."""
+        row = session.execute(
+            text("SELECT * FROM instances WHERE slug = :slug"),
+            {"slug": slug},
+        ).mappings().first()
+        return _instance_from_mapping(row) if row is not None else None
+
+    def load(self, session: Session, instance_id: str) -> InstanceRecord | None:
+        row = self.get(session, instance_id)
+        return _instance_record_from_row(row) if row is not None else None
+
+    def insert(self, session: Session, row: InstanceRow) -> None:
+        """Birth INSERT. No CAS, no audit write: the Dispatcher writes the birth audit row in
+        the same transaction."""
+        session.execute(
+            text(
+                """
+                INSERT INTO instances
+                    (id, slug, provider, environment, template, size, status, version,
+                     owner_key_id, resource_ids, address, known_hosts, lease_seconds,
+                     expires_at, hard_expires_at, hourly_price, vcpu, memory_mb,
+                     failure_reason, created_at, updated_at, destroyed_at, ssh_public_key)
+                VALUES
+                    (:id, :slug, :provider, :environment, :template, :size, :status, :version,
+                     :owner_key_id, :resource_ids, :address, :known_hosts, :lease_seconds,
+                     :expires_at, :hard_expires_at, :hourly_price, :vcpu, :memory_mb,
+                     :failure_reason, :created_at, :updated_at, :destroyed_at, :ssh_public_key)
+                """
+            ),
+            _instance_params(row),
+        )
+
+    def persist(
+        self, session: Session, record: InstanceRecord, expected_version: int, *, clock: Clock
+    ) -> None:
+        """CAS UPDATE over exactly the columns the machine owns. ``hard_expires_at``,
+        ``lease_seconds``, ``slug``, ``provider`` and ``environment`` are deliberately NOT
+        in the SET list: they are fixed at creation. ``rowcount == 0`` means another writer
+        won the race since ``expected_version`` was read -- raises ``StaleVersion``."""
+        result = session.execute(
+            text(
+                """
+                UPDATE instances SET
+                    status = :status, resource_ids = :resource_ids, address = :address,
+                    expires_at = :expires_at, failure_reason = :failure_reason,
+                    destroyed_at = :destroyed_at, updated_at = :updated_at,
+                    version = version + 1
+                WHERE id = :id AND version = :expected_version
+                """
+            ),
+            {
+                "id": record.id,
+                "status": record.state.value,
+                "resource_ids": _dump_nn(record.resource_ids, kind="map"),
+                "address": record.address,
+                "expires_at": _iso(record.expires_at),
+                "failure_reason": record.failure_reason,
+                "destroyed_at": _iso_or_none(record.destroyed_at),
+                "updated_at": _iso(clock.now()),
+                "expected_version": expected_version,
+            },
+        )
+        if result.rowcount == 0:
+            raise StaleVersion(
+                f"instance {record.id}: CAS UPDATE matched no row at version {expected_version}"
+            )
+
+    def list_all(self, session: Session) -> list[InstanceRow]:
+        rows = session.execute(text("SELECT * FROM instances ORDER BY created_at")).mappings().all()
+        return [_instance_from_mapping(r) for r in rows]
+
+    def list_live(self, session: Session) -> list[InstanceRow]:
+        """Every instance that is not ``destroyed``: the rows that may still hold a resource, and
+        so the ones admission limits count (DR-0055 decision 6)."""
+        rows = session.execute(
+            text("SELECT * FROM instances WHERE status != 'destroyed' ORDER BY created_at")
+        ).mappings().all()
+        return [_instance_from_mapping(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
 # cluster_state_audits / deployment_state_audits
 # ---------------------------------------------------------------------------
 
@@ -1721,6 +1959,82 @@ class DeploymentStateAuditRepository:
             {"deployment_id": deployment_id, "limit": limit},
         ).mappings().all()
         return [_dsa_from_mapping(r) for r in rows]
+
+
+@dataclass(frozen=True, slots=True)
+class InstanceStateAuditRow:
+    id: int | None
+    instance_id: str
+    from_state: str
+    to_state: str
+    event: str
+    actor: str
+    reason: str | None
+    context: Mapping[str, Any] | None
+    created_at: datetime
+
+
+def _isa_from_mapping(m: Mapping[str, Any]) -> InstanceStateAuditRow:
+    return InstanceStateAuditRow(
+        id=m["id"],
+        instance_id=m["instance_id"],
+        from_state=m["from_state"],
+        to_state=m["to_state"],
+        event=m["event"],
+        actor=m["actor"],
+        reason=m["reason"],
+        context=_load(m["context"]),
+        created_at=_parse(m["created_at"]),
+    )
+
+
+class InstanceStateAuditRepository:
+    """``instance_state_audits`` (0006) -- the instance twin of ``ClusterStateAuditRepository``,
+    with the same discipline: ``actor`` is ``event.actor``, ``created_at`` is ``event.at`` and
+    never ``Clock.now()``, ``reason`` is the event's own ``reason`` field when its class has
+    one, and ``context`` is the whole tagged event (DR-0007)."""
+
+    def add(
+        self,
+        session: Session,
+        *,
+        instance_id: str,
+        from_state: str,
+        to_state: str,
+        event: Event,
+        actor: str,
+        at: datetime,
+    ) -> None:
+        session.execute(
+            text(
+                """
+                INSERT INTO instance_state_audits
+                    (instance_id, from_state, to_state, event, actor, reason, context, created_at)
+                VALUES
+                    (:instance_id, :from_state, :to_state, :event, :actor, :reason, :context, :created_at)
+                """
+            ),
+            {
+                "instance_id": instance_id,
+                "from_state": from_state,
+                "to_state": to_state,
+                "event": type(event).__name__,
+                "actor": actor,
+                "reason": getattr(event, "reason", None),
+                "context": canonical_json(event),
+                "created_at": _iso(at),
+            },
+        )
+
+    def list_for_instance(self, session: Session, instance_id: str, limit: int = 50) -> list[InstanceStateAuditRow]:
+        rows = session.execute(
+            text(
+                "SELECT * FROM instance_state_audits WHERE instance_id = :instance_id "
+                "ORDER BY created_at DESC, id DESC LIMIT :limit"
+            ),
+            {"instance_id": instance_id, "limit": limit},
+        ).mappings().all()
+        return [_isa_from_mapping(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -2130,6 +2444,8 @@ class Repositories:
     timers: TimerRepository
     outbox: OutboxRepository
     workflow_runs: WorkflowRunRepository
+    instances: InstanceRepository  # DR-0055
+    instance_state_audits: InstanceStateAuditRepository  # DR-0055, 0006
 
 
 # ---------------------------------------------------------------------------

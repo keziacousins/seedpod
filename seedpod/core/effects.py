@@ -19,7 +19,12 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 if TYPE_CHECKING:
     from seedpod.core.events import DeploymentEvent, Event
-    from seedpod.core.records import ClusterRecord, DeploymentRecord, DeploymentState
+    from seedpod.core.records import (
+        ClusterRecord,
+        DeploymentRecord,
+        DeploymentState,
+        InstanceRecord,
+    )
 
 __all__ = [
     "EffectKind",
@@ -47,7 +52,7 @@ class EffectKind(StrEnum):
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Persist:
     kind: ClassVar[str] = EffectKind.PERSIST
-    record: ClusterRecord | DeploymentRecord  # full post-transition image, version already +1
+    record: ClusterRecord | DeploymentRecord | InstanceRecord  # full post-transition image, version already +1
     expected_version: int | None  # None => INSERT (birth); else CAS UPDATE ... WHERE version=expected
 
 
@@ -62,8 +67,9 @@ class Notify:
 @dataclass(frozen=True, slots=True, kw_only=True)
 class RunWorkflow:
     kind: ClassVar[str] = EffectKind.RUN_WORKFLOW
-    workflow: str  # "provision" | "deploy" | "rollback" | "destroy" — closed abstract-verb set (Conflict 13)
-    cluster_id: str
+    workflow: str  # "provision" | "deploy" | "rollback" | "destroy" — closed abstract-verb set (Conflict 13); an instance uses provision and destroy
+    aggregate_type: str  # "cluster" | "instance" — the aggregate the RUN belongs to (DR-0055 decision 4)
+    aggregate_id: str  # a deploy/rollback run is still "cluster": it holds its cluster's one-active-run slot
     deployment_id: str | None = None
     args: Mapping[str, Any] = ()  # typed per workflow in Pillar 2; refs only, never secrets
 
@@ -72,7 +78,8 @@ class RunWorkflow:
 class CancelWorkflow:
     kind: ClassVar[str] = EffectKind.CANCEL_WORKFLOW
     workflow: str
-    cluster_id: str
+    aggregate_type: str  # "cluster" | "instance", as RunWorkflow
+    aggregate_id: str
     deployment_id: str | None = None
     reason: str = ""
 
@@ -80,9 +87,9 @@ class CancelWorkflow:
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ScheduleTimer:
     kind: ClassVar[str] = EffectKind.SCHEDULE_TIMER
-    aggregate_type: str  # "cluster" | "deployment"
+    aggregate_type: str  # "cluster" | "deployment" | "instance"
     aggregate_id: str
-    timer_key: str  # "ttl" | "destroy" — upsert key => re-arming idempotent by construction
+    timer_key: str  # "ttl" | "destroy" | "expiry" — upsert key => re-arming idempotent by construction
     fire_at: datetime  # ABSOLUTE aware-UTC, computed from event.at / record fields — transition never calls now()
     event: Event  # the fact injected through apply() when it fires
 

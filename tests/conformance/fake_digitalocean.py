@@ -33,6 +33,7 @@ class FakeDigitalOceanBackend:
     project_resources: dict[str, set[str]] = field(default_factory=dict)
     vpcs: dict[str, dict] = field(default_factory=dict)
     firewalls: dict[str, dict] = field(default_factory=dict)
+    tags: set[str] = field(default_factory=set)  # a tag exists once it is created, or once a droplet has it
     call_count: int = 0
     _next_id: int = 10_000
     _next_vpc_id: int = 20_000
@@ -53,6 +54,7 @@ class FakeDigitalOceanBackend:
             "name": payload["name"],
             "inbound_rules": payload.get("inbound_rules", []),
             "outbound_rules": payload.get("outbound_rules", []),
+            "tags": payload.get("tags", []),
             "droplet_ids": [],
         }
         self.firewalls[firewall_id] = firewall
@@ -74,6 +76,7 @@ class FakeDigitalOceanBackend:
             "vpc_uuid": payload.get("vpc_uuid"),
         }
         self.droplets[str(droplet_id)] = droplet
+        self.tags.update(droplet["tags"])
         return droplet
 
     def seed_droplet(self, *, tags: list[str], status: str = "active", ip: str = "203.0.113.9") -> str:
@@ -195,10 +198,27 @@ class FakeDigitalOceanTransport(httpx.AsyncBaseTransport):
         if request.method == "GET" and route == "/firewalls":
             return self._json(200, {"firewalls": list(self.backend.firewalls.values())})
 
+        if request.method == "POST" and route == "/tags":
+            name = json.loads(request.content or b"{}")["name"]
+            self.backend.tags.add(name)  # the real API answers 201 for a tag that exists already, too
+            return self._json(201, {"tag": {"name": name}})
+
+        if request.method in ("POST", "PUT") and route.startswith("/firewalls") and not route.endswith("/droplets"):
+            unknown = set(json.loads(request.content or b"{}").get("tags") or ()) - self.backend.tags
+            if unknown:  # the real API refuses a firewall that names a tag that does not exist
+                return self._json(422, {"id": "unprocessable_entity", "message": f"tags do not exist: {sorted(unknown)}"})
+
         if request.method == "POST" and route == "/firewalls":
             payload = json.loads(request.content or b"{}")
             firewall = self.backend.create_firewall(payload)
             return self._json(202, {"firewall": firewall})
+
+        if request.method == "PUT" and route.startswith("/firewalls/"):
+            firewall = self.backend.firewalls.get(route.rsplit("/", 1)[-1])
+            if firewall is None:
+                return self._json(404, {"id": "not_found", "message": "The resource you were accessing could not be found."})
+            firewall.update(json.loads(request.content or b"{}"))
+            return self._json(200, {"firewall": firewall})
 
         if request.method == "POST" and route.startswith("/firewalls/") and route.endswith("/droplets"):
             firewall_id = route.split("/")[2]

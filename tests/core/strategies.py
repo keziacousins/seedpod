@@ -51,6 +51,18 @@ from seedpod.core.events import (
     InfraAllocated,
     InfraMissingObserved,
     InfraRunningObserved,
+    InstanceCreateRequested,
+    InstanceDestroyFailed,
+    InstanceDestroyRequested,
+    InstanceDestroySucceeded,
+    InstanceExpired,
+    InstanceProvisioned,
+    InstanceProvisionFailed,
+    InstanceRenewRequested,
+    InstanceResourcesAllocated,
+    InstanceRunningObserved,
+    InstanceStoppedObserved,
+    InstanceTimerLost,
     ProvisionFailed,
     ProvisionSucceeded,
     RetryRequested,
@@ -63,10 +75,12 @@ from seedpod.core.records import (
     ClusterState,
     DeploymentRecord,
     DeploymentState,
+    InstanceRecord,
+    InstanceStatus,
     Origin,
 )
 
-__all__ = ["events", "cluster_events", "deployment_events", "effects", "records"]
+__all__ = ["events", "cluster_events", "deployment_events", "instance_events", "effects", "records"]
 
 # ---------------------------------------------------------------------------
 # Primitive building blocks
@@ -174,7 +188,28 @@ deployment_events = st.one_of(
     st.builds(RollbackFinished, at=aware_utc_datetimes, actor=actors, ok=st.booleans()),
 )
 
-events = st.one_of(cluster_events, deployment_events)
+instance_events = st.one_of(
+    st.builds(InstanceCreateRequested, at=aware_utc_datetimes, actor=actors),
+    st.builds(InstanceRenewRequested, at=aware_utc_datetimes, actor=actors),
+    st.builds(InstanceDestroyRequested, at=aware_utc_datetimes, actor=actors),
+    st.builds(InstanceResourcesAllocated, at=aware_utc_datetimes, actor=actors, resource_ids=string_mappings()),
+    st.builds(
+        InstanceProvisioned,
+        at=aware_utc_datetimes,
+        actor=actors,
+        address=safe_text,
+        resource_ids=string_mappings(),
+    ),
+    st.builds(InstanceProvisionFailed, at=aware_utc_datetimes, actor=actors, reason=safe_text),
+    st.builds(InstanceDestroySucceeded, at=aware_utc_datetimes, actor=actors),
+    st.builds(InstanceDestroyFailed, at=aware_utc_datetimes, actor=actors, reason=safe_text),
+    st.builds(InstanceExpired, at=aware_utc_datetimes, actor=actors),
+    st.builds(InstanceStoppedObserved, at=aware_utc_datetimes, actor=actors),
+    st.builds(InstanceRunningObserved, at=aware_utc_datetimes, actor=actors),
+    st.builds(InstanceTimerLost, at=aware_utc_datetimes, actor=actors),
+)
+
+events = st.one_of(cluster_events, deployment_events, instance_events)
 
 # ---------------------------------------------------------------------------
 # Records
@@ -211,7 +246,24 @@ deployment_records = st.builds(
     failure_reason=st.one_of(st.none(), safe_text),
 )
 
-records = st.one_of(cluster_records, deployment_records)
+instance_records = st.builds(
+    InstanceRecord,
+    id=ids,
+    slug=nonempty_safe_text,
+    state=st.sampled_from(list(InstanceStatus)),
+    version=st.integers(min_value=0, max_value=1000),
+    provider=st.sampled_from(["digitalocean", "tart"]),
+    environment=nonempty_safe_text,
+    lease_seconds=st.integers(min_value=1, max_value=86400),
+    expires_at=aware_utc_datetimes,
+    hard_expires_at=aware_utc_datetimes,
+    address=st.one_of(st.none(), safe_text),
+    resource_ids=string_mappings(),
+    failure_reason=st.one_of(st.none(), safe_text),
+    destroyed_at=st.one_of(st.none(), aware_utc_datetimes),
+)
+
+records = st.one_of(cluster_records, deployment_records, instance_records)
 
 # ---------------------------------------------------------------------------
 # Effects
@@ -225,7 +277,7 @@ _persists = st.builds(
 
 _notifies = st.builds(
     Notify,
-    topic=st.sampled_from(["cluster_state_changed", "deployment_status_changed"]),
+    topic=st.sampled_from(["cluster_state_changed", "deployment_status_changed", "instance_state_changed"]),
     payload=json_mappings(),
     environment=st.one_of(st.none(), safe_text),
 )
@@ -233,7 +285,8 @@ _notifies = st.builds(
 _run_workflows = st.builds(
     RunWorkflow,
     workflow=st.sampled_from(["provision", "deploy", "rollback", "destroy"]),
-    cluster_id=ids,
+    aggregate_type=st.sampled_from(["cluster", "instance"]),
+    aggregate_id=ids,
     deployment_id=st.one_of(st.none(), ids),
     args=json_mappings(),
 )
@@ -241,25 +294,26 @@ _run_workflows = st.builds(
 _cancel_workflows = st.builds(
     CancelWorkflow,
     workflow=st.sampled_from(["provision", "deploy", "rollback", "destroy"]),
-    cluster_id=ids,
+    aggregate_type=st.sampled_from(["cluster", "instance"]),
+    aggregate_id=ids,
     deployment_id=st.one_of(st.none(), ids),
     reason=safe_text,
 )
 
 _schedule_timers = st.builds(
     ScheduleTimer,
-    aggregate_type=st.sampled_from(["cluster", "deployment"]),
+    aggregate_type=st.sampled_from(["cluster", "deployment", "instance"]),
     aggregate_id=ids,
-    timer_key=st.sampled_from(["ttl", "destroy"]),
+    timer_key=st.sampled_from(["ttl", "destroy", "expiry"]),
     fire_at=aware_utc_datetimes,
     event=events,
 )
 
 _cancel_timers = st.builds(
     CancelTimer,
-    aggregate_type=st.sampled_from(["cluster", "deployment"]),
+    aggregate_type=st.sampled_from(["cluster", "deployment", "instance"]),
     aggregate_id=ids,
-    timer_key=st.one_of(st.none(), st.sampled_from(["ttl", "destroy"])),
+    timer_key=st.one_of(st.none(), st.sampled_from(["ttl", "destroy", "expiry"])),
 )
 
 _cascades = st.builds(

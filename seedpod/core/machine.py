@@ -58,6 +58,7 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 from seedpod.core.effects import (
     CancelTimer,
@@ -95,6 +96,19 @@ from seedpod.core.events import (
     InfraAllocated,
     InfraMissingObserved,
     InfraRunningObserved,
+    InstanceCreateRequested,
+    InstanceDestroyFailed,
+    InstanceDestroyRequested,
+    InstanceDestroySucceeded,
+    InstanceEvent,
+    InstanceExpired,
+    InstanceProvisioned,
+    InstanceProvisionFailed,
+    InstanceRenewRequested,
+    InstanceResourcesAllocated,
+    InstanceRunningObserved,
+    InstanceStoppedObserved,
+    InstanceTimerLost,
     Observation,
     ProvisionFailed,
     ProvisionSucceeded,
@@ -108,15 +122,27 @@ from seedpod.core.records import (
     ClusterState,
     DeploymentRecord,
     DeploymentState,
+    InstanceRecord,
+    InstanceStatus,
     Origin,
 )
 
-__all__ = ["TransitionResult", "InvalidTransition", "StaleVersion", "transition"]
+__all__ = [
+    "TransitionResult",
+    "InvalidTransition",
+    "StaleVersion",
+    "transition",
+    "CLUSTER_TABLE",
+    "DEPLOYMENT_TABLE",
+    "INSTANCE_TABLE",
+    "INSTANCE_DESTROY_RETRY_DELAY",
+    "INSTANCE_RESOURCE_HOLDING_STATES",
+]
 
 
 @dataclass(frozen=True, slots=True)
 class TransitionResult:
-    record: ClusterRecord | DeploymentRecord  # version bumped iff a Persist is present
+    record: ClusterRecord | DeploymentRecord | InstanceRecord  # version bumped iff a Persist is present
     effects: tuple[Effect, ...]  # () => Ignore
 
 
@@ -146,11 +172,11 @@ _ALL_DEPLOYMENT_STATES_EXCEPT_DESTROYED = frozenset(
 # ---------------------------------------------------------------------------
 
 
-def _ignore(record: ClusterRecord | DeploymentRecord, event: Event) -> TransitionResult:
+def _ignore(record: ClusterRecord | DeploymentRecord | InstanceRecord, event: Event) -> TransitionResult:
     return TransitionResult(record=record, effects=())
 
 
-def _invalid(record: ClusterRecord | DeploymentRecord, event: Event) -> TransitionResult:
+def _invalid(record: ClusterRecord | DeploymentRecord | InstanceRecord, event: Event) -> TransitionResult:
     raise InvalidTransition(
         f"{type(event).__name__} is not valid for {type(record).__name__} "
         f"in state {record.state.value!r} (actor={event.actor!r})"
@@ -297,7 +323,7 @@ def _cluster_new_create_requested(record: ClusterRecord, event: CreateRequested)
         state=ClusterState.PROVISIONING,
         birth=True,
         notify_old_status="",  # preserves v1's UI-visible birth broadcast shape
-        extra_effects=(RunWorkflow(workflow="provision", cluster_id=record.id),),
+        extra_effects=(RunWorkflow(workflow="provision", aggregate_type="cluster", aggregate_id=record.id),),
     )
 
 
@@ -461,7 +487,7 @@ def _cluster_destroy_scheduled_destroy_due(record: ClusterRecord, event: Destroy
         state=ClusterState.DESTROYING,
         extra_effects=(
             RunWorkflow(
-                workflow="destroy", cluster_id=record.id,
+                workflow="destroy", aggregate_type="cluster", aggregate_id=record.id,
                 args={"trigger": event.trigger, "snapshot": event.snapshot},  # DR-0040, DR-0043
             ),
         ),
@@ -559,7 +585,7 @@ def _cluster_failed_retry_requested(record: ClusterRecord, event: RetryRequested
         event,
         state=ClusterState.PROVISIONING,
         failure_reason=None,
-        extra_effects=(RunWorkflow(workflow="provision", cluster_id=record.id),),
+        extra_effects=(RunWorkflow(workflow="provision", aggregate_type="cluster", aggregate_id=record.id),),
     )
 
 
@@ -846,7 +872,9 @@ def _deployment_pending_cluster_ready(record: DeploymentRecord, event: ClusterRe
         event,
         state=DeploymentState.DEPLOYING,
         extra_effects=(
-            RunWorkflow(workflow="deploy", cluster_id=record.cluster_id, deployment_id=record.id),
+            RunWorkflow(
+                workflow="deploy", aggregate_type="cluster", aggregate_id=record.cluster_id, deployment_id=record.id
+            ),
         ),
     )
 
@@ -884,8 +912,12 @@ def _deployment_deploying_cancel_requested(record: DeploymentRecord, event: Canc
     # Conflict 12: CancelWorkflow(deploy) THEN RunWorkflow(rollback, deployment_id=self.id), in that
     # order -- the drain-lane admitter processes them in seq order, so rollback waits for the
     # cancelled deploy run to reach terminal.
-    cancel_deploy = CancelWorkflow(workflow="deploy", cluster_id=record.cluster_id, deployment_id=record.id)
-    run_rollback = RunWorkflow(workflow="rollback", cluster_id=record.cluster_id, deployment_id=record.id)
+    cancel_deploy = CancelWorkflow(
+        workflow="deploy", aggregate_type="cluster", aggregate_id=record.cluster_id, deployment_id=record.id
+    )
+    run_rollback = RunWorkflow(
+        workflow="rollback", aggregate_type="cluster", aggregate_id=record.cluster_id, deployment_id=record.id
+    )
     return _deployment_result(
         record, event, state=DeploymentState.CANCELLED, extra_effects=(cancel_deploy, run_rollback)
     )
@@ -893,7 +925,9 @@ def _deployment_deploying_cancel_requested(record: DeploymentRecord, event: Canc
 
 def _deployment_deploying_cluster_gone(record: DeploymentRecord, event: ClusterGone) -> TransitionResult:
     # Conflict 12: CancelWorkflow(deploy) only -- no rollback on a dying cluster (v1 parity)
-    cancel_deploy = CancelWorkflow(workflow="deploy", cluster_id=record.cluster_id, deployment_id=record.id)
+    cancel_deploy = CancelWorkflow(
+        workflow="deploy", aggregate_type="cluster", aggregate_id=record.cluster_id, deployment_id=record.id
+    )
     return _deployment_result(record, event, state=DeploymentState.DESTROYED, extra_effects=(cancel_deploy,))
 
 
@@ -951,11 +985,341 @@ DEPLOYMENT_TABLE = _fill_defaults(
 
 
 # ---------------------------------------------------------------------------
+# Instance table (DR-0055). 8 states x 13 event kinds, total by ``_fill_defaults``.
+#
+# The invariants this table exists to keep:
+#
+# 1. **No instance without an expiry.** From birth to destroyed, a state that may hold a
+#    resource has an armed ``expiry`` timer. Birth arms it. Nothing before ``destroyed``
+#    cancels it. ``destroying`` is the one state where it may be gone (the timer was consumed
+#    when it fired), and there the destroy run's terminal event decides: success cancels all
+#    timers, failure re-arms ``expiry`` (``INSTANCE_DESTROY_RETRY_DELAY`` later). A VM found
+#    on a destroyed row re-arms it too, because that transition left a resource and no timer.
+# 2. **``hard_expires_at`` never changes, and ``expires_at`` never passes it.** No rule passes
+#    ``hard_expires_at`` to ``dataclasses.replace``. Renewal moves ``expires_at`` for a live
+#    lease and clamps it to the hard limit. ``expires_at`` is the lease end, not the timer: a
+#    failed destroy leaves it alone and arms the ``expiry`` timer at the retry time, and a zombie
+#    sets it to ``min(now, hard_expires_at)``. So ``expires_at <= hard_expires_at`` in every state.
+#    The timer may fire later than the column, and that is allowed (invariant 3).
+# 3. **A failed destroy always has a way back**: ``destroy-failed`` is left by a request or by
+#    the ``expiry`` timer, and entering it re-arms that timer. The retry timer's event is
+#    older than ``expires_at`` when the destroy was requested before the lease ended, so
+#    ``destroy-failed`` accepts ``InstanceExpired`` without the staleness check (no renewal is
+#    possible there, so an old fire cannot be stale).
+# 4. An ``InstanceExpired`` older than ``record.expires_at`` is stale and ignored (except in
+#    ``destroy-failed``, invariant 3). The timer
+#    service already drops a re-armed timer (DR-0009), so this only covers a fire that was
+#    built before a renewal and delivered after it.
+# ---------------------------------------------------------------------------
+
+# How long after a failed destroy the next automatic attempt runs. A constant, not a column:
+# the engine's own retry (the step Schedule) has already run inside the failed attempt.
+# Retries are unbounded on purpose -- an instance that cannot be destroyed is a bill that keeps
+# growing, and giving up would leave a resource with no path to retry.
+INSTANCE_DESTROY_RETRY_DELAY = timedelta(minutes=5)
+
+# The states that may hold a provider resource: every state but ``new`` and ``destroyed``.
+INSTANCE_RESOURCE_HOLDING_STATES = frozenset(
+    {
+        InstanceStatus.PROVISIONING,
+        InstanceStatus.ACTIVE,
+        InstanceStatus.FAILED,
+        InstanceStatus.DESTROYING,
+        InstanceStatus.DESTROY_FAILED,
+        InstanceStatus.ZOMBIE,
+    }
+)
+
+
+def _instance_result(
+    old: InstanceRecord,
+    event: Event,
+    *,
+    state: InstanceStatus,
+    birth: bool = False,
+    notify_old_status: str | None = None,
+    extra_effects: tuple[Effect, ...] = (),
+    **fields,
+) -> TransitionResult:
+    new = dataclasses.replace(old, state=state, version=old.version + 1, **fields)
+    persist = Persist(record=new, expected_version=None if birth else old.version)
+    old_status = old.state.value if notify_old_status is None else notify_old_status
+    notify = Notify(
+        topic="instance_state_changed",
+        payload={"instance_id": new.id, "old_status": old_status, "new_status": new.state.value},
+        environment=new.environment,
+    )
+    return TransitionResult(record=new, effects=(persist, notify, *extra_effects))
+
+
+def _expiry_timer(instance_id: str, fire_at: datetime) -> ScheduleTimer:
+    return ScheduleTimer(
+        aggregate_type="instance",
+        aggregate_id=instance_id,
+        timer_key="expiry",
+        fire_at=fire_at,
+        event=InstanceExpired(at=fire_at, actor="timer:expiry"),
+    )
+
+
+def _instance_cancel_all_timers(instance_id: str) -> CancelTimer:
+    return CancelTimer(aggregate_type="instance", aggregate_id=instance_id, timer_key=None)
+
+
+def _instance_workflow(workflow: str, instance_id: str) -> RunWorkflow:
+    return RunWorkflow(workflow=workflow, aggregate_type="instance", aggregate_id=instance_id)
+
+
+def _instance_new_create_requested(record: InstanceRecord, event: InstanceCreateRequested) -> TransitionResult:
+    # Admission built this record. The checks restate what makes an expiry real, so a caller
+    # that skipped them cannot birth an instance that expires at once or outlives its limit.
+    if record.lease_seconds <= 0:
+        raise InvalidTransition(f"instance {record.id}: lease_seconds must be positive, got {record.lease_seconds}")
+    if record.expires_at > record.hard_expires_at:
+        raise InvalidTransition(f"instance {record.id}: expires_at is later than hard_expires_at")
+    if record.expires_at <= event.at:
+        raise InvalidTransition(f"instance {record.id}: expires_at is not in the future")
+    return _instance_result(
+        record,
+        event,
+        state=InstanceStatus.PROVISIONING,
+        birth=True,
+        notify_old_status="",
+        extra_effects=(_instance_workflow("provision", record.id), _expiry_timer(record.id, record.expires_at)),
+    )
+
+
+def _instance_provisioning_resources_allocated(
+    record: InstanceRecord, event: InstanceResourcesAllocated
+) -> TransitionResult:
+    merged = {**dict(record.resource_ids), **dict(event.resource_ids)}
+    return _instance_result(record, event, state=InstanceStatus.PROVISIONING, resource_ids=merged)
+
+
+def _instance_provisioning_provisioned(record: InstanceRecord, event: InstanceProvisioned) -> TransitionResult:
+    merged = {**dict(record.resource_ids), **dict(event.resource_ids)}
+    if not event.address or not event.resource_ids:
+        # A success with nothing to reach or nothing to destroy is a defect in the workflow that
+        # reported it. Not `active`: `failed`, whose expiry is still armed, so it is destroyed at expiry.
+        # Any ids it did report are kept, because destroy needs them.
+        return _instance_result(
+            record, event, state=InstanceStatus.FAILED, resource_ids=merged,
+            failure_reason="provision reported success without an address and resource ids",
+        )
+    return _instance_result(
+        record, event, state=InstanceStatus.ACTIVE, address=event.address, resource_ids=merged, failure_reason=None
+    )
+
+
+def _instance_provisioning_provision_failed(record: InstanceRecord, event: InstanceProvisionFailed) -> TransitionResult:
+    # The expiry timer is still armed (nothing cancelled it), so this leaves it alone: a failed
+    # instance may hold a resource, and the timer is what destroys it.
+    return _instance_result(record, event, state=InstanceStatus.FAILED, failure_reason=event.reason)
+
+
+def _begin_instance_destroy(
+    record: InstanceRecord, event: Event, *, cancel_provision: bool
+) -> TransitionResult:
+    """-> DESTROYING. While provisioning, the provision run is cancelled FIRST, then the destroy
+    is requested, in that order -- the cluster machine's discipline (Conflict 12). The drain-lane
+    admitter works in ``seq`` order: the cancel flips the live run, and the destroy waits for that
+    run to reach a terminal status (DR-0011), so destroy never runs beside a half-finished
+    provision. The cancelled run's outcome event (InstanceProvisionFailed) then reaches an
+    instance in ``destroying`` and is Ignore.
+
+    The ``expiry`` timer is left as it is. If it is still armed it fires during ``destroying``
+    and is Ignore; if the destroy fails, ``_instance_destroying_destroy_failed`` re-arms it."""
+    extra: list[Effect] = []
+    if cancel_provision:
+        extra.append(CancelWorkflow(workflow="provision", aggregate_type="instance", aggregate_id=record.id))
+    extra.append(_instance_workflow("destroy", record.id))
+    return _instance_result(record, event, state=InstanceStatus.DESTROYING, extra_effects=tuple(extra))
+
+
+def _instance_provisioning_destroy(record: InstanceRecord, event: Event) -> TransitionResult:
+    return _begin_instance_destroy(record, event, cancel_provision=True)
+
+
+def _instance_destroy(record: InstanceRecord, event: Event) -> TransitionResult:
+    return _begin_instance_destroy(record, event, cancel_provision=False)
+
+
+def _instance_provisioning_expired(record: InstanceRecord, event: InstanceExpired) -> TransitionResult:
+    if event.at < record.expires_at:
+        return _ignore(record, event)  # stale: the expiry moved after this timer was armed
+    return _begin_instance_destroy(record, event, cancel_provision=True)
+
+
+def _instance_expired(record: InstanceRecord, event: InstanceExpired) -> TransitionResult:
+    if event.at < record.expires_at:
+        return _ignore(record, event)  # stale: the expiry moved after this timer was armed
+    return _begin_instance_destroy(record, event, cancel_provision=False)
+
+
+def _instance_destroy_failed_expired(record: InstanceRecord, event: InstanceExpired) -> TransitionResult:
+    # The destroy retry timer. It was armed at ``failure time + delay``, which is earlier than
+    # ``expires_at`` when the destroy was requested before the lease ended. No renewal exists
+    # in this state, so no fire here can be stale: always retry (invariant 3).
+    return _begin_instance_destroy(record, event, cancel_provision=False)
+
+
+def _instance_active_renew(record: InstanceRecord, event: InstanceRenewRequested) -> TransitionResult:
+    """``expires_at := min(at + lease_seconds, hard_expires_at)``, and the ``expiry`` timer re-armed.
+
+    Refused (``InvalidTransition``, the API's 409) when:
+    - ``at >= expires_at``: the lease is over. A renewal cannot revive it, and the timer may
+      already be due.
+    - the result would not be LATER than the current ``expires_at``: renewal never shortens a
+      lease. That happens when the lease is already at ``hard_expires_at``, and when a second
+      renewal at the same instant lands on the first one's result.
+    ``hard_expires_at`` is not an argument of ``replace`` here or anywhere else."""
+    if event.at >= record.expires_at:
+        raise InvalidTransition(f"instance {record.id}: lease expired at {record.expires_at.isoformat()}, cannot renew")
+    new_expires_at = min(event.at + timedelta(seconds=record.lease_seconds), record.hard_expires_at)
+    if new_expires_at <= record.expires_at:
+        raise InvalidTransition(
+            f"instance {record.id}: renewal would not extend the lease past "
+            f"{record.expires_at.isoformat()} (hard limit {record.hard_expires_at.isoformat()})"
+        )
+    return _instance_result(
+        record,
+        event,
+        state=InstanceStatus.ACTIVE,
+        expires_at=new_expires_at,
+        extra_effects=(_expiry_timer(record.id, new_expires_at),),
+    )
+
+
+def _instance_active_stopped(record: InstanceRecord, event: InstanceStoppedObserved) -> TransitionResult:
+    # Stop and resume are not built (DR-0055 decision 7). The timer stays armed, so a stopped
+    # VM is still destroyed at its expiry.
+    return _instance_result(record, event, state=InstanceStatus.FAILED, failure_reason="VM found stopped")
+
+
+def _instance_destroying_destroy_succeeded(record: InstanceRecord, event: InstanceDestroySucceeded) -> TransitionResult:
+    return _instance_result(
+        record,
+        event,
+        state=InstanceStatus.DESTROYED,
+        destroyed_at=event.at,
+        extra_effects=(_instance_cancel_all_timers(record.id),),
+    )
+
+
+def _instance_destroying_destroy_failed(record: InstanceRecord, event: InstanceDestroyFailed) -> TransitionResult:
+    # Re-arm ``expiry``: the fire that started this destroy consumed it. ``expires_at`` does NOT
+    # move (it must never pass ``hard_expires_at``, and the retry time may): only the timer does.
+    retry_at = event.at + INSTANCE_DESTROY_RETRY_DELAY
+    return _instance_result(
+        record,
+        event,
+        state=InstanceStatus.DESTROY_FAILED,
+        failure_reason=event.reason,
+        extra_effects=(_expiry_timer(record.id, retry_at),),
+    )
+
+
+def _instance_timer_lost(record: InstanceRecord, event: InstanceTimerLost) -> TransitionResult:
+    """The liveness sweep found no armed ``expiry`` timer in a state that waits on one. Re-arm it.
+
+    - ``active``, ``failed``, ``zombie``: at ``min(expires_at, hard_expires_at)``. ``expires_at``
+      never passes the hard limit (invariant 2), so the ``min`` only restates it. A time already
+      past is a timer that is due at once: the service fires it on its next poll, and the
+      ``InstanceExpired`` it carries is not stale, because its ``at`` is ``expires_at``.
+    - ``destroy-failed``: the lost timer was the retry. It is re-armed one retry delay from the
+      sweep's reading, and never later than ``hard_expires_at``. (The lease end may be a day away.)
+
+    Either way the timer never passes ``hard_expires_at``, which a lost timer must not do to an
+    instance that may hold a resource. The record's fields do not change, but the transition is
+    audited, so the repair leaves a trace."""
+    if record.state is InstanceStatus.DESTROY_FAILED:
+        fire_at = min(event.at + INSTANCE_DESTROY_RETRY_DELAY, record.hard_expires_at)
+    else:
+        fire_at = min(record.expires_at, record.hard_expires_at)
+    return _instance_result(record, event, state=record.state, extra_effects=(_expiry_timer(record.id, fire_at),))
+
+
+def _instance_destroyed_running_observed(record: InstanceRecord, event: InstanceRunningObserved) -> TransitionResult:
+    # The record said destroyed and the timers were cancelled, but a VM is running. It holds a
+    # resource, so it needs an expiry again: the timer is due now, and the destroy that follows
+    # is the same one any other expiry runs. The column is clamped to the hard limit (invariant
+    # 2); the timer is not, so a zombie found after the hard limit is destroyed at once.
+    return _instance_result(
+        record,
+        event,
+        state=InstanceStatus.ZOMBIE,
+        destroyed_at=None,
+        expires_at=min(event.at, record.hard_expires_at),
+        extra_effects=(_expiry_timer(record.id, event.at),),
+    )
+
+
+_INSTANCE_TABLE_RAW: dict[tuple[InstanceStatus, type], Callable] = {
+    (InstanceStatus.NEW, InstanceCreateRequested): _instance_new_create_requested,
+    # provisioning
+    (InstanceStatus.PROVISIONING, InstanceResourcesAllocated): _instance_provisioning_resources_allocated,
+    (InstanceStatus.PROVISIONING, InstanceProvisioned): _instance_provisioning_provisioned,
+    (InstanceStatus.PROVISIONING, InstanceProvisionFailed): _instance_provisioning_provision_failed,
+    (InstanceStatus.PROVISIONING, InstanceDestroyRequested): _instance_provisioning_destroy,
+    (InstanceStatus.PROVISIONING, InstanceExpired): _instance_provisioning_expired,
+    # active
+    (InstanceStatus.ACTIVE, InstanceRenewRequested): _instance_active_renew,
+    (InstanceStatus.ACTIVE, InstanceDestroyRequested): _instance_destroy,
+    (InstanceStatus.ACTIVE, InstanceExpired): _instance_expired,
+    (InstanceStatus.ACTIVE, InstanceStoppedObserved): _instance_active_stopped,
+    # failed, zombie, destroy-failed: each may hold a resource, each can be destroyed
+    (InstanceStatus.FAILED, InstanceDestroyRequested): _instance_destroy,
+    (InstanceStatus.FAILED, InstanceExpired): _instance_expired,
+    (InstanceStatus.ZOMBIE, InstanceDestroyRequested): _instance_destroy,
+    (InstanceStatus.ZOMBIE, InstanceExpired): _instance_expired,
+    (InstanceStatus.DESTROY_FAILED, InstanceDestroyRequested): _instance_destroy,
+    (InstanceStatus.DESTROY_FAILED, InstanceExpired): _instance_destroy_failed_expired,
+    # a lost expiry timer, in each state that waits on one (not provisioning or destroying, which
+    # wait on a run; the table's default for those is Ignore)
+    (InstanceStatus.ACTIVE, InstanceTimerLost): _instance_timer_lost,
+    (InstanceStatus.FAILED, InstanceTimerLost): _instance_timer_lost,
+    (InstanceStatus.ZOMBIE, InstanceTimerLost): _instance_timer_lost,
+    (InstanceStatus.DESTROY_FAILED, InstanceTimerLost): _instance_timer_lost,
+    # destroying
+    (InstanceStatus.DESTROYING, InstanceDestroySucceeded): _instance_destroying_destroy_succeeded,
+    (InstanceStatus.DESTROYING, InstanceDestroyFailed): _instance_destroying_destroy_failed,
+    # destroyed
+    (InstanceStatus.DESTROYED, InstanceRunningObserved): _instance_destroyed_running_observed,
+    # Not listed, so by the totality law: a Command is InvalidTransition (renew outside
+    # active; destroy while destroying or after destroyed -- the API's 409), a Report, timer or
+    # Observation is Ignore. That includes a stale report for a run the machine has moved past,
+    # and a duplicate InstanceProvisioned.
+}
+
+_INSTANCE_EVENT_TYPES: tuple[type, ...] = (
+    InstanceCreateRequested,
+    InstanceRenewRequested,
+    InstanceDestroyRequested,
+    InstanceResourcesAllocated,
+    InstanceProvisioned,
+    InstanceProvisionFailed,
+    InstanceDestroySucceeded,
+    InstanceDestroyFailed,
+    InstanceExpired,
+    InstanceStoppedObserved,
+    InstanceRunningObserved,
+    InstanceTimerLost,
+)
+
+INSTANCE_TABLE = _fill_defaults(
+    _INSTANCE_TABLE_RAW, tuple(InstanceStatus), _INSTANCE_EVENT_TYPES, birth_state=InstanceStatus.NEW
+)
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
 
-def transition(record: ClusterRecord | DeploymentRecord, event: ClusterEvent | DeploymentEvent) -> TransitionResult:
+def transition(
+    record: ClusterRecord | DeploymentRecord | InstanceRecord,
+    event: ClusterEvent | DeploymentEvent | InstanceEvent,
+) -> TransitionResult:
     """Pure. No IO, no clock, no locks. Total over (state x event-type).
 
     Raises ``InvalidTransition`` for illegal Commands, for privileged-actor
@@ -971,7 +1335,13 @@ def transition(record: ClusterRecord | DeploymentRecord, event: ClusterEvent | D
         table = CLUSTER_TABLE
     elif isinstance(record, DeploymentRecord):
         table = DEPLOYMENT_TABLE
+    elif isinstance(record, InstanceRecord):
+        table = INSTANCE_TABLE
     else:
-        raise TypeError(f"transition() requires a ClusterRecord or DeploymentRecord, got {type(record)!r}")
+        raise TypeError(
+            f"transition() requires a ClusterRecord, DeploymentRecord or InstanceRecord, got {type(record)!r}"
+        )
+    # The tables are keyed on (state, event type), so an event of another aggregate's kind
+    # is a KeyError and can never be read as this one's.
     rule = table[(record.state, type(event))]
     return rule(record, event)

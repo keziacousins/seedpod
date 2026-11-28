@@ -11,7 +11,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { formatDate, formatDateTime, formatTime, parseUTC } from "./time-utils";
+import { formatDate, formatDateTime, formatDuration, formatRemaining, formatTime, parseUTC } from "./time-utils";
 
 describe("parseUTC", () => {
   it("parses the +00:00 offset v2 actually sends", () => {
@@ -64,5 +64,28 @@ describe("formatters", () => {
       expect(out).not.toBe("-");
       expect(out).not.toMatch(/NaN/);
     }
+  });
+});
+
+describe("formatDuration", () => {
+  it("shows the units that are not zero", () => {
+    expect(formatDuration(5430)).toBe("1h 30m 30s");
+    expect(formatDuration(90000)).toBe("1d 1h");
+    expect(formatDuration(0)).toBe("0s");
+  });
+
+  it("refuses a negative or missing length", () => {
+    expect(formatDuration(-1)).toBe("-");
+    expect(formatDuration(undefined)).toBe("-");
+  });
+});
+
+describe("formatRemaining", () => {
+  const now = Date.parse("2026-08-10T12:00:00Z");
+
+  it("counts down to a +00:00 timestamp, and says Expired after it", () => {
+    expect(formatRemaining("2026-08-10T13:00:05+00:00", now)).toBe("1h 5s");
+    expect(formatRemaining("2026-08-10T12:00:00+00:00", now)).toBe("Expired");
+    expect(formatRemaining(null, now)).toBe("-");
   });
 });

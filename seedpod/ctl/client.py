@@ -273,6 +273,23 @@ class SeedpodClient:
             "GET", f"/api/clusters/{cluster_id}/audit", params={"limit": limit}
         )
 
+    # -- instances (seedpod/api/routers/instances.py) ------------------------
+
+    async def list_instances(self) -> Any:
+        return await self._request("GET", "/api/instances")
+
+    async def get_instance(self, instance_id: str) -> Any:
+        return await self._request("GET", f"/api/instances/{instance_id}")
+
+    async def create_instance(self, body: dict[str, Any]) -> Any:
+        return await self._request("POST", "/api/instances", json=body)
+
+    async def renew_instance(self, instance_id: str) -> Any:
+        return await self._request("POST", f"/api/instances/{instance_id}/renew")
+
+    async def destroy_instance(self, instance_id: str) -> Any:
+        return await self._request("DELETE", f"/api/instances/{instance_id}")
+
     # -- deployments (seedpod/api/routers/deployments.py) --------------------
 
     async def list_deployments(

@@ -45,6 +45,7 @@ from seedpod.core.clock import Clock
 from seedpod.core.errors import InfrastructureUnreachableError, PermanentError, TransientError
 from seedpod.core.events import EVENT_REGISTRY, Event
 from seedpod.data.repositories import (
+    ACTIVE_RUN_STATUSES,
     OutboxRepository,
     WorkflowRunRepository,
     WorkflowRunRow,
@@ -390,6 +391,14 @@ class WorkflowEngine:
             rows = self._run_repo.resumable(tx)
         for row in rows:
             await self._adopt(row.id)
+
+    async def resume_run(self, run_id: str) -> None:
+        """``resume_inflight()`` for ONE run (the instance liveness sweep's repair): adopt it if it
+        is non-terminal. ``_adopt`` does nothing for a run that already has a live task."""
+        async with self._uow() as tx:
+            row = self._run_repo.get(tx, run_id)
+        if row is not None and row.status in ACTIVE_RUN_STATUSES:
+            await self._adopt(run_id)
 
     async def cancel(self, run_id: str) -> None:
         """``cancel(run_id)`` = commit ``cancel_requested=TRUE``, THEN trip the
@@ -1089,10 +1098,11 @@ class WorkflowEngine:
             raise StepCancelled("cancelled during engine-owned wait")
 
     def _make_ctx(self, state: _RunState, step_path: str, attempt: int, token: CancelToken) -> StepContext:
+        # A run belongs to one aggregate: the context carries that id under its own name (DR-0055).
         return StepContext(
-            run_id=UUID(state.run_id), cluster_id=state.row.cluster_id, workflow=state.wf.workflow,
-            step_path=step_path, attempt=attempt, cancel=token, services=self._step_services,
-            note_sink=self._note_sink, progress_sink=self._progress_sink,
+            run_id=UUID(state.run_id), cluster_id=state.row.cluster_id, instance_id=state.row.instance_id,
+            workflow=state.wf.workflow, step_path=step_path, attempt=attempt, cancel=token,
+            services=self._step_services, note_sink=self._note_sink, progress_sink=self._progress_sink,
         )
 
     # -------------------------------------------------------------------------
@@ -1205,13 +1215,15 @@ class WorkflowEngine:
             self._step_repo.update(tx, str(run_id), step_path, notes=merged)
 
     async def _progress_sink(
-        self, run_id: UUID, cluster_id: str, workflow: str, step_path: str, attempt: int, message: str, fields: Mapping[str, Any]
+        self, run_id: UUID, cluster_id: str | None, workflow: str, step_path: str, attempt: int, message: str,
+        fields: Mapping[str, Any], *, instance_id: str | None = None,
     ) -> None:
+        owner = {"cluster_id": cluster_id} if instance_id is None else {"instance_id": instance_id}
         async with self._uow() as tx:
             ordinal = self._next_ordinal(str(run_id))
             self._outbox_repo.insert_run_notify(
                 tx, run_id=str(run_id), step_path=step_path, ordinal=ordinal, topic="workflow_progress",
-                payload={"run_id": str(run_id), "cluster_id": cluster_id, "workflow": workflow, "step_path": step_path, "attempt": attempt, "message": message, **fields},
+                payload={"run_id": str(run_id), **owner, "workflow": workflow, "step_path": step_path, "attempt": attempt, "message": message, **fields},
                 clock=self._clock,
             )
 
@@ -1224,7 +1236,10 @@ class WorkflowEngine:
         ordinal = self._next_ordinal(state.run_id)
         self._outbox_repo.insert_run_notify(
             tx, run_id=state.run_id, step_path="_run", ordinal=ordinal, topic=topic,
-            payload={"run_id": state.run_id, "workflow": state.wf.workflow, "cluster_id": state.row.cluster_id},
+            payload={
+                "run_id": state.run_id, "workflow": state.wf.workflow,
+                **({"cluster_id": state.row.cluster_id} if state.row.instance_id is None else {"instance_id": state.row.instance_id}),
+            },
             clock=self._clock,
         )
 
@@ -1234,14 +1249,25 @@ class WorkflowEngine:
 
     def _target_for(self, state: _RunState) -> tuple[str, str]:
         """Conflict 8's targeting rule: deploy/rollback events -> ('deployment',
-        run.deployment_id); provision/destroy -> ('cluster', run.cluster_id).
+        run.deployment_id); every other run -> the aggregate it belongs to (DR-0055 decision 4):
+        ('cluster', run.cluster_id) or ('instance', run.instance_id).
         ``workflow_runs.workflow`` is the CONCRETE definition name (Conflict 13);
         every deploy/rollback definition is named with a 'deploy' prefix
         (deploy-waves, deploy-rollback), so the prefix check is exact and total
-        over the closed set of definitions this engine will ever be handed."""
+        over the closed set of definitions this engine will ever be handed.
+
+        A run with neither id, or a deploy run with no ``deployment_id``, raises rather than
+        guessing a target (the table's CHECK makes the first impossible for a stored row)."""
+        row = state.row
         if state.wf.workflow.startswith("deploy"):
-            return ("deployment", state.row.deployment_id)
-        return ("cluster", state.row.cluster_id)
+            if row.deployment_id is None:
+                raise ValueError(f"run {state.run_id}: workflow {state.wf.workflow!r} has no deployment_id")
+            return ("deployment", row.deployment_id)
+        if row.instance_id is not None:
+            return ("instance", row.instance_id)
+        if row.cluster_id is not None:
+            return ("cluster", row.cluster_id)
+        raise ValueError(f"run {state.run_id} has neither cluster_id nor instance_id")
 
     def _build_event(self, event_name: str, payload_def: Mapping[str, Any], scope: Mapping[str, Any], state: _RunState) -> Event:
         """Step-level ``emit:`` events only -- no auto-attach (see

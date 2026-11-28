@@ -71,7 +71,7 @@ def test_new_create_requested_births_provisioning():
     assert result.effects == (
         _persist(new, None),
         _cn(new, ""),
-        ef.RunWorkflow(workflow="provision", cluster_id=new.id),
+        ef.RunWorkflow(workflow="provision", aggregate_type="cluster", aggregate_id=new.id),
     )
 
 
@@ -398,7 +398,7 @@ def test_destroy_scheduled_destroy_due_starts_destroying():
         _cn(new, "destroy-scheduled"),
         ef.RunWorkflow(
             workflow="destroy",
-            cluster_id=new.id,
+            aggregate_type="cluster", aggregate_id=new.id,
             # DR-0040 `trigger` + DR-0043 `snapshot` -- two independent questions
             # the destroy workflow needs answered, both stamped onto DestroyDue.
             args={"trigger": "operator", "snapshot": False},
@@ -624,7 +624,7 @@ def test_failed_retry_requested_reprovisions():
     assert result.effects == (
         _persist(new, old.version),
         _cn(new, "failed"),
-        ef.RunWorkflow(workflow="provision", cluster_id=new.id),
+        ef.RunWorkflow(workflow="provision", aggregate_type="cluster", aggregate_id=new.id),
     )
 
 

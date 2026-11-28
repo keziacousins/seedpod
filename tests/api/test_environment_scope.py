@@ -15,10 +15,11 @@ import pytest
 from sqlalchemy import text
 
 from seedpod.core.effects import ScheduleTimer
-from seedpod.core.events import TtlExpired
+from seedpod.core.events import InstanceExpired, TtlExpired
 from seedpod.data.repositories import WorkflowRunRow
 from tests.api.test_clusters import _birth_cluster, _promote_to_active, _set_kubeconfig
 from tests.api.test_features import _birth_active_snapshot_cluster, _install_fake_kubectl
+from tests.runtime.conftest import make_instance_row, make_owner_key
 
 
 @pytest.fixture
@@ -299,6 +300,36 @@ async def test_workflow_and_timer_lists_show_only_the_key_environment(app, clien
     assert {t["aggregate_id"] for t in all_timers} == {"c1", "s1"}
     staging_timers = (await client.get("/api/timers", headers=headers)).json()["timers"]
     assert {t["aggregate_id"] for t in staging_timers} == {"s1"}
+
+
+async def test_instance_runs_and_timers_follow_the_instance_environment(app, client):
+    """DR-0055: an instance run has no cluster, and its instance's environment decides who sees it,
+    and who sees the instance's timer."""
+    now = app.clock.now()
+    async with app.uow() as t:
+        owner = make_owner_key(t)
+        for iid, environment in (("i1", "staging"), ("i2", "ephemeral")):
+            app.repos.instances.insert(t, make_instance_row(iid, f"box-{iid}", owner, environment=environment))
+            app.repos.workflow_runs.insert(t, WorkflowRunRow(
+                id=f"run-{iid}", workflow="provision-instance-tart", workflow_version=1, cluster_id=None,
+                instance_id=iid, deployment_id=None, dedupe_key=f"dedupe-{iid}", args={}, status="succeeded",
+                cancel_requested=False, failed_step=None, error=None, undo_incomplete=None,
+                initiated_by="api:test", created_at=now, started_at=now, finished_at=now,
+            ))
+            app.repos.timers.upsert(t, ScheduleTimer(
+                aggregate_type="instance", aggregate_id=iid, timer_key="expiry",
+                fire_at=now + timedelta(hours=1), event=InstanceExpired(at=now, actor="timer:expiry"),
+            ), created_by_effect=f"effect-{iid}")
+    admin = await _key(app, environment="all")
+    staging = await _key(app, environment="staging")
+
+    rows = (await client.get("/api/workflows", headers=admin)).json()["workflows"]
+    assert {(r["id"], r["cluster_id"], r["instance_id"]) for r in rows} == {("run-i1", None, "i1"), ("run-i2", None, "i2")}
+    rows = (await client.get("/api/workflows", headers=staging)).json()["workflows"]
+    assert [r["instance_id"] for r in rows] == ["i1"]
+    timers = (await client.get("/api/timers", headers=staging)).json()["timers"]
+    assert [(t["aggregate_type"], t["aggregate_id"]) for t in timers] == [("instance", "i1")]
+    assert len((await client.get("/api/timers", headers=admin)).json()["timers"]) == 2
 
 
 # ---------------------------------------------------------------------------

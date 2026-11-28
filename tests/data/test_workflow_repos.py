@@ -571,3 +571,84 @@ async def test_repos_never_commit_rollback_on_exception(uow):
 
     async with uow() as tx:
         assert run_repo.get(tx, "r1") is None
+
+
+# ---------------------------------------------------------------------------
+# DR-0055 decision 4 (0005_instances.sql): a run belongs to a cluster OR an instance.
+# ---------------------------------------------------------------------------
+
+
+def _insert_instance(session, instance_id: str) -> None:
+    session.execute(
+        text("INSERT INTO api_keys (key_hash, username, created_at) VALUES (:h, 'u', :now)"),
+        {"h": f"hash-{instance_id}", "now": NOW.isoformat()},
+    )
+    owner = session.execute(text("SELECT MAX(id) FROM api_keys")).scalar()
+    session.execute(
+        text(
+            """
+            INSERT INTO instances (id, slug, provider, environment, template, size, status, owner_key_id,
+                                   lease_seconds, expires_at, hard_expires_at, hourly_price, vcpu,
+                                   memory_mb, created_at, updated_at)
+            VALUES (:id, :id, 'tart', 'ephemeral', 't', 's', 'active', :owner, 60, :now, :now, 0, 1, 1,
+                    :now, :now)
+            """
+        ),
+        {"id": instance_id, "owner": owner, "now": NOW.isoformat()},
+    )
+
+
+def make_instance_run(run_id: str, instance_id: str, *, status: str = "pending", **overrides) -> WorkflowRunRow:
+    return make_run(run_id, None, status=status, instance_id=instance_id, **overrides)
+
+
+def test_run_row_needs_exactly_one_aggregate():
+    with pytest.raises(ValueError, match="exactly one"):
+        make_run("r1", None)
+    with pytest.raises(ValueError, match="exactly one"):
+        make_run("r1", "c1", instance_id="i1")
+    assert make_run("r1", "c1").instance_id is None
+    assert make_instance_run("r1", "i1").cluster_id is None
+
+
+async def test_instance_run_round_trips_with_a_null_cluster(uow):
+    async with uow() as t:
+        _insert_instance(t, "i1")
+        run_repo.insert(t, make_instance_run("r1", "i1", dedupe_key="k1"))
+    async with uow() as t:
+        got = run_repo.get(t, "r1")
+        by_key = run_repo.get_by_dedupe_key(t, "k1")
+    assert (got.cluster_id, got.instance_id) == (None, "i1")
+    assert by_key == got
+
+
+async def test_active_for_instance_sees_only_that_instances_live_run(uow):
+    async with uow() as t:
+        _insert_cluster(t, "c1")
+        _insert_instance(t, "i1")
+        _insert_instance(t, "i2")
+        run_repo.insert(t, make_run("cluster-run", "c1", status="running"))
+        run_repo.insert(t, make_instance_run("old", "i1", status="succeeded"))
+        run_repo.insert(t, make_instance_run("live", "i1", status="blocked"))
+    async with uow() as t:
+        assert run_repo.active_for_instance(t, "i1").id == "live"
+        assert run_repo.active_for_instance(t, "i2") is None
+        assert run_repo.active_for_instance(t, "c1") is None  # a cluster id is not an instance id
+        assert run_repo.active_for_cluster(t, "i1") is None  # and the reverse
+        assert run_repo.active_for_cluster(t, "c1").id == "cluster-run"
+
+
+async def test_one_active_run_per_instance_is_enforced_by_insert(uow):
+    async with uow() as t:
+        _insert_instance(t, "i1")
+        run_repo.insert(t, make_instance_run("a", "i1", status="running"))
+    with pytest.raises(IntegrityError):
+        async with uow() as t:
+            run_repo.insert(t, make_instance_run("b", "i1", status="pending"))
+
+
+async def test_insert_admitted_still_dedupes_instance_runs(uow):
+    async with uow() as t:
+        _insert_instance(t, "i1")
+        assert run_repo.insert_admitted(t, make_instance_run("a", "i1", dedupe_key="k")) is True
+        assert run_repo.insert_admitted(t, make_instance_run("b", "i1", dedupe_key="k")) is False

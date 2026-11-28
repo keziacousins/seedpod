@@ -24,7 +24,10 @@ def test_migrate_applies_every_file_and_stamps_user_version(tmp_path):
     # 0001 initial + 0002 clusters.dns_record_id (DR-0034)
     # + 0003 deployment_presets.default_provider (DR-0046)
     # + 0004 clusters.last_healthy_at (DR-0050)
-    assert _user_version(db) == 4
+    # + 0005 instances table, workflow_runs rebuilt (DR-0055)
+    # + 0006 instance_state_audits (DR-0055)
+    # + 0007 instances.ssh_public_key (DR-0055)
+    assert _user_version(db) == 7
 
     with db.engine.begin() as conn:
         tables = {
@@ -40,6 +43,8 @@ def test_migrate_applies_every_file_and_stamps_user_version(tmp_path):
         "workflow_steps",
         "effects_outbox",
         "timers",
+        "instances",
+        "instance_state_audits",
     ):
         assert expected in tables
 
@@ -51,7 +56,10 @@ def test_migrate_is_idempotent(tmp_path):
     # 0001 initial + 0002 clusters.dns_record_id (DR-0034)
     # + 0003 deployment_presets.default_provider (DR-0046)
     # + 0004 clusters.last_healthy_at (DR-0050)
-    assert _user_version(db) == 4
+    # + 0005 instances table, workflow_runs rebuilt (DR-0055)
+    # + 0006 instance_state_audits (DR-0055)
+    # + 0007 instances.ssh_public_key (DR-0055)
+    assert _user_version(db) == 7
 
     # and the schema is still intact / usable, not double-applied
     with db.engine.begin() as conn:

@@ -6,7 +6,7 @@ Effects carry abstract verbs (the machine stays provider-ignorant); the run-admi
 definition + inputs via this table, built in the composition root.
 ``workflow_runs.workflow`` stores the CONCRETE name (pinned with ``workflow_version``).
 
-DR-0022 ruling 2: the destroy arm now returns ``{"cluster_id": eff.cluster_id}``,
+DR-0022 ruling 2: the destroy arm now returns ``{"cluster_id": eff.aggregate_id}``,
 matching provision — the ``DnsRecordRefResolver`` Protocol (a dispatch-time snapshot
 of one field, stale on any retry or crash-resumed run) is DELETED. Both
 ``destroy-cloud.yml`` and ``destroy-shared.yml`` gain a ``cluster.load_infra`` head
@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from seedpod.core.effects import RunWorkflow
-    from seedpod.core.records import ClusterRecord
+    from seedpod.core.records import ClusterRecord, InstanceRecord
 
 __all__ = ["WorkflowDispatch"]
 
@@ -36,10 +36,33 @@ class WorkflowDispatch:
     destroy_by_provider: Mapping[str, str]  # {'digitalocean':'destroy-cloud', 'tart':'destroy-cloud',
     #  'kind':'destroy-shared', 'orbstack':'destroy-shared'}
 
-    def resolve(self, eff: RunWorkflow, cluster: ClusterRecord) -> tuple[str, dict]:
+    def resolve_instance(self, eff: RunWorkflow, instance: InstanceRecord) -> tuple[str, dict]:
+        """The instance verbs (DR-0055): ``provision`` -> ``provision-instance-{provider}``,
+        ``destroy`` -> ``destroy-instance`` (one workflow for every provider: the provider is
+        read from the instance row at run time, as the cluster destroy does, DR-0022 ruling 2).
+        Both get ``{"instance_id": ...}`` and nothing else. The args are an allowlist for the
+        same reason ``resolve``'s destroy arm is one, and nothing resolvable is smuggled in.
+        Any other verb, or an effect aimed at another aggregate, raises: an instance never
+        deploys, and its id is never read as a cluster's."""
+        if eff.aggregate_type != "instance":
+            raise ValueError(f"cannot resolve {eff.workflow!r} for aggregate type {eff.aggregate_type!r} as an instance")
+        if eff.aggregate_id != instance.id:
+            raise ValueError(f"effect names instance {eff.aggregate_id!r}, record is {instance.id!r}")
         match eff.workflow:
             case "provision":
-                return (f"provision-{cluster.provider}", {"cluster_id": eff.cluster_id})
+                return (f"provision-instance-{instance.provider}", {"instance_id": eff.aggregate_id})
+            case "destroy":
+                return ("destroy-instance", {"instance_id": eff.aggregate_id})
+        raise ValueError(f"unknown abstract workflow verb for an instance: {eff.workflow!r}")
+
+    def resolve(self, eff: RunWorkflow, cluster: ClusterRecord) -> tuple[str, dict]:
+        # Every verb below is a CLUSTER verb (instance workflows resolve in `resolve_instance`).
+        # Refuse an effect aimed at anything else rather than read its id as a cluster's.
+        if eff.aggregate_type != "cluster":
+            raise ValueError(f"cannot resolve {eff.workflow!r} for aggregate type {eff.aggregate_type!r}")
+        match eff.workflow:
+            case "provision":
+                return (f"provision-{cluster.provider}", {"cluster_id": eff.aggregate_id})
             case "deploy":
                 return ("deploy-waves", {"deployment_id": eff.deployment_id})
             case "rollback":
@@ -66,7 +89,7 @@ class WorkflowDispatch:
                 return (
                     self.destroy_by_provider[cluster.provider],
                     {
-                        "cluster_id": eff.cluster_id,
+                        "cluster_id": eff.aggregate_id,
                         "trigger": args.get("trigger", "operator"),
                         "snapshot": args.get("snapshot", False),
                     },

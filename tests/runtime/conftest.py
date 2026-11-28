@@ -8,9 +8,10 @@ anywhere -- fakes below are plain, hand-built classes.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
+from sqlalchemy import text
 
 from seedpod.core.clock import FrozenClock
 from seedpod.core.records import ClusterState, DeploymentState, Origin
@@ -23,6 +24,9 @@ from seedpod.data.repositories import (
     DeploymentRepository,
     DeploymentRow,
     DeploymentStateAuditRepository,
+    InstanceRepository,
+    InstanceRow,
+    InstanceStateAuditRepository,
     OutboxRepository,
     Repositories,
     TimerRepository,
@@ -69,6 +73,8 @@ def repos():
         timers=TimerRepository(),
         outbox=OutboxRepository(),
         workflow_runs=WorkflowRunRepository(),
+        instances=InstanceRepository(),
+        instance_state_audits=InstanceStateAuditRepository(),
     )
 
 
@@ -210,6 +216,48 @@ def make_deployment_row(deployment_id: str, cluster_id: str, *, status: str = "a
     return DeploymentRow(**fields)
 
 
+def make_owner_key(session) -> int:
+    """An api_keys row for ``instances.owner_key_id``'s foreign key; returns its id."""
+    session.execute(
+        text("INSERT INTO api_keys (key_hash, username, created_at) VALUES (:h, 'u', :now)"),
+        {"h": f"hash-{session.execute(text('SELECT COUNT(*) FROM api_keys')).scalar()}", "now": NOW.isoformat()},
+    )
+    return session.execute(text("SELECT MAX(id) FROM api_keys")).scalar()
+
+
+def make_instance_row(
+    instance_id: str, slug: str, owner_key_id: int, *, status: str = "new", **overrides
+) -> InstanceRow:
+    """A birth-shaped ``instances`` row (version 0, status 'new' by default). The lease is one
+    hour from ``NOW``, the hard limit a day."""
+    fields = {
+        "id": instance_id,
+        "slug": slug,
+        "provider": "fake",
+        "environment": "ephemeral",
+        "template": "ubuntu",
+        "size": "small",
+        "status": status,
+        "version": 0,
+        "owner_key_id": owner_key_id,
+        "resource_ids": {},
+        "address": None,
+        "known_hosts": None,
+        "lease_seconds": 3600,
+        "expires_at": NOW + timedelta(hours=1),
+        "hard_expires_at": NOW + timedelta(days=1),
+        "hourly_price": 0.0,
+        "vcpu": 1,
+        "memory_mb": 1024,
+        "failure_reason": None,
+        "created_at": NOW,
+        "updated_at": NOW,
+        "destroyed_at": None,
+    }
+    fields.update(overrides)
+    return InstanceRow(**fields)
+
+
 def make_run_row(run_id: str, cluster_id: str, *, workflow: str = "deploy-waves", status: str = "running", **overrides) -> WorkflowRunRow:
     fields = {
         "id": run_id,
@@ -241,6 +289,8 @@ __all__ = [
     "FakeWorkflowDefinition",
     "make_cluster_row",
     "make_deployment_row",
+    "make_instance_row",
+    "make_owner_key",
     "make_run_row",
     "ClusterState",
     "DeploymentState",

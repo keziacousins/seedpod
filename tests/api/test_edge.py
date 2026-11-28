@@ -142,6 +142,7 @@ async def test_workflows_endpoint_serializes_a_real_row(app, client, auth_header
         "id": "run-1",
         "workflow": "provision-kind",
         "cluster_id": "c1",
+        "instance_id": None,
         "deployment_id": None,
         "status": "running",
         "failed_step": None,

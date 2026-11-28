@@ -1,14 +1,15 @@
 ---
 title: DR-0055 — a bare VM is an instance, its own aggregate, and never a cluster without k3s
 type: decision
-status: proposal
+status: active
 created: 2026-11-23
-updated: 2026-11-23
+updated: 2026-11-28
+amended-by: DR-0056
 ---
 
 # DR-0055: a bare VM is an instance, not a cluster
 
-**Status: PROPOSAL — not yet ratified.**
+**Status: ACTIVE — ratified by Kezia, 2026-11-23.**
 
 ## Context
 
@@ -128,7 +129,7 @@ on the host stays crew's: identity, runs, workers and transcripts.
   migration. The acceptance suite must pass unchanged.
 - DR-0054's table gains a row: an instance's environment is `instances.environment`. Its timers and
   runs follow it. The timer and workflow lists currently hide these rows from a scoped key, and must
-  change. DR-0054 is itself still a proposal, and Decision 9 depends on it.
+  change. Decision 9 depends on DR-0054.
 - `docs/design/` and crew's `DESIGN.md`, which plans its own VM providers, need updating on
   ratification.
 - A holder that keeps renewing while stuck costs money until `hard_expires_at`. That is the bound.

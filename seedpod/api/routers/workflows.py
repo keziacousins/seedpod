@@ -4,7 +4,7 @@
 (``WorkflowRunRepository.list_all``).
 
 Field set is exactly ui-contract obligation 7 / DR-0003's inventory: ``id, workflow,
-cluster_id, deployment_id, status, failed_step, error, undo_incomplete, created_at,
+cluster_id, instance_id, deployment_id, status, failed_step, error, undo_incomplete, created_at,
 started_at, finished_at`` -- a clean DTO (DR-0002: "we own the UI, so the SPA adapts
 to the clean v2 contract"), not the full ``WorkflowRunRow`` (which also carries
 ``workflow_version``/``dedupe_key``/``args``/``cancel_requested``/``initiated_by``,
@@ -36,6 +36,7 @@ def _serialize(row: WorkflowRunRow) -> dict[str, Any]:
         "id": row.id,
         "workflow": row.workflow,
         "cluster_id": row.cluster_id,
+        "instance_id": row.instance_id,
         "deployment_id": row.deployment_id,
         "status": row.status,
         "failed_step": row.failed_step,
@@ -55,7 +56,11 @@ async def list_workflows(
     async with app.uow() as t:
         rows = app.repos.workflow_runs.list_all(t)
         if api_key.environment != ALL_ENVIRONMENTS:
-            # DR-0054: a run has its cluster's environment.
+            # DR-0054: a run has the environment of its cluster or its instance (DR-0055).
             environments = {c.id: c.environment for c in app.repos.clusters.list_all(t)}
-            rows = [r for r in rows if environment_admits(api_key.environment, environments.get(r.cluster_id, ""))]
+            environments |= {i.id: i.environment for i in app.repos.instances.list_all(t)}
+            rows = [
+                r for r in rows
+                if environment_admits(api_key.environment, environments.get(r.cluster_id or r.instance_id, ""))
+            ]
     return {"workflows": [_serialize(r) for r in rows]}

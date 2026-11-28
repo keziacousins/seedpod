@@ -70,6 +70,11 @@ class FakeSshdBackend:
     # `task.cancel()` while the fake is still "mid-install".
     install_delay_s: float = 0.0
 
+    # DR-0055 `BootInstance`: what the fake guest saw (the ssh argv and the stdin bytes), and what the
+    # "entrypoint" exits with.
+    boot: tuple[tuple[str, ...], bytes | None] | None = None
+    boot_exit_code: int = 0
+
 
 class FakeSshTransport:
     """Implements ``seedpod.providers.contract.SubprocessRunner`` against a
@@ -130,6 +135,9 @@ class FakeSshTransport:
             if len(argv) == 2 and argv[1] == "-V":
                 return SubprocessResult(returncode=0, stdout=b"", stderr=b"OpenSSH_9.0\n")
             command = argv[-1]
+            if "/etc/seedpod-boot" in command:
+                self.backend.boot = (tuple(argv), stdin)
+                return SubprocessResult(returncode=self.backend.boot_exit_code, stdout=b"", stderr=b"")
             if self.backend.install_delay_s and "INSTALL_K3S_EXEC" in command:
                 await asyncio.sleep(self.backend.install_delay_s)
             return self._handle_ssh_command(command)

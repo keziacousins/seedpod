@@ -60,19 +60,23 @@ class RecordingNoteSink:
 @dataclass
 class RecordingProgressSink:
     calls: list[tuple] = field(default_factory=list)
+    instance_ids: list[str | None] = field(default_factory=list)  # DR-0055: set on an instance run
     raise_on_call: bool = False
 
     async def __call__(
         self,
         run_id: uuid.UUID,
-        cluster_id: str,
+        cluster_id: str | None,
         workflow: str,
         step_path: str,
         attempt: int,
         message: str,
         fields: Mapping[str, JsonValue],
+        *,
+        instance_id: str | None = None,
     ) -> None:
         self.calls.append((run_id, cluster_id, workflow, step_path, attempt, message, dict(fields)))
+        self.instance_ids.append(instance_id)
         if self.raise_on_call:
             raise RuntimeError("progress sink exploded")
 
@@ -84,7 +88,8 @@ def make_step_context(
     note_sink: RecordingNoteSink | None = None,
     progress_sink: RecordingProgressSink | None = None,
     run_id: uuid.UUID | None = None,
-    cluster_id: str = "cluster-1",
+    cluster_id: str | None = "cluster-1",
+    instance_id: str | None = None,
     workflow: str = "provision-digitalocean",
     step_path: str = "create",
     attempt: int = 1,
@@ -93,7 +98,8 @@ def make_step_context(
 
     return StepContext(
         run_id=run_id or uuid.uuid4(),
-        cluster_id=cluster_id,
+        cluster_id=None if instance_id is not None else cluster_id,
+        instance_id=instance_id,
         workflow=workflow,
         step_path=step_path,
         attempt=attempt,
@@ -835,7 +841,7 @@ class EngineHarness:
     run_repo: Any
     step_repo: Any
     outbox_repo: Any
-    dispatcher: FakeDispatcher
+    dispatcher: Any  # a FakeDispatcher, or the real Dispatcher when built with dispatcher_factory
     sleeper: InstantSleeper
     registry: Any
     definitions: Mapping[str, Any]
@@ -849,8 +855,9 @@ def build_engine(
     *,
     named_types: Mapping[str, type] | None = None,
     dispatcher: FakeDispatcher | None = None,
+    dispatcher_factory: Any = None,
     sleeper: InstantSleeper | None = None,
-    subprocess_manager: FakeSubprocessManager | None = None,
+    subprocess_manager: Any = None,
     **engine_overrides: Any,
 ) -> EngineHarness:
     """The shared test harness other engine test suites build on. `definitions_yaml`
@@ -880,7 +887,12 @@ def build_engine(
     adapter = _RegistryViewAdapter(registry=registry, named_types=dict(named_types or {}))
     definitions = {name: load_workflow(text, adapter) for name, text in definitions_yaml.items()}
 
-    dispatcher = dispatcher if dispatcher is not None else FakeDispatcher()
+    # `dispatcher_factory(uow)` builds a REAL Dispatcher over this harness's own UnitOfWork, so a
+    # test can drive the real transition path (tests/engine/test_instance_lifecycle.py).
+    if dispatcher_factory is not None:
+        dispatcher = dispatcher_factory(uow)
+    else:
+        dispatcher = dispatcher if dispatcher is not None else FakeDispatcher()
     sleeper = sleeper if sleeper is not None else InstantSleeper()
     services = StepServices(subprocess_manager=subprocess_manager or FakeSubprocessManager())
 

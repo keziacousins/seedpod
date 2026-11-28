@@ -109,6 +109,16 @@ export function Workflows() {
         ),
     },
     {
+      key: "instance_id",
+      label: "Instance",
+      render: (instanceId) =>
+        instanceId ? (
+          <Guid value={instanceId} linkTo={`/instances/${instanceId}`} />
+        ) : (
+          <span style="color: var(--text-light);">-</span>
+        ),
+    },
+    {
       key: "deployment_id",
       label: "Deployment",
       render: (deploymentId) =>
@@ -196,10 +206,10 @@ export function Workflows() {
           <span style="color: var(--text-light); font-size: 0.85em;">
             {type}:
           </span>
-          {type === "cluster" ? (
+          {type === "cluster" || type === "instance" ? (
             <Guid
               value={row.aggregate_id}
-              linkTo={`/clusters/${row.aggregate_id}`}
+              linkTo={`/${type}s/${row.aggregate_id}`}
             />
           ) : (
             <Guid value={row.aggregate_id} />

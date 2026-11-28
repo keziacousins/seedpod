@@ -6,6 +6,8 @@ import { MiniEventHud } from "./components/MiniEventHud";
 import { Login } from "./pages/Login";
 import { ClusterList } from "./pages/ClusterList";
 import { ClusterDetail } from "./pages/ClusterDetail";
+import { InstanceList } from "./pages/InstanceList";
+import { InstanceDetail } from "./pages/InstanceDetail";
 import { PodDetail } from "./pages/PodDetail";
 import { ContainerDetail } from "./pages/ContainerDetail";
 import { DeploymentList } from "./pages/DeploymentList";
@@ -32,6 +34,7 @@ import "./styles/app.css";
 
 const NAV_ITEMS = [
   { path: "/clusters", label: "Clusters" },
+  { path: "/instances", label: "Instances" },
   { path: "/deployments", label: "Deployments" },
   { path: "/presets", label: "Presets" },
   { path: "/snapshots", label: "Snapshots" },
@@ -116,6 +119,8 @@ export function App() {
           <ClusterDetail path="/clusters/:clusterId" />
           <PodDetail path="/clusters/:clusterId/pods/:namespace/:podName" />
           <ContainerDetail path="/clusters/:clusterId/pods/:namespace/:podName/containers/:containerName" />
+          <InstanceList path="/instances" />
+          <InstanceDetail path="/instances/:instanceId" />
           <DeploymentList path="/deployments" />
           <DeploymentDetail path="/deployments/:deploymentId" />
           <PresetList path="/presets" />

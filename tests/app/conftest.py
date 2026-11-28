@@ -28,6 +28,8 @@ from seedpod.data.repositories import (
     DeploymentAuditRepository,
     DeploymentRepository,
     DeploymentStateAuditRepository,
+    InstanceRepository,
+    InstanceStateAuditRepository,
     OutboxRepository,
     Repositories,
     SecretAuditRepository,
@@ -77,6 +79,8 @@ def repos() -> Repositories:
         timers=TimerRepository(),
         outbox=OutboxRepository(),
         workflow_runs=WorkflowRunRepository(),
+        instances=InstanceRepository(),
+        instance_state_audits=InstanceStateAuditRepository(),
     )
 
 

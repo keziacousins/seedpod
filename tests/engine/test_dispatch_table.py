@@ -8,12 +8,13 @@ head step).
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
 from seedpod.core.effects import RunWorkflow
-from seedpod.core.records import ClusterRecord, ClusterState, Origin
+from seedpod.core.records import ClusterRecord, ClusterState, InstanceRecord, InstanceStatus, Origin
 from seedpod.engine.config import parse_workflow
 from seedpod.engine.dispatch_table import WorkflowDispatch
 
@@ -45,7 +46,7 @@ def make_dispatch() -> WorkflowDispatch:
 
 def test_provision_resolves_to_provider_specific_definition():
     dispatch = make_dispatch()
-    eff = RunWorkflow(workflow="provision", cluster_id="cluster-1")
+    eff = RunWorkflow(workflow="provision", aggregate_type="cluster", aggregate_id="cluster-1")
     name, inputs = dispatch.resolve(eff, make_cluster("digitalocean"))
     assert name == "provision-digitalocean"
     assert inputs == {"cluster_id": "cluster-1"}
@@ -53,14 +54,14 @@ def test_provision_resolves_to_provider_specific_definition():
 
 def test_provision_resolves_per_provider_for_tart():
     dispatch = make_dispatch()
-    eff = RunWorkflow(workflow="provision", cluster_id="cluster-1")
+    eff = RunWorkflow(workflow="provision", aggregate_type="cluster", aggregate_id="cluster-1")
     name, _inputs = dispatch.resolve(eff, make_cluster("tart"))
     assert name == "provision-tart"
 
 
 def test_deploy_resolves_to_deploy_waves():
     dispatch = make_dispatch()
-    eff = RunWorkflow(workflow="deploy", cluster_id="cluster-1", deployment_id="dep-1")
+    eff = RunWorkflow(workflow="deploy", aggregate_type="cluster", aggregate_id="cluster-1", deployment_id="dep-1")
     name, inputs = dispatch.resolve(eff, make_cluster())
     assert name == "deploy-waves"
     assert inputs == {"deployment_id": "dep-1"}
@@ -68,7 +69,7 @@ def test_deploy_resolves_to_deploy_waves():
 
 def test_rollback_resolves_to_deploy_rollback():
     dispatch = make_dispatch()
-    eff = RunWorkflow(workflow="rollback", cluster_id="cluster-1", deployment_id="dep-1")
+    eff = RunWorkflow(workflow="rollback", aggregate_type="cluster", aggregate_id="cluster-1", deployment_id="dep-1")
     name, inputs = dispatch.resolve(eff, make_cluster())
     assert name == "deploy-rollback"
     assert inputs == {"deployment_id": "dep-1"}
@@ -76,14 +77,14 @@ def test_rollback_resolves_to_deploy_rollback():
 
 def test_destroy_resolves_by_provider_mapping_cloud():
     dispatch = make_dispatch()
-    eff = RunWorkflow(workflow="destroy", cluster_id="cluster-1")
+    eff = RunWorkflow(workflow="destroy", aggregate_type="cluster", aggregate_id="cluster-1")
     name, _inputs = dispatch.resolve(eff, make_cluster("digitalocean"))
     assert name == "destroy-cloud"
 
 
 def test_destroy_resolves_by_provider_mapping_shared():
     dispatch = make_dispatch()
-    eff = RunWorkflow(workflow="destroy", cluster_id="cluster-1")
+    eff = RunWorkflow(workflow="destroy", aggregate_type="cluster", aggregate_id="cluster-1")
     name, _inputs = dispatch.resolve(eff, make_cluster("kind"))
     assert name == "destroy-shared"
 
@@ -105,7 +106,7 @@ def test_destroy_inputs_carry_cluster_id_and_trigger_only():
     ``snapshot_before_destroy`` is likewise unrecoverable downstream, and is a
     different question from ``trigger``'s provenance."""
     dispatch = make_dispatch()
-    eff = RunWorkflow(workflow="destroy", cluster_id="cluster-1")
+    eff = RunWorkflow(workflow="destroy", aggregate_type="cluster", aggregate_id="cluster-1")
     _name, inputs = dispatch.resolve(eff, make_cluster())
     # defaults when the machine stamped neither
     assert inputs == {"cluster_id": "cluster-1", "trigger": "operator", "snapshot": False}
@@ -113,7 +114,7 @@ def test_destroy_inputs_carry_cluster_id_and_trigger_only():
 
 def test_destroy_inputs_carry_the_ttl_trigger_when_the_machine_stamped_one():
     dispatch = make_dispatch()
-    eff = RunWorkflow(workflow="destroy", cluster_id="cluster-1", args={"trigger": "ttl_expiry"})
+    eff = RunWorkflow(workflow="destroy", aggregate_type="cluster", aggregate_id="cluster-1", args={"trigger": "ttl_expiry"})
     _name, inputs = dispatch.resolve(eff, make_cluster())
     assert inputs == {"cluster_id": "cluster-1", "trigger": "ttl_expiry", "snapshot": False}
 
@@ -122,7 +123,7 @@ def test_destroy_inputs_carry_the_operator_snapshot_request():
     """DR-0043: `snapshot_before_destroy=true` reaches the workflow, where
     `cluster.auto_snapshot` honours it unconditionally."""
     dispatch = make_dispatch()
-    eff = RunWorkflow(workflow="destroy", cluster_id="cluster-1", args={"snapshot": True})
+    eff = RunWorkflow(workflow="destroy", aggregate_type="cluster", aggregate_id="cluster-1", args={"snapshot": True})
     _name, inputs = dispatch.resolve(eff, make_cluster())
     assert inputs["snapshot"] is True
 
@@ -152,7 +153,7 @@ def test_destroy_resolve_supplies_every_input_the_shipped_workflow_declares(prov
     # only, and a pure structural parse needs no verb registry to get it.
     definition = parse_workflow(yaml_path.read_text())
     _name, inputs = make_dispatch().resolve(
-        RunWorkflow(workflow="destroy", cluster_id="cluster-1"), make_cluster(provider)
+        RunWorkflow(workflow="destroy", aggregate_type="cluster", aggregate_id="cluster-1"), make_cluster(provider)
     )
     missing = set(definition.inputs) - set(inputs)
     assert not missing, (
@@ -163,6 +164,21 @@ def test_destroy_resolve_supplies_every_input_the_shipped_workflow_declares(prov
 
 def test_unknown_abstract_verb_raises():
     dispatch = make_dispatch()
-    eff = RunWorkflow(workflow="not-a-real-verb", cluster_id="cluster-1")
+    eff = RunWorkflow(workflow="not-a-real-verb", aggregate_type="cluster", aggregate_id="cluster-1")
     with pytest.raises(ValueError):
         dispatch.resolve(eff, make_cluster())
+
+
+@pytest.mark.parametrize(("verb", "definition"), [("provision", "provision-instance-tart"), ("destroy", "destroy-instance")])
+def test_instance_dispatch_names_a_shipped_workflow_and_supplies_exactly_its_inputs(verb, definition):
+    """DR-0043's trap: the dispatch allowlist and the YAML's `inputs:` are two lists nothing else keeps equal."""
+    now = datetime(2026, 7, 15, tzinfo=UTC)
+    record = InstanceRecord(
+        id="inst-1", slug="box", state=InstanceStatus.PROVISIONING, version=1, provider="tart", environment="ephemeral",
+        lease_seconds=3600, expires_at=now + timedelta(hours=1), hard_expires_at=now + timedelta(hours=24),
+    )
+    name, inputs = make_dispatch().resolve_instance(
+        RunWorkflow(workflow=verb, aggregate_type="instance", aggregate_id="inst-1"), record
+    )
+    assert name == definition
+    assert set(inputs) == set(parse_workflow((WORKFLOWS_DIR / f"{name}.yml").read_text()).inputs)

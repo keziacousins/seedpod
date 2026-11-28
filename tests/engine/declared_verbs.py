@@ -159,7 +159,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-from pydantic import BaseModel, SecretStr
+from pydantic import BaseModel, SecretStr, create_model
 
 from seedpod.core.acme import AcmeConfig
 from seedpod.core.cluster_spec import ClusterSpecification
@@ -642,6 +642,31 @@ class LoadInfraOutput(BaseModel):
     dns_record: DnsRecordRef | None = None
 
 
+def _fixture(name: str, **fields: object) -> type[BaseModel]:
+    """A fixture model from ``field=annotation`` pairs; a tuple carries a default."""
+    return create_model(name, **{k: v if isinstance(v, tuple) else (v, ...) for k, v in fields.items()})
+
+
+# DR-0055's `instance.*` family: a bare VM with no k3s. Five verbs.
+InstLoadParams = _fixture("InstLoadParams", instance_id=str)  # also instance.load_infra's
+InstLoadSpecOutput = _fixture(
+    "InstLoadSpecOutput", provider=str, slug=str, image=str, vcpu=int, memory_mb=int, disk_gb=int | None,
+    provider_size=(str | None, None), region=(str | None, None), entrypoint=str, ssh_user=str, ssh_private_key_path=str, ssh_public_key=str,
+)
+InstCreateParams = _fixture(
+    "InstCreateParams", provider=str, instance_id=str, slug=str, image=str, vcpu=int, memory_mb=int, disk_gb=int | None,
+    provider_size=(str | None, None), region=(str | None, None),
+)
+InstCreateOutput = _fixture(
+    "InstCreateOutput", resource_ids=Mapping[str, str], address=(str | None, None), adopted_existing=(bool, False)
+)
+InstBootParams = _fixture(
+    "InstBootParams", host=str, known_hosts=str, ssh_user=str, ssh_private_key_path=str, ssh_public_key=str, entrypoint=str
+)
+InstLoadInfraOutput = _fixture("InstLoadInfraOutput", provider=str, slug=str, resource_ids=Mapping[str, str])
+InstDestroyParams = _fixture("InstDestroyParams", provider=str, instance_id=str, slug=str, resource_ids=Mapping[str, str])
+
+
 # ---------------------------------------------------------------------------
 # The declared-verbs table -- rekeyed to DR-0022's 30-verb vocabulary.
 # ---------------------------------------------------------------------------
@@ -741,6 +766,14 @@ DECLARED_VERBS: dict[str, VerbFixture] = {
         DestroyInstanceParams, EmptyOutput, gateable=True, plane="provider", thin=False
     ),
     "kube.wipe_namespace": VerbFixture(WipeNamespaceParams, EmptyOutput, plane="provider", thin=False),
+    # -- provision-instance-tart.yml / destroy-instance.yml (DR-0055) --------
+    "instance.load_spec": VerbFixture(InstLoadParams, InstLoadSpecOutput, plane="domain"),
+    "instance.create": VerbFixture(
+        InstCreateParams, InstCreateOutput, undoable=True, plane="provider", thin=True, idempotent=False
+    ),  # as infra.create_instance: a crash mid-create fails the run and compensation destroys by name
+    "instance.boot": VerbFixture(InstBootParams, EmptyOutput, plane="provider", thin=True, idempotent=False),
+    "instance.load_infra": VerbFixture(InstLoadParams, InstLoadInfraOutput, plane="domain"),
+    "instance.destroy": VerbFixture(InstDestroyParams, EmptyOutput, plane="provider", thin=True),
 }
 
 

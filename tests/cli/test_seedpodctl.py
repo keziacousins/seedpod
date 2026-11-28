@@ -317,3 +317,30 @@ def test_cli_main_missing_api_key_fails_cleanly(monkeypatch, capsys):
 def test_cli_main_requires_a_subcommand(capsys):
     with pytest.raises(SystemExit):
         cli.main([])
+
+
+# ---------------------------------------------------------------------------
+# instances (DR-0055)
+# ---------------------------------------------------------------------------
+
+
+async def test_instances_round_trip_reads_the_key_file_on_the_client_side(app, tmp_path):
+    from tests.api.test_instances import KEY, TEMPLATES
+
+    app.instance_templates = TEMPLATES
+    key_file = tmp_path / "id.pub"
+    key_file.write_text(KEY + "\n")
+    _, plaintext = await app.services.api_keys.create_api_key(
+        username="dev", environment="all", permissions=["instances:*"]
+    )
+    parse = cli.build_parser().parse_args
+    async with _client_for(app, api_key=plaintext) as client:
+        created = await cli._instances_create(client, parse([
+            "instances", "create", "--slug", "box", "--template", "ubuntu", "--size", "small",
+            "--environment", "ephemeral", "--lease-seconds", "1800", "--ssh-key-file", str(key_file),
+        ]))
+        assert (created["slug"], created["lease_seconds"], created["status"]) == ("box", 1800, "provisioning")
+        assert (await cli._instances_get(client, parse(["instances", "get", "box"])))["id"] == created["id"]
+        assert [i["slug"] for i in (await cli._instances_list(client, parse(["instances", "list"])))["instances"]] == ["box"]
+        assert (await cli._instances_destroy(client, parse(["instances", "destroy", "box"])))["status"] == "destroying"
+    assert parse(["instances", "renew", "box"]).func is cli._instances_renew

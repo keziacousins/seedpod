@@ -16,7 +16,7 @@ since DR-0015 assigns their construction to this composition-root component.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +28,8 @@ from fastapi import FastAPI
 from seedpod.app.config import AppConfig
 from seedpod.core.clock import Clock
 from seedpod.core.errors import ErrorCode, PermanentError
+from seedpod.core.instance_limits import InstanceLimits
+from seedpod.core.instance_template import InstanceTemplate
 from seedpod.core.tempfiles import TempFileRegistry
 from seedpod.data.database import Database
 from seedpod.data.migrate import MIGRATIONS_DIR, migrate
@@ -38,6 +40,8 @@ from seedpod.providers.contract import Provider
 from seedpod.runtime.dispatcher import Dispatcher
 from seedpod.runtime.effect_executor import EffectExecutor
 from seedpod.runtime.health import HealthMonitor
+from seedpod.runtime.instance_liveness import InstanceLivenessSweep
+from seedpod.runtime.instance_reconcile import InstanceReconciler
 from seedpod.runtime.reconciliation import ReconciliationService
 from seedpod.runtime.sse import SSEHub
 from seedpod.runtime.subprocess_manager import SubprocessManager
@@ -149,6 +153,8 @@ class App:
     timers: TimerService
     engine: WorkflowEngine
     executor: EffectExecutor
+    instance_liveness: InstanceLivenessSweep  # DR-0055: correctness, like the executor and timers
+    instance_reconciler: InstanceReconciler  # DR-0055: periodic, behind `background_tasks` like the cluster reconciler
     services: Services
     api: FastAPI
     http_transport: httpx.AsyncClient  # DR-0015: shared outbound-HTTP seam for GHCR/DNS
@@ -158,6 +164,9 @@ class App:
     ghcr: GhcrService | None  # DR-0015: credential-gated on config.github_token
     dns: DnsService | None  # DR-0015: credential-gated on config.cloudflare_api_token
     manifest_resolver: ManifestResolver  # always constructed; ghcr_service=None degrades gracefully
+    id_gen: Callable[[], str]  # the one id source build_app's services share; `api/routers/instances.py` births with it
+    instance_templates: Mapping[str, InstanceTemplate]  # DR-0055: what a request may name
+    instance_limits: InstanceLimits  # DR-0055 decision 6: admission caps; no file means no caps
     clock: Clock  # Round 6, api-edge: the same Clock every other collaborator was built
     #                with (dispatcher/timers/executor/hub/... each hold their own private
     #                copy already) -- exposed here too because CLAUDE.md's "every timestamp
@@ -197,11 +206,16 @@ class App:
         if self.config.background_tasks:
             await self.engine.resume_inflight()
             await self.services.reconciliation.start()
+            await self.instance_reconciler.start()
             await self.services.health.start()
             # DR-0044. Behind the flag like the other periodic loops (tests stay
             # deterministic and call `flush_last_used()` directly), but note the
             # DELIBERATE asymmetry in `stop()`: the final flush is unconditional.
             await self.services.api_keys.start()
+        # DR-0055. Correctness, not a convenience, so it is NOT behind `background_tasks`: it is the
+        # backstop that keeps an instance's way to destruction working without a restart. Started
+        # after `resume_inflight()` (above) so its first pass finds the startup adoption already done.
+        await self.instance_liveness.start()
 
     def _verify_ssh_identities(self) -> None:
         """Thin bind of ``verify_ssh_identities`` to this App's own enabled providers.
@@ -231,8 +245,12 @@ class App:
         (An earlier revision of this docstring recorded that no ``engine.stop()``
         existed and flagged it as a DR-worthy follow-up. DR-0024 is that DR.)
         """
+        # First: its pass adopts runs and applies events, and the engine, timers and executor it
+        # leans on must still be there while it runs.
+        await self.instance_liveness.stop()
         if self.config.background_tasks:
             await self.services.health.stop()
+            await self.instance_reconciler.stop()
             await self.services.reconciliation.stop()
         await self.engine.stop()
         await self.timers.stop()

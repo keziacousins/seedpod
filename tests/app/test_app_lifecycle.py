@@ -9,6 +9,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 from cryptography.fernet import Fernet
 
 from seedpod.app.config import AppConfig
@@ -68,6 +69,25 @@ async def test_start_always_runs_executor_and_timers_regardless_of_background_ta
         assert not app.services.health.running
     finally:
         await app.stop()
+
+
+@pytest.mark.parametrize("background_tasks", [False, True])
+async def test_start_runs_the_instance_liveness_sweep_regardless_of_background_tasks(
+    tmp_path, test_config_dir, background_tasks
+):
+    """DR-0055: the sweep is the backstop for an instance's way to destruction, so like the executor
+    and the timers it is correctness, not a convenience, and the flag does not turn it off. It stops
+    with the app."""
+    config = _config(tmp_path, test_config_dir, background_tasks=background_tasks)
+    app = build_app(config, providers={"fake": FakeProvider()}, clock=FrozenClock(_NOW), id_gen=sequential_ids())
+    assert not app.instance_liveness.running
+    await app.start()
+    try:
+        assert app.instance_liveness.running
+    finally:
+        await app.stop()
+    assert not app.instance_liveness.running
+    await app.stop()  # idempotent
 
 
 async def test_start_runs_reconciliation_and_health_iff_background_tasks(tmp_path, test_config_dir):

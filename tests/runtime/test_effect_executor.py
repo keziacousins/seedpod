@@ -177,7 +177,7 @@ async def test_backoff_ladder_and_dead_at_attempt_8(uow, repos, executor, clock)
 
     # No cluster "ghost" exists -- every admission attempt genuinely fails
     # (LookupError), deterministically, forever.
-    eff = RunWorkflow(workflow="provision", cluster_id="ghost")
+    eff = RunWorkflow(workflow="provision", aggregate_type="cluster", aggregate_id="ghost")
     row = outbox_row(eff, "cluster", "ghost", 1, 0, now=NOW)
     async with uow() as t:
         repos.outbox.insert(t, row)

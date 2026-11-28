@@ -104,12 +104,14 @@ class ProgressSink(Protocol):
     async def __call__(
         self,
         run_id: UUID,
-        cluster_id: str,
+        cluster_id: str | None,
         workflow: str,
         step_path: str,
         attempt: int,
         message: str,
         fields: Mapping[str, JsonValue],
+        *,
+        instance_id: str | None = None,
     ) -> None: ...
 
 
@@ -126,13 +128,16 @@ class StepServices:
 
 class StepContext:
     """Seam B §2.1 verbatim contract. Constructed per attempt by the engine; ``attempt``
-    is 1-based and read from the DB, so it survives restart."""
+    is 1-based and read from the DB, so it survives restart.
+
+    **A run belongs to exactly one aggregate** (DR-0055): a cluster or an instance. The constructor
+    refuses both or neither, and the id of the other kind RAISES rather than answering ``None``, so
+    a cluster step on an instance run cannot look up cluster ``None``."""
 
     def __init__(
         self,
         *,
         run_id: UUID,
-        cluster_id: str,
         workflow: str,
         step_path: str,
         attempt: int,
@@ -140,9 +145,17 @@ class StepContext:
         services: StepServices,
         note_sink: NoteSink,
         progress_sink: ProgressSink,
+        cluster_id: str | None = None,
+        instance_id: str | None = None,
     ) -> None:
+        if (cluster_id is None) == (instance_id is None):
+            raise ValueError(
+                "a StepContext needs exactly one of cluster_id and instance_id "
+                f"(got cluster_id={cluster_id!r}, instance_id={instance_id!r})"
+            )
         self.run_id = run_id
-        self.cluster_id = cluster_id
+        self._cluster_id = cluster_id
+        self._instance_id = instance_id
         self.workflow = workflow
         self.step_path = step_path  # materialized cursor path: 'create' | 'wave[1].apply'
         self.attempt = attempt
@@ -150,6 +163,20 @@ class StepContext:
         self.services = services
         self._note_sink = note_sink
         self._progress_sink = progress_sink
+
+    @property
+    def cluster_id(self) -> str:
+        """The cluster this run belongs to. Raises on an instance run."""
+        if self._cluster_id is None:
+            raise ValueError(f"run {self.run_id} belongs to instance {self._instance_id!r}, not to a cluster")
+        return self._cluster_id
+
+    @property
+    def instance_id(self) -> str:
+        """The instance this run belongs to. Raises on a cluster run."""
+        if self._instance_id is None:
+            raise ValueError(f"run {self.run_id} belongs to cluster {self._cluster_id!r}, not to an instance")
+        return self._instance_id
 
     async def note(self, **facts: str) -> None:
         """Durable write-ahead scratchpad, committed to workflow_steps.notes BEFORE
@@ -160,12 +187,13 @@ class StepContext:
 
     async def progress(self, message: str, /, **fields: JsonValue) -> None:
         """Writes Notify(topic='workflow_progress') to the effects outbox with payload
-        {run_id, cluster_id, workflow, step_path, attempt, message, **fields}.
+        {run_id, cluster_id (instance_id on an instance run), workflow, step_path, attempt, message, **fields}.
         Never raises to the step; never touches the cursor. Replaces per-job SSE
         and _job_wrapper's 36-char-arg scanning (gotcha 15)."""
         try:
+            owner = {} if self._instance_id is None else {"instance_id": self._instance_id}
             await self._progress_sink(
-                self.run_id, self.cluster_id, self.workflow, self.step_path, self.attempt, message, fields
+                self.run_id, self._cluster_id, self.workflow, self.step_path, self.attempt, message, fields, **owner
             )
         except Exception:
             return  # never raises to the step
@@ -213,7 +241,7 @@ class StepContext:
             # generalized from per-process SIGTERM/SIGKILL to process-GROUP kill so a
             # spawned kubectl/ssh's own children die too)
         )
-        self.services.subprocess_manager.register(process, cluster_id=self.cluster_id)
+        self.services.subprocess_manager.register(process, cluster_id=self._cluster_id)  # None for an instance run
         try:
             communicate_task = asyncio.ensure_future(process.communicate(stdin))
             cancel_task = asyncio.ensure_future(self.cancel.wait())

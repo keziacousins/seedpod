@@ -13,7 +13,8 @@ encoded on ``seedpod/core/effects.py``'s ``EffectKind`` members.
 
 Every ``cluster``/``deployment`` state change in v2 -- API commands, engine step
 ``emit:``/outcome events, timer fires, reconciler observations -- goes through
-``Dispatcher.apply()``. No direct ORM/status writes anywhere else; the repositories
+``Dispatcher.apply()``. (DR-0055 adds ``instance``: a bare VM is its own aggregate, with its
+own pure table, repository and audit.) No direct ORM/status writes anywhere else; the repositories
 this module drives (``seedpod/data/repositories.py``) never commit -- the
 ``UnitOfWork`` this module opens (or the caller's, when chaining via ``tx=``) is the
 only thing that ever does.
@@ -74,18 +75,31 @@ from seedpod.core.effects import (
 )
 from seedpod.core.events import DeploymentPending, DeployRequested, Event
 from seedpod.core.machine import TransitionResult, transition
-from seedpod.core.records import ClusterRecord, DeploymentRecord
+from seedpod.core.records import ClusterRecord, DeploymentRecord, InstanceRecord
 from seedpod.data.repositories import (
     ClusterRow,
     DeploymentRow,
+    InstanceRow,
     OutboxRow,
     Repositories,
     _cluster_record_from_row,
     _deployment_record_from_row,
+    _instance_record_from_row,
 )
 from seedpod.data.uow import UnitOfWork
 
 __all__ = ["Dispatcher", "outbox_row"]
+
+# The aggregates ``apply()`` can transition. Every internal branch below selects on this
+# explicitly: a name outside it is an error, never "the other one".
+_SUPPORTED_AGGREGATES = frozenset({"cluster", "deployment", "instance"})
+
+
+def _unsupported(aggregate: str) -> ValueError:
+    return ValueError(
+        f"unknown aggregate type {aggregate!r}: expected one of {sorted(_SUPPORTED_AGGREGATES)}"
+    )
+
 
 # Conflict 2's amended EffectKind lane table (seedpod/core/effects.py's per-member
 # comments, restated here as the Dispatcher's own lookup): Persist/ScheduleTimer/
@@ -194,6 +208,28 @@ def _overlay_cluster_row(row: ClusterRow, record: ClusterRecord) -> ClusterRow:
     )
 
 
+def _overlay_instance_row(row: InstanceRow, record: InstanceRecord) -> InstanceRow:
+    """The instance twin of ``_overlay_cluster_row``: every field ``_instance_record_from_row``
+    reads, taken from the post-transition record. Template, size, owner, price, vcpu, memory,
+    known_hosts and the timestamps pass through from the caller's row."""
+    return dataclasses.replace(
+        row,
+        id=record.id,
+        slug=record.slug,
+        provider=record.provider,
+        environment=record.environment,
+        status=record.state.value,
+        version=record.version,
+        resource_ids=record.resource_ids,
+        address=record.address,
+        lease_seconds=record.lease_seconds,
+        expires_at=record.expires_at,
+        hard_expires_at=record.hard_expires_at,
+        failure_reason=record.failure_reason,
+        destroyed_at=record.destroyed_at,
+    )
+
+
 def _overlay_deployment_row(row: DeploymentRow, record: DeploymentRecord) -> DeploymentRow:
     """The deployment twin of ``_overlay_cluster_row``."""
     return dataclasses.replace(
@@ -216,7 +252,7 @@ class _Pokeable(Protocol):
 
 
 class Dispatcher:
-    """``Dispatcher(uow, repos, clock)`` -- the ONLY write path for cluster/deployment
+    """``Dispatcher(uow, repos, clock)`` -- the ONLY write path for cluster/deployment/instance
     state in v2. ``apply()`` is fully correct before ``attach_executor``/
     ``attach_timers`` are ever called (they only add a latency hint on top)."""
 
@@ -258,19 +294,22 @@ class Dispatcher:
         event: Event,
         *,
         tx: Session | None = None,
-        record: ClusterRow | DeploymentRow | None = None,
+        record: ClusterRow | DeploymentRow | InstanceRow | None = None,
         _cascade_depth: int = 0,
     ) -> TransitionResult:
         """Run the pure ``transition()`` for one aggregate and durably commit every
         effect it returns. ``record=`` supplies a NEW birth as the FULL row DTO
-        (``ClusterRow`` | ``DeploymentRow``, DR-0006) in place of the normal
+        (``ClusterRow`` | ``DeploymentRow`` | ``InstanceRow``, DR-0006) in place of the normal
         ``repos.<agg>.load()`` read; it is narrowed to the pure record for
         ``transition()``, and the birth ``Persist`` INSERTs that same row with its
         machine-owned fields overlaid from the post-transition record (module
         docstring). ``Ignore`` (``result.effects == ()``) writes NOTHING: no version
         bump, no audit row, no outbox row, no poke. ``StaleVersion`` from a losing CAS
         propagates to the caller unretried -- the re-read/re-decide loop (<=3
-        attempts) is the caller's job (docs/design/seam-a-core.md §D)."""
+        attempts) is the caller's job (docs/design/seam-a-core.md §D). An unsupported or
+        unknown ``aggregate`` raises ``ValueError`` before anything is read or written."""
+        if aggregate not in _SUPPORTED_AGGREGATES:
+            raise _unsupported(aggregate)
         assert _cascade_depth <= _MAX_CASCADE_DEPTH, (
             f"Cascade recursion exceeded depth {_MAX_CASCADE_DEPTH} "
             f"({aggregate}/{aggregate_id})"
@@ -328,20 +367,31 @@ class Dispatcher:
         if self._timers is not None:
             self._timers.poke()
 
-    def _narrow(self, aggregate: str, row: ClusterRow | DeploymentRow) -> ClusterRecord | DeploymentRecord:
+    def _narrow(
+        self, aggregate: str, row: ClusterRow | DeploymentRow | InstanceRow
+    ) -> ClusterRecord | DeploymentRecord | InstanceRecord:
         """DR-0006: narrow a birth's full row DTO to the pure record ``transition()``
         accepts, via the SAME mapping ``ClusterRepository.load``/
         ``DeploymentRepository.load`` use internally (imported, not reimplemented)."""
         if aggregate == "cluster":
             return _cluster_record_from_row(row)  # type: ignore[arg-type]
-        return _deployment_record_from_row(row)  # type: ignore[arg-type]
+        if aggregate == "deployment":
+            return _deployment_record_from_row(row)  # type: ignore[arg-type]
+        if aggregate == "instance":
+            return _instance_record_from_row(row)  # type: ignore[arg-type]
+        raise _unsupported(aggregate)
 
-    def _load(self, t: Session, aggregate: str, aggregate_id: str) -> ClusterRecord | DeploymentRecord:
-        rec = (
-            self.repos.clusters.load(t, aggregate_id)
-            if aggregate == "cluster"
-            else self.repos.deployments.load(t, aggregate_id)
-        )
+    def _load(
+        self, t: Session, aggregate: str, aggregate_id: str
+    ) -> ClusterRecord | DeploymentRecord | InstanceRecord:
+        if aggregate == "cluster":
+            rec = self.repos.clusters.load(t, aggregate_id)
+        elif aggregate == "deployment":
+            rec = self.repos.deployments.load(t, aggregate_id)
+        elif aggregate == "instance":
+            rec = self.repos.instances.load(t, aggregate_id)
+        else:
+            raise _unsupported(aggregate)
         if rec is None:
             raise LookupError(f"no {aggregate} {aggregate_id!r} to load and transition")
         return rec
@@ -352,8 +402,10 @@ class Dispatcher:
         aggregate: str,
         eff: Persist,
         *,
-        birth_row: ClusterRow | DeploymentRow | None,
+        birth_row: ClusterRow | DeploymentRow | InstanceRow | None,
     ) -> None:
+        if aggregate not in _SUPPORTED_AGGREGATES:
+            raise _unsupported(aggregate)
         if eff.expected_version is None:
             if birth_row is None:
                 raise ValueError(
@@ -363,21 +415,29 @@ class Dispatcher:
                 )
             if aggregate == "cluster":
                 self.repos.clusters.insert(t, _overlay_cluster_row(birth_row, eff.record))  # type: ignore[arg-type]
-            else:
+            elif aggregate == "deployment":
                 self.repos.deployments.insert(
                     t, _overlay_deployment_row(birth_row, eff.record)  # type: ignore[arg-type]
                 )
+            elif aggregate == "instance":
+                self.repos.instances.insert(t, _overlay_instance_row(birth_row, eff.record))  # type: ignore[arg-type]
+            else:
+                raise _unsupported(aggregate)
             return
         if aggregate == "cluster":
             self.repos.clusters.persist(t, eff.record, eff.expected_version, clock=self._clock)  # type: ignore[arg-type]
-        else:
+        elif aggregate == "deployment":
             self.repos.deployments.persist(t, eff.record, eff.expected_version, clock=self._clock)  # type: ignore[arg-type]
+        elif aggregate == "instance":
+            self.repos.instances.persist(t, eff.record, eff.expected_version, clock=self._clock)  # type: ignore[arg-type]
+        else:
+            raise _unsupported(aggregate)
 
     def _audit(
         self,
         t: Session,
         aggregate: str,
-        rec: ClusterRecord | DeploymentRecord,
+        rec: ClusterRecord | DeploymentRecord | InstanceRecord,
         result: TransitionResult,
         event: Event,
     ) -> None:
@@ -402,7 +462,7 @@ class Dispatcher:
                 actor=event.actor,
                 at=event.at,
             )
-        else:
+        elif aggregate == "deployment":
             self.repos.deployment_state_audits.add(
                 t,
                 deployment_id=result.record.id,
@@ -413,3 +473,15 @@ class Dispatcher:
                 actor=event.actor,
                 at=event.at,
             )
+        elif aggregate == "instance":
+            self.repos.instance_state_audits.add(
+                t,
+                instance_id=result.record.id,
+                from_state=from_state,
+                to_state=to_state,
+                event=event,
+                actor=event.actor,
+                at=event.at,
+            )
+        else:
+            raise _unsupported(aggregate)

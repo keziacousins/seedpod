@@ -73,6 +73,9 @@ def test_shipped_files_present():
         "destroy-cloud.yml",
         "destroy-shared.yml",
         "deploy-rollback.yml",
+        "provision-instance-tart.yml",  # DR-0055: a bare VM, not a cluster
+        "provision-instance-digitalocean.yml",
+        "destroy-instance.yml",
     }
 
 

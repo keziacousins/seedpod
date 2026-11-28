@@ -1,0 +1,56 @@
+# provision-instance-tart -- a bare VM on tart: no k3s, no kubeconfig (DR-0055).
+#
+# It shares provision-tart.yml's address, ssh and host-key steps, then boots the VM (decision 8) and
+# stops. on_failure: compensate, so a failure or cancel after `create` destroys the VM by its recorded
+# id, or by its name spi-{slug} if no id was recorded. InstanceProvisionFailed fires after that.
+# instance.boot is last: after the host key is captured, never retried, never replayed after a crash.
+workflow: provision-instance-tart
+version: 1
+inputs:
+  instance_id: {type: str}
+on_failure: compensate
+outcome:
+  succeeded: {event: InstanceProvisioned,
+              payload: {address: {from: vm.address}, resource_ids: {from: create.resource_ids}}}
+  failed:    {event: InstanceProvisionFailed}
+  cancelled: {event: InstanceProvisionFailed}
+steps:
+  - id: spec
+    uses: instance.load_spec
+    with: {instance_id: {from: run.instance_id}}
+    timeout_seconds: 30
+
+  - id: create                        # tart clone + set + a detached run; the VM is spi-{slug}
+    uses: instance.create
+    with: {provider: {from: spec.provider}, instance_id: {from: run.instance_id}, slug: {from: spec.slug},
+           image: {from: spec.image}, vcpu: {from: spec.vcpu}, memory_mb: {from: spec.memory_mb},
+           disk_gb: {from: spec.disk_gb},
+           provider_size: {from: spec.provider_size}, region: {from: spec.region}}
+    timeout_seconds: 120
+    emit:
+      event: InstanceResourcesAllocated
+      payload: {resource_ids: {from: create.resource_ids}}
+
+  - id: vm                            # `tart ip` until an address is assigned
+    uses: infra.await_instance
+    with: {provider: {from: spec.provider}, resource_ids: {from: create.resource_ids}}
+    gate: {timeout_seconds: 120, interval_seconds: 2}
+
+  - id: ssh
+    uses: k3s.await_ssh
+    with: {host: {from: vm.address}}
+    gate: {timeout_seconds: 180, interval_seconds: 10, settle_seconds: 5}
+
+  - id: trust_host                    # the TOFU pair: the only insecure ssh call, then the keyscan
+    uses: k3s.trust_host_keys
+    with: {host: {from: vm.address}, ssh_user: {from: spec.ssh_user},
+           ssh_private_key_path: {from: spec.ssh_private_key_path}}
+    retry: ssh_default
+    timeout_seconds: 310
+
+  - id: boot                          # payload on stdin to a root-only file, then the template's entrypoint
+    uses: instance.boot
+    with: {host: {from: vm.address}, known_hosts: {from: trust_host.known_hosts},
+           ssh_user: {from: spec.ssh_user}, ssh_private_key_path: {from: spec.ssh_private_key_path},
+           ssh_public_key: {from: spec.ssh_public_key}, entrypoint: {from: spec.entrypoint}}
+    timeout_seconds: 300

@@ -47,7 +47,9 @@ skip-compensation debug flag, not provider code.
 from __future__ import annotations
 
 from seedpod.providers.contract import (
+    CreateBareInstance,
     CreateInstance,
+    DestroyBareInstance,
     DestroyInstance,
     KubeApplyManifest,
     KubeDeleteManifest,
@@ -76,6 +78,13 @@ def undo_for(cmd: ProviderCommand, observed: Observed) -> ProviderCommand | None
             # ids never escaped ⇒ nothing was allocated OR tag-before-boot +
             # reconciliation (Zombie/CreateUnmanaged next cycle) is the backstop.
             return None
+
+        case CreateBareInstance(instance_id=instance_id, slug=slug):
+            # DR-0055. Never ``None``, unlike ``CreateInstance``: the VM's marker is known before any
+            # backend call (``spi-{slug}`` on tart, the ``instance-uuid:{id}`` tag on DigitalOcean), so
+            # even a create that never recorded an id has a destroy that finds it by that marker.
+            ids = observed.value.resource_ids if observed.value is not None else observed.data  # type: ignore[attr-defined]
+            return DestroyBareInstance(instance_id=instance_id, slug=slug, resource_ids=dict(ids))
 
         case KubeApplyManifest(kubeconfig=kubeconfig, manifest_yaml=manifest_yaml):
             # Literal inverse — reachable ONLY via `kube.apply_file` (the infra-shim

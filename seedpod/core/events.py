@@ -73,8 +73,22 @@ __all__ = [
     "ClusterGone",
     "DeploymentPending",
     "RollbackFinished",
+    # instance events (DR-0055)
+    "InstanceCreateRequested",
+    "InstanceRenewRequested",
+    "InstanceDestroyRequested",
+    "InstanceResourcesAllocated",
+    "InstanceProvisioned",
+    "InstanceProvisionFailed",
+    "InstanceDestroySucceeded",
+    "InstanceDestroyFailed",
+    "InstanceExpired",
+    "InstanceStoppedObserved",
+    "InstanceRunningObserved",
+    "InstanceTimerLost",
     "ClusterEvent",
     "DeploymentEvent",
+    "InstanceEvent",
 ]
 
 EVENT_REGISTRY: dict[str, type[Event]] = {}
@@ -360,6 +374,92 @@ class RollbackFinished(Report):
     ok: bool
 
 
+# ---- Instance events (DR-0055). Every kind addresses exactly ONE aggregate, so these are
+# disjoint from the cluster and deployment events above even where the meaning is the same
+# (InstanceProvisioned is not ProvisionSucceeded: a VM has no kubeconfig). ----
+
+
+@_event
+@dataclass(frozen=True, slots=True, kw_only=True)
+class InstanceCreateRequested(Command):
+    pass  # the birth. Lease and limits were checked at admission, before the row exists.
+
+
+@_event
+@dataclass(frozen=True, slots=True, kw_only=True)
+class InstanceRenewRequested(Command):
+    pass  # new expiry = min(at + lease_seconds, hard_expires_at); the machine decides
+
+
+@_event
+@dataclass(frozen=True, slots=True, kw_only=True)
+class InstanceDestroyRequested(Command):
+    pass
+
+
+@_event
+@dataclass(frozen=True, slots=True, kw_only=True)
+class InstanceResourcesAllocated(Report):
+    # Mid-provision fact, as InfraAllocated: the ids are recorded the moment the provider
+    # returns them, so a destroy can name them even if the run dies before it finishes.
+    resource_ids: Mapping[str, str]
+
+
+@_event
+@dataclass(frozen=True, slots=True, kw_only=True)
+class InstanceProvisioned(Report):
+    """Provision succeeded. Has no kubeconfig field. The machine treats an empty address or
+    empty resource ids as a failed provision (``failed``), not as an active instance."""
+
+    address: str
+    resource_ids: Mapping[str, str]
+
+
+@_event
+@dataclass(frozen=True, slots=True, kw_only=True)
+class InstanceProvisionFailed(Report):
+    reason: str  # fired after compensation ran
+
+
+@_event
+@dataclass(frozen=True, slots=True, kw_only=True)
+class InstanceDestroySucceeded(Report):
+    pass
+
+
+@_event
+@dataclass(frozen=True, slots=True, kw_only=True)
+class InstanceDestroyFailed(Report):
+    reason: str
+
+
+@_event
+@dataclass(frozen=True, slots=True, kw_only=True)
+class InstanceExpired(TimerFired):
+    pass  # timer_key "expiry". Also the retry timer for a destroy that failed (same key).
+
+
+@_event
+@dataclass(frozen=True, slots=True, kw_only=True)
+class InstanceStoppedObserved(Observation):
+    pass  # the provider confirms the VM exists and is stopped
+
+
+@_event
+@dataclass(frozen=True, slots=True, kw_only=True)
+class InstanceRunningObserved(Observation):
+    pass  # the provider confirms the VM exists and is running
+
+
+@_event
+@dataclass(frozen=True, slots=True, kw_only=True)
+class InstanceTimerLost(Report):
+    """The liveness sweep found an instance that waits on its ``expiry`` timer and has none armed.
+    The machine re-arms it (``at`` is the sweep's own clock reading). A Report, not an
+    Observation: it states a finding about seedpod's own records, not a fact the provider
+    reported, so it does not need the reconciler's or the health monitor's actor."""
+
+
 ClusterEvent = (
     CreateRequested
     | Discovered
@@ -391,4 +491,19 @@ DeploymentEvent = (
     | SupersededBy
     | ClusterGone
     | RollbackFinished
+)
+
+InstanceEvent = (
+    InstanceCreateRequested
+    | InstanceRenewRequested
+    | InstanceDestroyRequested
+    | InstanceResourcesAllocated
+    | InstanceProvisioned
+    | InstanceProvisionFailed
+    | InstanceDestroySucceeded
+    | InstanceDestroyFailed
+    | InstanceExpired
+    | InstanceStoppedObserved
+    | InstanceRunningObserved
+    | InstanceTimerLost
 )

@@ -16,8 +16,12 @@ from seedpod.providers.contract import (
     RESOURCE_ALLOCATED,
     ApplyFirewalls,
     AssignToProject,
+    BareInstanceCommand,
+    BootInstance,
     CaptureHostKeys,
+    CreateBareInstance,
     CreateInstance,
+    DestroyBareInstance,
     DestroyInstance,
     DigitalOceanCommand,
     FetchKubeconfig,
@@ -38,6 +42,7 @@ from seedpod.providers.contract import (
     KubeRolloutUndo,
     KubeRun,
     KubeWatchPods,
+    ListBareInstances,
     ListInstances,
     MachineCommand,
     Observed,
@@ -76,8 +81,9 @@ MACHINE_TYPES = {
     ListInstances,
     Reconcile,
 }
+BARE_INSTANCE_TYPES = {CreateBareInstance, DestroyBareInstance, ListBareInstances}  # DR-0055
 DIGITALOCEAN_TYPES = {ApplyFirewalls, AssignToProject}
-K3S_TYPES = {ProbeSshPort, CaptureHostKeys, InstallK3s, ProbeK3s, FetchKubeconfig}
+K3S_TYPES = {ProbeSshPort, CaptureHostKeys, InstallK3s, ProbeK3s, FetchKubeconfig, BootInstance}
 KUBECTL_TYPES = {
     KubeGetClusterInfo,
     KubeGetNodes,
@@ -100,6 +106,10 @@ def test_machine_command_union_is_exactly_the_spec_set():
     assert _flatten_union(MachineCommand) == MACHINE_TYPES
 
 
+def test_bare_instance_command_union_is_exactly_the_dr_0055_set():
+    assert _flatten_union(BareInstanceCommand) == BARE_INSTANCE_TYPES
+
+
 def test_digitalocean_command_union_is_exactly_the_spec_set():
     """DigitalOcean-only extras (§5.7.1 amendment) — not part of the generic machine plane
     every machine provider implements; ``Provider.supported`` gates which provider instance
@@ -120,9 +130,10 @@ def test_provider_command_union_covers_every_command_dataclass_exactly_once():
     §5.4's plane matrix) but appears once in the Python union — ``Provider.supported``,
     not this module, is what actually gates which commands a given provider instance
     accepts (contract.py's own comment on this)."""
-    expected = MACHINE_TYPES | DIGITALOCEAN_TYPES | K3S_TYPES | KUBECTL_TYPES
+    expected = MACHINE_TYPES | BARE_INSTANCE_TYPES | DIGITALOCEAN_TYPES | K3S_TYPES | KUBECTL_TYPES
     assert _flatten_union(ProviderCommand) == expected
-    assert len(expected) == 6 + 2 + 5 + 14  # machine + digitalocean-only + k3s + kubectl, FetchKubeconfig counted once
+    # machine + bare instance + digitalocean-only + k3s (with BootInstance) + kubectl, FetchKubeconfig once
+    assert len(expected) == 6 + 3 + 2 + 6 + 14
 
 
 def test_fetch_kubeconfig_is_reachable_through_provider_command():

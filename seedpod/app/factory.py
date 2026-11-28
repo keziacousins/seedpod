@@ -113,6 +113,8 @@ from seedpod.app.services import (
     SnapshotService,
 )
 from seedpod.core.clock import Clock, SystemClock
+from seedpod.core.instance_limits import InstanceLimits
+from seedpod.core.instance_template import InstanceTemplate
 from seedpod.data.database import Database
 from seedpod.data.repositories import (
     ApiKeyRepository,
@@ -121,6 +123,8 @@ from seedpod.data.repositories import (
     DeploymentAuditRepository,
     DeploymentRepository,
     DeploymentStateAuditRepository,
+    InstanceRepository,
+    InstanceStateAuditRepository,
     OutboxRepository,
     PresetRepository,
     Repositories,
@@ -159,6 +163,13 @@ from seedpod.engine.steps.infra import (
     InfraDestroyInstance,
     InfraFetchKubeconfig,
 )
+from seedpod.engine.steps.instance import (
+    InstanceBoot,
+    InstanceCreate,
+    InstanceDestroy,
+    InstanceLoadInfra,
+    InstanceLoadSpec,
+)
 from seedpod.engine.steps.k3s import (
     K3sAwaitApi,
     K3sAwaitSsh,
@@ -184,6 +195,8 @@ from seedpod.providers.tart import TartConfig, TartProvider
 from seedpod.runtime.dispatcher import Dispatcher
 from seedpod.runtime.effect_executor import EffectExecutor
 from seedpod.runtime.health import HealthMonitor
+from seedpod.runtime.instance_liveness import InstanceLivenessSweep
+from seedpod.runtime.instance_reconcile import InstanceReconciler
 from seedpod.runtime.reconciliation import ReconciliationService
 from seedpod.runtime.sse import SSEHub
 from seedpod.runtime.subprocess_manager import (
@@ -269,6 +282,8 @@ def build_app(
         timers=TimerRepository(),
         outbox=OutboxRepository(),
         workflow_runs=WorkflowRunRepository(),
+        instances=InstanceRepository(),
+        instance_state_audits=InstanceStateAuditRepository(),
     )
     uow = UnitOfWork(db)
     deployment_audits_repo = DeploymentAuditRepository(crypto)
@@ -361,6 +376,7 @@ def build_app(
         config.config_dir, config.snapshot_storage_path,
     )
     ssh_identities = _ssh_identities(config)
+    instance_templates = load_instance_templates(config.config_dir / "instance-templates")
     steps = _build_step_registry(
         uow=uow,
         repos=repos,
@@ -373,6 +389,7 @@ def build_app(
         deployment_audits=deployment_audits_repo,
         manifest_resolver=manifest_resolver,
         snapshots=snapshot_service,
+        instance_templates=instance_templates,
     )
     definitions = load_workflow_definitions(config.config_dir / "workflows")
     step_services = StepServices(
@@ -407,6 +424,10 @@ def build_app(
     )
     dispatcher.attach_executor(executor)  # sole late wire: .poke() latency hint only
     dispatcher.attach_timers(timers)  # ditto
+    # DR-0055: the level-triggered backstop for an instance's way to destruction. Reads the
+    # database and the engine's task table only; every change goes through the Dispatcher.
+    instance_liveness = InstanceLivenessSweep(uow, repos, dispatcher, engine, clock)
+    instance_reconciler = InstanceReconciler(uow, repos, dispatcher, providers, clock)
 
     # 9 -- thin application services (seedpod/app/services/) + the Round-5 runtime
     # services this component must wire (seam-d Decision 8 predates
@@ -463,6 +484,8 @@ def build_app(
         timers=timers,
         engine=engine,
         executor=executor,
+        instance_liveness=instance_liveness,
+        instance_reconciler=instance_reconciler,
         services=services,
         api=api,
         http_transport=transport,
@@ -470,6 +493,9 @@ def build_app(
         ghcr=ghcr_service,
         dns=dns,
         manifest_resolver=manifest_resolver,
+        id_gen=id_gen,
+        instance_templates=instance_templates,
+        instance_limits=load_instance_limits(config.config_dir / "instance-limits.yml"),
         clock=clock,
     )
     api.state.app = app  # lifespan + routes reach App through api.state -- no globals
@@ -818,6 +844,7 @@ def _build_step_registry(
     deployment_audits: DeploymentAuditRepository,
     manifest_resolver: ManifestResolver,
     snapshots: SnapshotService,
+    instance_templates: Mapping[str, InstanceTemplate],
 ) -> StepRegistry:
     """The composition-root verb registry -- the FULL 30-verb DR-0022 catalog,
     complete as of this round's "restore-and-rehydrate" component. Built up
@@ -946,8 +973,33 @@ def _build_step_registry(
             DeployRestoreSnapshot.verb: DeployRestoreSnapshot(snapshots=snapshots, clock=clock),
             DeployEnsureRollouts.verb: DeployEnsureRollouts(),
             DeployAwaitWave.verb: DeployAwaitWave(),
+            # DR-0055: a bare VM, no k3s.
+            InstanceLoadSpec.verb: InstanceLoadSpec(
+                uow=uow, instances=repos.instances, templates=instance_templates,
+                ssh_identities=ssh_identities,
+            ),
+            InstanceCreate.verb: InstanceCreate(),
+            InstanceBoot.verb: InstanceBoot(),
+            InstanceLoadInfra.verb: InstanceLoadInfra(uow=uow, instances=repos.instances),
+            InstanceDestroy.verb: InstanceDestroy(),
         }
     )
+
+
+def load_instance_templates(directory: Path) -> dict[str, InstanceTemplate]:
+    """``config/instance-templates/{name}.yml`` -> ``{name: template}``. A missing directory is no
+    templates. A malformed file raises at boot, like a bad k3s version, not mid-provision."""
+    return {
+        path.stem: InstanceTemplate.model_validate(_load_yaml(path))
+        for path in sorted(directory.glob("*.yml"))
+    }
+
+
+def load_instance_limits(path: Path) -> InstanceLimits:
+    """``config/instance-limits.yml`` -> ``InstanceLimits``. An absent file means NO caps at all, so a
+    deployment that never wrote one admits every request its templates allow. A malformed file raises
+    at boot."""
+    return InstanceLimits.model_validate(_load_yaml(path) or {})
 
 
 def load_workflow_definitions(directory: Path) -> dict[str, WorkflowDefinition]:

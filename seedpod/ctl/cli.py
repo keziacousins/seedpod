@@ -1,7 +1,7 @@
 """``seedpodctl`` -- the ``argparse``-based command-line front end for
 ``seedpod.ctl.client.SeedpodClient`` (docs/decisions/DR-0021 §0c/point 3).
 Command groups mirror the API surface one-for-one (``keys``, ``secrets``,
-``clusters``, ``deployments``, ``deploy``, ``snapshots``, ``presets``,
+``clusters``, ``instances``, ``deployments``, ``deploy``, ``snapshots``, ``presets``,
 ``workflows``, ``timers``, ``health``, ``config``) -- each subcommand is one
 client call, printed as JSON. One exception: ``clusters kubeconfig`` prints the
 file itself (DR-0053).
@@ -329,6 +329,74 @@ def _add_clusters(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument("cluster_id")
     p.add_argument("--limit", type=int, default=50)
     p.set_defaults(func=_clusters_audit)
+
+
+# ---------------------------------------------------------------------------
+# instances (DR-0055)
+# ---------------------------------------------------------------------------
+
+
+async def _instances_list(client: SeedpodClient, args: argparse.Namespace) -> Any:
+    return await client.list_instances()
+
+
+async def _instances_get(client: SeedpodClient, args: argparse.Namespace) -> Any:
+    return await client.get_instance(args.instance_id)
+
+
+async def _instances_create(client: SeedpodClient, args: argparse.Namespace) -> Any:
+    """The key file is read here, on the caller's machine, and only its public half is sent."""
+    body = {
+        "slug": args.slug,
+        "template": args.template,
+        "size": args.size,
+        "environment": args.environment,
+        "ssh_public_key": args.ssh_key_file.read_text(encoding="utf-8").strip(),
+        "lease_seconds": args.lease_seconds,
+    }
+    return await client.create_instance({k: v for k, v in body.items() if v is not None})
+
+
+async def _instances_renew(client: SeedpodClient, args: argparse.Namespace) -> Any:
+    return await client.renew_instance(args.instance_id)
+
+
+async def _instances_destroy(client: SeedpodClient, args: argparse.Namespace) -> Any:
+    return await client.destroy_instance(args.instance_id)
+
+
+def _add_instances(subparsers: argparse._SubParsersAction) -> None:
+    group = subparsers.add_parser("instances", help="manage bare VM instances")
+    actions = group.add_subparsers(dest="action", required=True)
+
+    p = actions.add_parser("list", help="list your instances")
+    p.set_defaults(func=_instances_list)
+
+    p = actions.add_parser("get", help="get one instance")
+    p.add_argument("instance_id", help="instance id or slug")
+    p.set_defaults(func=_instances_get)
+
+    p = actions.add_parser("create", help="request an instance")
+    p.add_argument("--slug", required=True)
+    p.add_argument("--template", required=True)
+    p.add_argument("--size", required=True)
+    p.add_argument("--environment", required=True)
+    p.add_argument("--lease-seconds", type=int, help="default: the template's lease")
+    p.add_argument(
+        "--ssh-key-file",
+        type=Path,
+        default=Path("~/.ssh/id_ed25519.pub").expanduser(),
+        help="public key to authorize on the VM (default: %(default)s)",
+    )
+    p.set_defaults(func=_instances_create)
+
+    p = actions.add_parser("renew", help="renew an instance's lease")
+    p.add_argument("instance_id", help="instance id or slug")
+    p.set_defaults(func=_instances_renew)
+
+    p = actions.add_parser("destroy", help="destroy an instance")
+    p.add_argument("instance_id", help="instance id or slug")
+    p.set_defaults(func=_instances_destroy)
 
 
 # ---------------------------------------------------------------------------
@@ -690,6 +758,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_keys(subparsers)
     _add_secrets(subparsers)
     _add_clusters(subparsers)
+    _add_instances(subparsers)
     _add_deployments(subparsers)
     _add_deploy(subparsers)
     _add_snapshots(subparsers)
@@ -726,7 +795,7 @@ async def _run(args: argparse.Namespace) -> int:
     except NotFoundError as exc:
         print(f"error: not found: {exc}", file=sys.stderr)
         return 1
-    except ConnectionFailedError as exc:
+    except (ConnectionFailedError, OSError) as exc:  # OSError: an unreadable --ssh-key-file
         print(f"error: {exc}", file=sys.stderr)
         return 1
     except ApiError as exc:
