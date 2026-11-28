@@ -1,14 +1,14 @@
 ---
 title: DR-0056 — a DigitalOcean instance has its own tag firewall, an explicit droplet size, and no cluster network
 type: decision
-status: proposal
+status: active
 created: 2026-11-28
 updated: 2026-11-28
 ---
 
 # DR-0056: an instance droplet has its own firewall
 
-**Status: PROPOSAL — awaiting ratification by Kezia.** It amends DR-0055 and closes its open item
+**Status: ACTIVE — ratified by Kezia, 2026-11-28.** It amends DR-0055 and closes its open item
 "DigitalOcean inbound firewall".
 
 ## Context
